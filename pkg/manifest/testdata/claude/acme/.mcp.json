@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "fetch": {"type": "stdio", "command": "npx", "args": ["-y", "@acme/fetch-mcp"], "env": {"ACME_API_KEY": "{secret:ACME_API_KEY}"}},
+    "search": {"type": "http", "url": "https://search.acme.test/mcp"}
+  }
+}

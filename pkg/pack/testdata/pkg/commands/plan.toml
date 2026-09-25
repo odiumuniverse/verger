@@ -1,0 +1,2 @@
+description = "Plan the work."
+prompt = "Plan $ARGUMENTS."

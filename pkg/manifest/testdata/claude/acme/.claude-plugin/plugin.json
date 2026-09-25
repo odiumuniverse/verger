@@ -1,0 +1,14 @@
+{
+  "name": "acme-toolkit",
+  "version": "1.2.3",
+  "description": "Acme toolkit",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "node inline.js"}]}
+    ]
+  },
+  "mcpServers": {
+    "fetch": {"type": "stdio", "command": "inline-fetch", "args": ["--inline"]},
+    "inline": {"type": "stdio", "command": "inline-mcp"}
+  }
+}

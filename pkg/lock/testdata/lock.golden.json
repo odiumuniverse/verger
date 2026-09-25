@@ -1,0 +1,37 @@
+{
+  "cells": [
+    {
+      "host": "claude",
+      "package": "acme/рег-☃",
+      "reason": "hooks-unapproved",
+      "scope": "user",
+      "strategy": "silenced",
+      "version": "0.9.0"
+    },
+    {
+      "caps_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "host": "claude",
+      "package": "vercel-labs/skills//find-skills",
+      "ref": "v1.4.2",
+      "scope": "project",
+      "source": "registry",
+      "strategy": "native",
+      "version": "1.4.2"
+    },
+    {
+      "host": "codex",
+      "package": "vercel-labs/skills//find-skills",
+      "scope": "user",
+      "strategy": "loose",
+      "updated_at": "2026-09-25T10:00:00Z",
+      "version": "1.4.2"
+    }
+  ],
+  "schema": 1,
+  "snapshot": {
+    "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "generated_at": "2026-09-25T10:00:00Z",
+    "key_id": "0123456789ABCDEF"
+  }
+}

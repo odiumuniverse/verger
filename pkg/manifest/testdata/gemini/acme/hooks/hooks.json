@@ -1,0 +1,7 @@
+{
+  "BeforeTool": [{"matcher": "write", "hooks": [{"type": "command", "command": "gemini-hook.sh"}]}],
+  "AfterTool": [{"hooks": [{"type": "command", "command": "after.sh"}]}],
+  "SessionStart": [{"hooks": [{"type": "command", "command": "start.sh"}]}],
+  "Notification": [{"hooks": [{"type": "command", "command": "note.sh"}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "stop.sh"}]}]
+}

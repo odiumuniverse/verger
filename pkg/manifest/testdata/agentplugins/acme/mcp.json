@@ -1,0 +1,8 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "agent-remote": {"type": "sse", "url": "https://agent.acme.test/sse"},
+    "agent-server": {"type": "stdio", "command": "agent-mcp", "args": ["--x"]},
+    "agent-ws": {"type": "ws", "url": "https://ws.acme.test"}
+  }
+}

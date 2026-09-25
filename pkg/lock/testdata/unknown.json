@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "future_lock": {"nested": [1, 2]},
+  "snapshot": {
+    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "cells": [
+    {
+      "package": "acme/review-kit",
+      "host": "claude",
+      "scope": "user",
+      "version": "2.3.1",
+      "strategy": "native",
+      "future_cell": "keep-me",
+      "future_cell_obj": {"a": 1}
+    }
+  ]
+}

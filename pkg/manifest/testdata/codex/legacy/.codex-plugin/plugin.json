@@ -1,0 +1,9 @@
+{
+  "name": "legacy-acme",
+  "version": "0.1.0",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "legacy-hook.sh"}]}
+    ]
+  }
+}

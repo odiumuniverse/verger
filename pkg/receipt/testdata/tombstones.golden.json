@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "tombstones": [
+    {
+      "cause": "user",
+      "host": "claude",
+      "package": "owner/name",
+      "receipt_digest": "6f32860910ca0fb2a20c7fda143666b09dbf8db5238195c90a586fb542ff0cad",
+      "removed_at": "2026-09-25T12:00:00Z",
+      "schema": 1,
+      "scope": "user",
+      "trash_id": "20260925T123045.123456789Z"
+    },
+    {
+      "cause": "user",
+      "host": "codex",
+      "package": "owner/name",
+      "receipt_digest": "6f32860910ca0fb2a20c7fda143666b09dbf8db5238195c90a586fb542ff0cad",
+      "removed_at": "2026-09-25T12:01:00Z",
+      "schema": 1,
+      "scope": "project",
+      "trash_id": "20260925T123045.123456789Z"
+    }
+  ]
+}

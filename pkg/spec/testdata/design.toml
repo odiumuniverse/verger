@@ -1,0 +1,46 @@
+# ~/.verger/verger.toml  (project: ./verger.toml — та же схема, scope=project)
+schema = 1
+
+[defaults]
+hooks    = "ask"        # ask | yes | no — вопрос [Y/n] на install
+cooldown = "24h"        # задержка upstream-обновлений
+
+[propagate]             # §5.7, дефолты; всё переопределяемо ниже
+install     = "all"     # all | origin | ask
+remove      = "all"
+disable     = "all"
+enable      = "all"
+update      = "all"     # «побеждает новейшая»
+adopt       = "all"     # ручная установка в агенте → во все
+marketplace = "all"     # маркетплейс из агента → источник + агенты с его форматом
+
+[propagate.kind.hook]   # пример: хуки никогда не раскатывать при adopt
+adopt = "origin"
+
+[propagate.host.codex]  # пример: выключения в Codex не распространять
+disable = "origin"
+
+[[source]]              # порядок = приоритет, первый побеждает
+name = "acme-internal"
+url  = "git@github.com:acme/agent-plugins.git"   # приватный: ssh/gh credentials
+[[source]]
+name = "getverger"      # публичный реестр (неявно последний, если не указан)
+
+[[package]]
+id      = "JuliusBrussee/caveman"
+channel = "stable"
+except  = ["pi"]
+
+[[package]]
+id = "vercel-labs/skills//find-skills"
+
+[[package]]
+id  = "mcp:io.github.github/github-mcp-server"
+env = { GITHUB_TOKEN = "{secret:GITHUB_TOKEN}" }
+
+[[package]]
+id       = "acme/review-kit"
+version  = "2.3.1"      # pin: «новейшая» не поднимает выше
+disabled = true
+[package.propagate]
+remove = "ask"
