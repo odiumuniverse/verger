@@ -36,3 +36,6 @@ go.work.sum
 
 # Stray default build output
 /verger
+
+# Local design notes, specs and review reports (not published)
+/docs/
