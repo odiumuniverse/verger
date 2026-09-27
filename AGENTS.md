@@ -52,7 +52,7 @@ active (pattern: beadle `pkg/cli/home_isolation_test.go`). A test that forgets i
 - `pkg/tui` — bubbletea
 - `pkg/home` — home discovery, absorb/eject, flock, lease
 - `pkg/spec`, `pkg/lock` — desired state (TOML) and exact state (JSON)
-- `pkg/registry` — snapshot types, client, signature, cache
+- `pkg/resolve` — input → source: site adapters, repo classification, live search (no own registry, D30)
 - `pkg/source` — fetch: github/git/url/npm/local/mcp-registry
 - `pkg/manifest` — format parsers → normalized Package
 - `pkg/pack` — chimera render (synth + `verger pack`)

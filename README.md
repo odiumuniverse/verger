@@ -11,15 +11,18 @@ OpenCode, Kilo, Pi, DeepSeek Harness.
   `native → synth → loose → silenced(reason)`.
 - Manual installs in any agent are adopted automatically; manual removals
   propagate with guardrails; the newest version wins.
-- The public registry (`getverger/registry`) is data only — a signed, sparse
-  snapshot built by a nightly crawler. No server.
+- No registry of its own: packages resolve straight from their source —
+  `owner/repo`, `plugin@owner/repo`, a git/npm/MCP ref or a link to a skills or
+  marketplace site — and install natively through each agent's own CLI grammar
+  wherever the repo carries that agent's format. Install a plugin in any agent
+  the usual way and `verger watch` spreads it to the rest.
 
 The design lives in [docs/DESIGN.md](docs/DESIGN.md); the work breakdown is in
 [docs/TASKS.md](docs/TASKS.md).
 
 ## Status
 
-Ф0 (repository skeleton: home, spec/lock, receipts, lease) — in progress.
+Ф0 done; Ф1 (Claude/Codex/Gemini adapters, apply, CLI, e2e) — in review.
 
 ## Development
 
