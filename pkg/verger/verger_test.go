@@ -299,7 +299,7 @@ func TestSecretsOption(t *testing.T) {
 
 			Convey("Then Open reports OpenError option secrets", func() {
 				So(ok, ShouldBeTrue)
-				So(target.Option, ShouldEqual, "secrets")
+				So(target.Option, ShouldEqual, OptionSecrets)
 			})
 		})
 	})
@@ -317,9 +317,58 @@ func TestSecretsOption(t *testing.T) {
 
 			Convey("Then the parse failure surfaces as OpenError option secrets", func() {
 				So(openOK, ShouldBeTrue)
-				So(target.Option, ShouldEqual, "secrets")
+				So(target.Option, ShouldEqual, OptionSecrets)
 				So(target.Value, ShouldEqual, filepath.Join(homeRoot, "state", "secrets.json"))
 				So(parseOK, ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestSecretsUnreadableState(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are meaningless as root")
+	}
+
+	Convey("Given an unreadable home state directory", t, func() {
+		homeRoot := filepath.Join(t.TempDir(), "home")
+		stateDir := filepath.Join(homeRoot, "state")
+		writeFile(t, filepath.Join(stateDir, "secrets.json"), `{"version":1,"secrets":{}}`)
+		So(os.Chmod(stateDir, 0o000), ShouldBeNil)
+
+		t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) }) //nolint:gosec // G302: restoring the state directory
+
+		Convey("When the facade opens", func() {
+			_, err := Open(context.Background(), WithHome(homeRoot))
+
+			target, openOK := errors.AsType[*OpenError](err)
+			_, parseOK := errors.AsType[*secret.SecretParseError](err)
+
+			Convey("Then the unreadable area fails fast as OpenError option secrets", func() {
+				So(openOK, ShouldBeTrue)
+				So(target.Option, ShouldEqual, OptionSecrets)
+				So(target.Value, ShouldEqual, filepath.Join(homeRoot, "state", "secrets.json"))
+				So(parseOK, ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestSecretsMissingFile(t *testing.T) {
+	Convey("Given a home without a secrets file", t, func() {
+		homeRoot := filepath.Join(t.TempDir(), "home")
+
+		Convey("When the facade opens", func() {
+			c, err := Open(context.Background(), WithHome(homeRoot))
+
+			Convey("Then the missing file is an empty store, not an error", func() {
+				So(err, ShouldBeNil)
+
+				defer func() { _ = c.Close() }()
+
+				So(c.Secrets(), ShouldNotBeNil)
+				So(c.Secrets().Len(), ShouldEqual, 0)
+				assertMissing(t, filepath.Join(homeRoot, "state", "secrets.json"))
 			})
 		})
 	})

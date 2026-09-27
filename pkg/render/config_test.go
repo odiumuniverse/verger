@@ -476,6 +476,103 @@ func TestEditTOMLExistingEdges(t *testing.T) {
 	})
 }
 
+func TestEditTOMLArrayOfTablesRefused(t *testing.T) {
+	doc := []byte("[[items]]\nname = \"a\"\n")
+
+	Convey("Given an array-of-tables document", t, func() {
+		Convey("When a key inside the table array is edited", func() {
+			owned := render.Owned{"items.name": canonicalDigest(t, "a")}
+
+			out, changes, err := render.EditTOML(doc, []render.Edit{{Path: "items.name", Value: "b"}}, owned)
+
+			_, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then the editor refuses instead of emitting invalid TOML", func() {
+				So(ok, ShouldBeTrue)
+				So(out, ShouldBeNil)
+				So(changes, ShouldBeNil)
+			})
+		})
+
+		Convey("When a new key inside the table array is written", func() {
+			_, _, err := render.EditTOML(doc, []render.Edit{{Path: "items.extra", Value: "x"}}, nil)
+
+			_, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then it is refused too", func() {
+				So(ok, ShouldBeTrue)
+			})
+		})
+
+		Convey("When the array itself is replaced with a matching owned hash", func() {
+			current := []any{map[string]any{"name": "a"}}
+			owned := render.Owned{"items": canonicalDigest(t, current)}
+
+			out, changes, err := render.EditTOML(doc, []render.Edit{{Path: "items", Value: map[string]any{"b": "c"}}}, owned)
+
+			_, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then the replacement is refused instead of emitting a duplicate table", func() {
+				So(ok, ShouldBeTrue)
+				So(out, ShouldBeNil)
+				So(changes, ShouldBeNil)
+			})
+		})
+
+		Convey("When an unrelated top-level key is edited", func() {
+			out, _, err := render.EditTOML(doc, []render.Edit{{Path: "other", Value: "x"}}, nil)
+
+			Convey("Then the edit still lands", func() {
+				So(err, ShouldBeNil)
+				So(string(out), ShouldContainSubstring, "other")
+			})
+		})
+	})
+}
+
+func TestEditJSONCDuplicateKeysRefused(t *testing.T) {
+	Convey("Given a document with a duplicated top-level key", t, func() {
+		doc := []byte(`{"hooks":{"a":1},"hooks":{"b":2}}`)
+
+		Convey("When the key is edited", func() {
+			out, changes, err := render.EditJSONC(doc, []render.Edit{{Path: "hooks", Value: map[string]any{"c": 3}}}, nil)
+
+			_, ok := errors.AsType[*render.ConfigParseError](err)
+
+			Convey("Then the ambiguous document is refused fail-closed", func() {
+				So(ok, ShouldBeTrue)
+				So(out, ShouldBeNil)
+				So(changes, ShouldBeNil)
+			})
+		})
+	})
+
+	Convey("Given a document with a duplicated nested key", t, func() {
+		Convey("When the nested key is edited", func() {
+			_, _, err := render.EditJSONC([]byte(`{"a":{"k":1,"k":2}}`), []render.Edit{{Path: "a.k", Value: 3}}, nil)
+
+			_, ok := errors.AsType[*render.ConfigParseError](err)
+
+			Convey("Then it is refused", func() {
+				So(ok, ShouldBeTrue)
+			})
+		})
+	})
+
+	Convey("Given a document without duplicates", t, func() {
+		Convey("When an owned key is edited", func() {
+			owned := render.Owned{"hooks": canonicalDigest(t, map[string]any{})}
+
+			out, _, err := render.EditJSONC([]byte(`{"hooks":{}}`), []render.Edit{{Path: "hooks", Value: map[string]any{"c": 3}}}, owned)
+
+			Convey("Then the edit still lands", func() {
+				So(err, ShouldBeNil)
+				So(string(out), ShouldEqualJSON, `{"hooks":{"c":3}}`)
+			})
+		})
+	})
+}
+
 func TestEditTOMLSurgical(t *testing.T) {
 	Convey("Given a Gemini command document with foreign keys and comments", t, func() {
 		file := []byte(`# my command
@@ -528,6 +625,137 @@ custom = 1
 				So(secondChanges, ShouldBeEmpty)
 				So(string(second), ShouldEqual, string(first))
 			})
+		})
+	})
+}
+
+func TestEditJSONCBOM(t *testing.T) {
+	Convey("Given a BOM-only document", t, func() {
+		out, changes, err := render.EditJSONC([]byte("\xEF\xBB\xBF"), []render.Edit{{Path: "model", Value: "gpt"}}, nil)
+
+		Convey("When an edit is applied", func() {
+			Convey("Then the BOM is stripped and the edit lands", func() {
+				So(err, ShouldBeNil)
+				So(changes, ShouldHaveLength, 1)
+				So(string(out), ShouldEqualJSON, `{"model":"gpt"}`)
+				So(strings.HasPrefix(string(out), "\xEF\xBB\xBF"), ShouldBeFalse)
+			})
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with CRLF endings and a comment", t, func() {
+		file := []byte("\xEF\xBB\xBF{\r\n  // keep\r\n  \"model\": \"gpt\"\r\n}\r\n")
+
+		out, changes, err := render.EditJSONC(file, []render.Edit{{Path: "model", Value: "new"}},
+			render.Owned{"model": canonicalDigest(t, "gpt")})
+
+		Convey("When the owned key is edited", func() {
+			Convey("Then the BOM is gone, the comment and CRLF endings survive", func() {
+				So(err, ShouldBeNil)
+				So(changes, ShouldHaveLength, 1)
+				So(strings.HasPrefix(string(out), "\xEF\xBB\xBF"), ShouldBeFalse)
+				So(string(out), ShouldContainSubstring, "// keep")
+				So(string(out), ShouldContainSubstring, "\r\n")
+				So(string(out), ShouldContainSubstring, `"new"`)
+
+				Convey("And a second edit with the reported digest parses the result", func() {
+					second, secondChanges, secondErr := render.EditJSONC(out,
+						[]render.Edit{{Path: "model", Value: "new"}}, render.Owned{"model": changes[0].Digest})
+
+					So(secondErr, ShouldBeNil)
+					So(secondChanges, ShouldBeEmpty)
+					So(string(second), ShouldEqual, string(out))
+				})
+			})
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with no applicable edit", t, func() {
+		file := []byte("\xEF\xBB\xBF{\"a\":1}")
+
+		out, changes, err := render.EditJSONC(file, nil, nil)
+
+		Convey("Then the original bytes are returned untouched", func() {
+			So(err, ShouldBeNil)
+			So(changes, ShouldBeEmpty)
+			So(out, ShouldResemble, file)
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with real corruption", t, func() {
+		out, changes, err := render.EditJSONC([]byte("\xEF\xBB\xBF{\"a\":"), []render.Edit{{Path: "a", Value: 1}}, nil)
+
+		Convey("Then it fails closed with a *ConfigParseError", func() {
+			_, ok := errors.AsType[*render.ConfigParseError](err)
+
+			So(ok, ShouldBeTrue)
+			So(out, ShouldBeNil)
+			So(changes, ShouldBeNil)
+		})
+	})
+}
+
+func TestEditTOMLBOM(t *testing.T) {
+	Convey("Given a BOM-only document", t, func() {
+		out, changes, err := render.EditTOML([]byte("\xEF\xBB\xBF"), []render.Edit{{Path: "model", Value: "gpt"}}, nil)
+
+		Convey("When a scalar is created", func() {
+			Convey("Then the BOM is stripped and the assignment lands", func() {
+				So(err, ShouldBeNil)
+				So(changes, ShouldHaveLength, 1)
+				So(string(out), ShouldEqual, "model = \"gpt\"\n")
+				So(strings.HasPrefix(string(out), "\xEF\xBB\xBF"), ShouldBeFalse)
+			})
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with CRLF endings and a comment", t, func() {
+		file := []byte("\xEF\xBB\xBF# keep\r\nmodel = \"gpt\"\r\n")
+
+		out, changes, err := render.EditTOML(file, []render.Edit{{Path: "model", Value: "new"}},
+			render.Owned{"model": canonicalDigest(t, "gpt")})
+
+		Convey("When the owned scalar is edited", func() {
+			Convey("Then the BOM is gone, the comment and CRLF endings survive", func() {
+				So(err, ShouldBeNil)
+				So(changes, ShouldHaveLength, 1)
+				So(strings.HasPrefix(string(out), "\xEF\xBB\xBF"), ShouldBeFalse)
+				So(string(out), ShouldContainSubstring, "# keep")
+				So(string(out), ShouldContainSubstring, "\r\n")
+
+				Convey("And a second edit with the reported digest parses the result", func() {
+					second, secondChanges, secondErr := render.EditTOML(out,
+						[]render.Edit{{Path: "model", Value: "new"}}, render.Owned{"model": changes[0].Digest})
+
+					So(secondErr, ShouldBeNil)
+					So(secondChanges, ShouldBeEmpty)
+					So(string(second), ShouldEqual, string(out))
+				})
+			})
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with no applicable edit", t, func() {
+		file := []byte("\xEF\xBB\xBFmodel = \"gpt\"\n")
+
+		out, changes, err := render.EditTOML(file, nil, nil)
+
+		Convey("Then the original bytes are returned untouched", func() {
+			So(err, ShouldBeNil)
+			So(changes, ShouldBeEmpty)
+			So(out, ShouldResemble, file)
+		})
+	})
+
+	Convey("Given a BOM-prefixed document with real corruption", t, func() {
+		out, changes, err := render.EditTOML([]byte("\xEF\xBB\xBFmodel = "), []render.Edit{{Path: "model", Value: "gpt"}}, nil)
+
+		Convey("Then it fails closed with a *ConfigParseError", func() {
+			_, ok := errors.AsType[*render.ConfigParseError](err)
+
+			So(ok, ShouldBeTrue)
+			So(out, ShouldBeNil)
+			So(changes, ShouldBeNil)
 		})
 	})
 }

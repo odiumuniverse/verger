@@ -17,6 +17,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/fsutil"
+	pkgid "github.com/odiumuniverse/verger/pkg/id"
 )
 
 // Schema is the receipt, journal event and tombstone schema version.
@@ -410,7 +411,7 @@ func (s *Store) List() ([]Receipt, error) {
 			continue
 		}
 
-		receipts, err := s.listTree(filepath.Join(s.dir, pkgDir.Name()), pkgDir.Name())
+		receipts, err := s.listTree(filepath.Join(s.dir, pkgDir.Name()))
 		if err != nil {
 			return nil, err
 		}
@@ -423,9 +424,8 @@ func (s *Store) List() ([]Receipt, error) {
 	return list, nil
 }
 
-// listTree reads one package subtree; pkg is the slash-joined package id built
-// from the directory names on the way down.
-func (s *Store) listTree(path, pkg string) ([]Receipt, error) {
+// listTree reads one package subtree.
+func (s *Store) listTree(path string) ([]Receipt, error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("read receipts dir %s: %w", path, err)
@@ -437,7 +437,7 @@ func (s *Store) listTree(path, pkg string) ([]Receipt, error) {
 		name := entry.Name()
 
 		if entry.IsDir() {
-			children, err := s.listTree(filepath.Join(path, name), pkg+"/"+name)
+			children, err := s.listTree(filepath.Join(path, name))
 			if err != nil {
 				return nil, err
 			}
@@ -452,7 +452,7 @@ func (s *Store) listTree(path, pkg string) ([]Receipt, error) {
 			continue
 		}
 
-		r, err := readReceiptFile(filepath.Join(path, name), pkg, host, scope)
+		r, err := s.readReceiptFile(filepath.Join(path, name), host, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -471,7 +471,7 @@ func leafKey(name string) (host, scope string, ok bool) {
 
 	for _, candidate := range []string{ScopeUser, ScopeProject} {
 		trimmed, found := strings.CutSuffix(name, "-"+candidate+".json")
-		if found && trimmed != "" && validElement(trimmed) {
+		if found && trimmed != "" && pkgid.ValidateElement(trimmed) {
 			return trimmed, candidate, true
 		}
 	}
@@ -479,8 +479,10 @@ func leafKey(name string) (host, scope string, ok bool) {
 	return "", "", false
 }
 
-// readReceiptFile parses one receipt file and checks it against its key.
-func readReceiptFile(path, pkg, host, scope string) (Receipt, error) {
+// readReceiptFile parses one receipt file and checks that its key resolves to
+// exactly this path: the canonical `//subpath` form maps onto nested
+// directories, so the stored package id is the authority.
+func (s *Store) readReceiptFile(path, host, scope string) (Receipt, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: the path is walked from the store root
 	if err != nil {
 		return Receipt{}, fmt.Errorf("read receipt %s: %w", path, err)
@@ -491,7 +493,12 @@ func readReceiptFile(path, pkg, host, scope string) (Receipt, error) {
 		return Receipt{}, err
 	}
 
-	if r.Package != pkg || r.Scope != scope || r.Host != host {
+	want, pathErr := s.cellPath(r.Package, r.Host, r.Scope)
+	if pathErr != nil || want != path {
+		return Receipt{}, &CorruptReceiptError{Path: path, Cause: errors.New("receipt does not match its path")}
+	}
+
+	if r.Scope != scope || r.Host != host {
 		return Receipt{}, &CorruptReceiptError{Path: path, Cause: errors.New("receipt does not match its key")}
 	}
 
@@ -641,29 +648,10 @@ func validScope(scope string) bool {
 	return scope == ScopeUser || scope == ScopeProject
 }
 
-// validElement reports whether value is safe as one path element.
-func validElement(value string) bool {
-	if value == "" || value == "." || value == ".." {
-		return false
-	}
-
-	for i := range len(value) {
-		c := value[i]
-
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '.', c == '_', c == '-', c == '+':
-		default:
-			return false
-		}
-	}
-
-	return true
-}
-
-// validateKeyElement rejects unsafe host/scope path elements.
+// validateKeyElement rejects unsafe host/scope path elements via the shared
+// grammar.
 func validateKeyElement(field, value string) error {
-	if !validElement(value) {
+	if !pkgid.ValidateElement(value) {
 		return &InvalidKeyError{Field: field, Value: value}
 	}
 
@@ -673,48 +661,14 @@ func validateKeyElement(field, value string) error {
 // fieldPackage names the package key in InvalidKeyError.
 const fieldPackage = "package"
 
-// validatePackage checks a package id for path safety; "/" nests, so each
-// segment must be safe.
+// validatePackage checks a canonical package id via the shared grammar;
+// violations map onto *InvalidKeyError.
 func validatePackage(pkg string) error {
-	switch {
-	case pkg == "":
+	if err := pkgid.ValidatePackage(pkg); err != nil {
 		return &InvalidKeyError{Field: fieldPackage, Value: pkg}
-	case strings.IndexByte(pkg, 0) >= 0, strings.Contains(pkg, `\`):
-		return &InvalidKeyError{Field: fieldPackage, Value: pkg}
-	case filepath.IsAbs(pkg), strings.HasPrefix(pkg, "/"):
-		return &InvalidKeyError{Field: fieldPackage, Value: pkg}
-	case strings.HasSuffix(pkg, "/"), strings.Contains(pkg, "//"):
-		return &InvalidKeyError{Field: fieldPackage, Value: pkg}
-	}
-
-	for seg := range strings.SplitSeq(pkg, "/") {
-		if !validPackageSegment(seg) {
-			return &InvalidKeyError{Field: fieldPackage, Value: pkg}
-		}
 	}
 
 	return nil
-}
-
-// validPackageSegment reports whether one package id segment is safe; the
-// registry forms additionally allow ":" and "@".
-func validPackageSegment(seg string) bool {
-	if seg == "" || seg == "." || seg == ".." {
-		return false
-	}
-
-	for i := range len(seg) {
-		c := seg[i]
-
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '.', c == '_', c == '-', c == '+', c == ':', c == '@':
-		default:
-			return false
-		}
-	}
-
-	return true
 }
 
 // ---- errors ------------------------------------------------------------------

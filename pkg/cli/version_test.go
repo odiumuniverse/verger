@@ -10,12 +10,11 @@ import (
 
 func TestVersionCommand(t *testing.T) {
 	Convey("Given a root command", t, func() {
-		root := NewRootCmd("1.2.3-test")
+		var out bytes.Buffer
+
+		root := NewRootCmd(Options{Version: "1.2.3-test", Out: &out, Err: &out})
 
 		Convey("When running version", func() {
-			var out bytes.Buffer
-			root.SetOut(&out)
-			root.SetErr(&out)
 			root.SetArgs([]string{"version"})
 
 			err := root.Execute()
@@ -30,7 +29,7 @@ func TestVersionCommand(t *testing.T) {
 
 func TestRootCommandUnknownSubcommand(t *testing.T) {
 	Convey("Given a root command", t, func() {
-		root := NewRootCmd("dev")
+		root := NewRootCmd(Options{Version: "dev"})
 		root.SetArgs([]string{"definitely-not-a-command"})
 
 		Convey("When running an unknown subcommand", func() {

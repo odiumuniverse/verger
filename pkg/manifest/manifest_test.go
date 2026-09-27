@@ -698,8 +698,15 @@ func TestParseDeterministic(t *testing.T) {
 }
 
 func TestParseDoesNotWrite(t *testing.T) {
-	Convey("Given the chimera fixture", t, func() {
+	Convey("Given the chimera fixture and a canary home", t, func() {
 		root := fixture(t, "chimera/acme")
+
+		canary := filepath.Join(t.TempDir(), "canary-home")
+		if err := os.MkdirAll(canary, 0o700); err != nil {
+			t.Fatalf("mkdir canary: %v", err)
+		}
+
+		t.Setenv("HOME", canary)
 
 		before := treeSnapshot(t, root)
 
@@ -720,8 +727,9 @@ func TestParseDoesNotWrite(t *testing.T) {
 			_, err = manifest.References(data, root, t.TempDir())
 			So(err, ShouldBeNil)
 
-			Convey("Then the tree is byte-identical", func() {
+			Convey("Then the tree is byte-identical and the canary home stays empty", func() {
 				So(treeSnapshot(t, root), ShouldResemble, before)
+				So(treeSnapshot(t, canary), ShouldResemble, map[string]string{".": "dir"})
 			})
 		})
 	})

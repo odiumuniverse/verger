@@ -1,0 +1,15 @@
+{
+  "name": "caveman",
+  "version": "1.2.3",
+  "description": "Caveman toolkit.",
+  "mcpServers": {
+    "fs": {
+      "command": "node",
+      "args": ["${extensionPath}/server.js"],
+      "env": {"TOKEN": "{secret:MCP_TOKEN}"}
+    },
+    "web": {
+      "httpUrl": "https://example.com/mcp"
+    }
+  }
+}

@@ -53,7 +53,7 @@ func (ExecRunner) Run(ctx context.Context, bin Binary, args []string, stdin []by
 	case err == nil:
 		return stdout.Bytes(), nil
 	case exited:
-		return stdout.Bytes(), &ExitError{Name: bin.Name, Code: exitErr.ExitCode(), Stderr: strings.TrimSpace(stderr.String()), Err: exitErr}
+		return stdout.Bytes(), &ExitError{Name: bin.Name, Code: exitErr.ExitCode(), Stderr: stderr.String(), Err: exitErr}
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, exec.ErrNotFound):
 		return stdout.Bytes(), fmt.Errorf("%s: %w: %w", bin.Name, ErrNotFound, err)
 	default:

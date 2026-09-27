@@ -83,12 +83,12 @@ func TestExecRunnerFailures(t *testing.T) {
 
 			exitErr, ok := errors.AsType[*hostcli.ExitError](err)
 
-			Convey("Then stdout, the exit code and stderr come back in an ExitError", func() {
+			Convey("Then stdout, the exit code and the verbatim stderr come back", func() {
 				So(ok, ShouldBeTrue)
 				So(string(out), ShouldEqual, "partial-out\n")
 				So(exitErr.Name, ShouldEqual, "claude")
 				So(exitErr.Code, ShouldEqual, 3)
-				So(exitErr.Stderr, ShouldEqual, "boom on stderr")
+				So(exitErr.Stderr, ShouldEqual, "boom on stderr\n")
 				So(errors.Is(err, hostcli.ErrNotFound), ShouldBeFalse)
 			})
 		})

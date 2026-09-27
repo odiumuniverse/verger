@@ -1,0 +1,20 @@
+[
+  {
+    "id": "foo@acme",
+    "version": "1.1.0",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "/home/u/.claude/plugins/cache/acme/foo/1.1.0",
+    "installedAt": "2026-09-27T16:20:16.111Z",
+    "lastUpdated": "2026-09-27T16:20:30.491Z"
+  },
+  {
+    "id": "skills--find-skills@vercel-labs",
+    "version": "1.0.0",
+    "scope": "user",
+    "enabled": false,
+    "installPath": "/home/u/.claude/plugins/cache/vercel-labs/skills--find-skills/1.0.0",
+    "installedAt": "2026-09-27T16:25:01.000Z",
+    "lastUpdated": "2026-09-27T16:25:01.000Z"
+  }
+]

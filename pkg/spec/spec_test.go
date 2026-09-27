@@ -571,6 +571,73 @@ func TestSave(t *testing.T) {
 	})
 }
 
+func TestSaveRefusesOutOfRangeSchema(t *testing.T) {
+	Convey("Given hand-built specs with an out-of-range schema", t, func() {
+		dir := t.TempDir()
+
+		Convey("When a newer schema is saved", func() {
+			path := filepath.Join(dir, "newer.toml")
+			doc := New()
+			doc.Schema = Schema + 1
+
+			err := doc.Save(path)
+
+			_, statErr := os.Stat(path)
+
+			Convey("Then it is refused with *SchemaNewerError, Path set and nothing written", func() {
+				detail, ok := errors.AsType[*SchemaNewerError](err)
+				So(ok, ShouldBeTrue)
+
+				if ok {
+					So(detail.Path, ShouldEqual, path)
+					So(detail.Found, ShouldEqual, Schema+1)
+					So(detail.Supported, ShouldEqual, Schema)
+				}
+
+				So(errors.Is(statErr, fs.ErrNotExist), ShouldBeTrue)
+			})
+		})
+
+		Convey("When a zero schema is saved", func() {
+			path := filepath.Join(dir, "zero.toml")
+			doc := &Spec{}
+
+			err := doc.Save(path)
+
+			_, statErr := os.Stat(path)
+
+			Convey("Then it is refused with *SchemaInvalidError, Path set and nothing written", func() {
+				detail, ok := errors.AsType[*SchemaInvalidError](err)
+				So(ok, ShouldBeTrue)
+
+				if ok {
+					So(detail.Path, ShouldEqual, path)
+					So(detail.Found, ShouldEqual, 0)
+				}
+
+				So(errors.Is(statErr, fs.ErrNotExist), ShouldBeTrue)
+			})
+		})
+
+		Convey("When an existing file would be replaced by an out-of-range schema", func() {
+			path := filepath.Join(dir, "existing.toml")
+			So(New().Save(path), ShouldBeNil)
+
+			before := mustReadFile(t, path)
+
+			bad := New()
+			bad.Schema = Schema + 1
+
+			err := bad.Save(path)
+
+			Convey("Then the stored bytes stay untouched", func() {
+				So(err, ShouldBeError)
+				So(mustReadFile(t, path), ShouldResemble, before)
+			})
+		})
+	})
+}
+
 func TestSaveWritesNoEnvironmentPaths(t *testing.T) {
 	Convey("Given a spec loaded from a file", t, func() {
 		source := filepath.Join(t.TempDir(), "in", "verger.toml")
@@ -726,9 +793,9 @@ func TestValidateID(t *testing.T) {
 			"JuliusBrussee/caveman",
 			"vercel-labs/skills//find-skills",
 			"mcp:io.github.github/github-mcp-server",
-			"./local/path",
 			"claude:caveman@caveman",
 			"a",
+			"a//b",
 		} {
 			Convey("Given the id "+id, func() {
 				Convey("When it is validated", func() {
@@ -743,7 +810,9 @@ func TestValidateID(t *testing.T) {
 	Convey("Given unsafe package ids", t, func() {
 		for _, id := range []string{
 			"",
+			".",
 			"/absolute",
+			"./local/path",
 			"trailing/",
 			"a/../b",
 			"..",
@@ -752,6 +821,10 @@ func TestValidateID(t *testing.T) {
 			`a\b`,
 			"a\x00b",
 			"a*b",
+			"a//",
+			"//x",
+			"a///b",
+			"a//b//c",
 		} {
 			Convey("Given the id "+strings.ReplaceAll(id, "\x00", "<NUL>"), func() {
 				Convey("When it is validated", func() {

@@ -37,7 +37,7 @@ func ParseCommandMarkdown(data []byte) (Command, error) {
 
 	body, ok, err := unmarshalFrontmatter(data, &raw)
 	if err != nil {
-		return Command{}, fmt.Errorf("parse frontmatter: %w", err)
+		return Command{}, &RenderError{Kind: kindCommand, Cause: err}
 	}
 
 	cmd := Command{Body: normalizeBody(body)}

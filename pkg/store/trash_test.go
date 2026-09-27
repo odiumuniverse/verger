@@ -1364,9 +1364,12 @@ func TestTrashPutRollbackMessage(t *testing.T) {
 		src := filepath.Join(t.TempDir(), "precious.txt")
 		mkFile(t, src, "precious", 0o600)
 
+		var bucket string
+
 		previous := writeEntryFile
 		writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
-			_ = os.RemoveAll(filepath.Dir(path))
+			bucket = filepath.Dir(path)
+			_ = os.RemoveAll(bucket)
 
 			return errors.New("disk full")
 		}
@@ -1375,10 +1378,46 @@ func TestTrashPutRollbackMessage(t *testing.T) {
 
 		_, err := tr.Put(context.Background(), src, PutOptions{})
 
-		Convey("Then the rollback error is truthful about the failed restore", func() {
+		Convey("Then the rollback error names the bucket it did not remove", func() {
 			So(err, ShouldBeError)
-			So(strings.Contains(err.Error(), "payload kept"), ShouldBeFalse)
 			So(strings.Contains(err.Error(), "rollback"), ShouldBeTrue)
+			So(strings.Contains(err.Error(), bucket), ShouldBeTrue)
+		})
+	})
+}
+
+func TestTrashPutRollbackKeepsBucket(t *testing.T) {
+	Convey("Given entry.json writing fails with the payload still in the bucket", t, func() {
+		st := newStore(t, time.Now)
+		tr := st.Trash()
+
+		src := filepath.Join(t.TempDir(), "precious.txt")
+		mkFile(t, src, "precious", 0o600)
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		previous := writeEntryFile
+		writeEntryFile = func(string, []byte, fs.FileMode) error {
+			cancel() // the rollback move must fail before it touches the payload
+
+			return errors.New("disk full")
+		}
+
+		defer func() { writeEntryFile = previous }()
+
+		_, err := tr.Put(ctx, src, PutOptions{})
+
+		Convey("Then the bucket and its payload survive and the error names the bucket", func() {
+			So(err, ShouldBeError)
+
+			names := bucketNames(t, st.TrashDir())
+			So(names, ShouldHaveLength, 1)
+
+			bucket := filepath.Join(st.TrashDir(), names[0])
+			So(strings.Contains(err.Error(), bucket), ShouldBeTrue)
+			So(fsutil.Exists(filepath.Join(bucket, "payload")), ShouldBeTrue)
+			So(string(readTestFile(t, filepath.Join(bucket, "payload"))), ShouldEqual, "precious")
+			So(fsutil.Exists(src), ShouldBeFalse)
 		})
 	})
 }

@@ -337,16 +337,9 @@ func mcpServersFromMap(format Format, file string, raw map[string]json.RawMessag
 	return servers
 }
 
-// mcpServerFromEntry infers the transport and reports unusable servers.
+// mcpServerFromEntry infers the transport and reports servers with no command
+// and no url, or an unsupported transport.
 func mcpServerFromEntry(format Format, file, name string, entry mcpEntry, warnings *[]string) (MCPServer, bool) {
-	switch entry.Type {
-	case "", transportStdio, transportStream, transportSSE, transportHTTPLeg:
-	default:
-		*warnings = append(*warnings, warning(format, file, fmt.Sprintf("mcp server %s has unsupported transport %q; skipped", name, entry.Type)))
-
-		return MCPServer{}, false
-	}
-
 	command := entry.Command
 	if len(entry.Args) > 0 {
 		command = append(slices.Clone(entry.Command), entry.Args...)
@@ -355,6 +348,20 @@ func mcpServerFromEntry(format Format, file, name string, entry mcpEntry, warnin
 	url := entry.URL
 	if url == "" {
 		url = entry.HTTPURL
+	}
+
+	if len(command) == 0 && url == "" {
+		*warnings = append(*warnings, warning(format, file, fmt.Sprintf("mcp server %s has neither command nor url; skipped", name)))
+
+		return MCPServer{}, false
+	}
+
+	switch entry.Type {
+	case "", transportStdio, transportStream, transportSSE, transportHTTPLeg:
+	default:
+		*warnings = append(*warnings, warning(format, file, fmt.Sprintf("mcp server %s has unsupported transport %q; skipped", name, entry.Type)))
+
+		return MCPServer{}, false
 	}
 
 	transport := ""
@@ -366,14 +373,10 @@ func mcpServerFromEntry(format Format, file, name string, entry mcpEntry, warnin
 		transport = transportStream
 	case entry.Type == transportStdio:
 		transport = transportStdio
-	case entry.HTTPURL != "" || entry.URL != "":
+	case url != "":
 		transport = transportStream
-	case len(command) > 0:
-		transport = transportStdio
 	default:
-		*warnings = append(*warnings, warning(format, file, fmt.Sprintf("mcp server %s has neither command nor url; skipped", name)))
-
-		return MCPServer{}, false
+		transport = transportStdio
 	}
 
 	return MCPServer{

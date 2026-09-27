@@ -2,6 +2,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/odiumuniverse/verger/pkg/fsutil"
+	pkgid "github.com/odiumuniverse/verger/pkg/id"
 )
 
 const (
@@ -153,21 +155,62 @@ func (s *Store) CacheDir() string {
 	return filepath.Join(s.root, dirCache)
 }
 
-// SynthPath returns <root>/synth/<pkg>/<version> without creating it. A
-// slashed package id nests directories.
+// SynthPath returns <root>/synth/<owner>/<name>/<version> without creating it
+// (decision F3): <root>/synth/<owner> is the owner marketplace root and every
+// package of the owner is one <name>/<version> dir below it. The elements come
+// from SynthElements.
 func (s *Store) SynthPath(pkg, version string) (string, error) {
-	if err := validatePackageID(pkg); err != nil {
+	owner, name, err := SynthElements(pkg)
+	if err != nil {
 		return "", err
 	}
 
-	if !ValidElement(version) {
+	if !pkgid.ValidateElement(version) {
 		return "", &InvalidIDError{Value: version, Reason: "invalid version element"}
 	}
 
-	return filepath.Join(s.root, dirSynth, filepath.FromSlash(pkg), version), nil
+	return filepath.Join(s.root, dirSynth, owner, name, version), nil
 }
 
-// EnsureSynthPath creates and returns <root>/synth/<pkg>/<version> with 0700.
+// SynthElements splits a package id into the owner and name elements of its
+// synth dir: the first id segment and the rest of the id. Each is escaped
+// reversibly — every byte outside [A-Za-z0-9._-] (the `/` and `//`
+// separators, `+`, `:`, `@`) becomes `+HH` — so distinct ids never share a
+// dir, while a plain owner/name id keeps its segments verbatim. An id without
+// an owner has no synth dir.
+func SynthElements(pkg string) (string, string, error) {
+	if err := packageIDError(pkg); err != nil {
+		return "", "", err
+	}
+
+	owner, rest, ok := strings.Cut(pkg, "/")
+	if !ok || strings.HasPrefix(rest, "/") {
+		return "", "", &InvalidIDError{Value: pkg, Reason: "a synth dir needs an owner/name id"}
+	}
+
+	return escapeSynthElement(owner), escapeSynthElement(rest), nil
+}
+
+// escapeSynthElement escapes every byte outside [A-Za-z0-9._-] as `+HH`.
+func escapeSynthElement(value string) string {
+	var out strings.Builder
+
+	for i := range len(value) {
+		c := value[i]
+
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			out.WriteByte(c)
+		default:
+			fmt.Fprintf(&out, "+%02X", c)
+		}
+	}
+
+	return out.String()
+}
+
+// EnsureSynthPath creates and returns <root>/synth/<owner>/<name>/<version>
+// with 0700.
 func (s *Store) EnsureSynthPath(pkg, version string) (string, error) {
 	path, err := s.SynthPath(pkg, version)
 	if err != nil {
@@ -182,13 +225,14 @@ func (s *Store) EnsureSynthPath(pkg, version string) (string, error) {
 }
 
 // PackageDataPath returns <root>/data/<pkg>/<host> without creating it. A
-// slashed package id nests directories.
+// slashed package id nests directories; the canonical `//subpath` separator
+// nests like any other slash.
 func (s *Store) PackageDataPath(pkg, host string) (string, error) {
-	if err := validatePackageID(pkg); err != nil {
+	if err := packageIDError(pkg); err != nil {
 		return "", err
 	}
 
-	if !ValidElement(host) {
+	if !pkgid.ValidateElement(host) {
 		return "", &InvalidIDError{Value: host, Reason: "invalid host element"}
 	}
 
@@ -211,11 +255,11 @@ func (s *Store) EnsurePackageData(pkg, host string) (string, error) {
 
 // RuntimePath returns <root>/runtime/<host>/<version> without creating it.
 func (s *Store) RuntimePath(host, version string) (string, error) {
-	if !ValidElement(host) {
+	if !pkgid.ValidateElement(host) {
 		return "", &InvalidIDError{Value: host, Reason: "invalid host element"}
 	}
 
-	if !ValidElement(version) {
+	if !pkgid.ValidateElement(version) {
 		return "", &InvalidIDError{Value: version, Reason: "invalid version element"}
 	}
 
@@ -242,57 +286,21 @@ func (s *Store) Trash() *Trash {
 	return s.trash
 }
 
-// ValidElement reports whether s is safe as one path element (host, version,
-// trash id): non-empty, not "."/"..", and only letters, digits, `._-+`.
-func ValidElement(s string) bool {
-	return validSegment(s, "")
-}
-
-// validSegment reports whether seg is a safe path element; extra lists
-// additional single-byte characters the segment may contain.
-func validSegment(seg, extra string) bool {
-	if seg == "" || seg == "." || seg == ".." {
-		return false
+// packageIDError converts a package-id grammar violation into a store
+// *InvalidIDError; a nil error means the id is valid. The grammar itself lives
+// in pkg/id (T1.11 G.7).
+func packageIDError(pkg string) error {
+	err := pkgid.ValidatePackage(pkg)
+	if err == nil {
+		return nil
 	}
 
-	for i := range len(seg) {
-		c := seg[i]
-
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '.', c == '_', c == '-', c == '+':
-		case extra != "" && strings.IndexByte(extra, c) >= 0:
-		default:
-			return false
-		}
+	reason := err.Error()
+	if target, ok := errors.AsType[*pkgid.InvalidIDError](err); ok {
+		reason = target.Reason
 	}
 
-	return true
-}
-
-// validatePackageID checks a package id for path safety: segments of
-// letters/digits/`._-+:@` separated by single slashes, no absolute path.
-func validatePackageID(pkg string) error {
-	switch {
-	case pkg == "":
-		return &InvalidIDError{Value: pkg, Reason: "empty package id"}
-	case strings.IndexByte(pkg, 0) >= 0:
-		return &InvalidIDError{Value: pkg, Reason: "NUL byte"}
-	case strings.Contains(pkg, `\`):
-		return &InvalidIDError{Value: pkg, Reason: "backslash"}
-	case filepath.IsAbs(pkg), strings.HasPrefix(pkg, "/"):
-		return &InvalidIDError{Value: pkg, Reason: "absolute path"}
-	case strings.HasSuffix(pkg, "/"), strings.Contains(pkg, "//"):
-		return &InvalidIDError{Value: pkg, Reason: "empty path segment"}
-	}
-
-	for seg := range strings.SplitSeq(pkg, "/") {
-		if !validSegment(seg, ":@") {
-			return &InvalidIDError{Value: pkg, Reason: "invalid path segment " + seg}
-		}
-	}
-
-	return nil
+	return &InvalidIDError{Value: pkg, Reason: reason}
 }
 
 // InvalidIDError reports a package id, host, version or trash id that is not

@@ -280,7 +280,11 @@ func TestMCPDocumentInference(t *testing.T) {
 			"headers-env": {"type": "stdio", "command": "env-mcp", "env": {"KEY": "{secret:KEY}"}, "headers": {"X": "{secret:X}"}},
 			"unknown-type": {"type": "ws", "url": "https://f.test"},
 			"neither": {"name": "nothing"},
-			"empty": {}
+			"empty": {},
+			"typed-empty-stdio": {"type": "stdio"},
+			"typed-empty-sse": {"type": "sse"},
+			"typed-empty-http": {"type": "streamable-http"},
+			"typed-empty-alias": {"type": "http"}
 		}}`)
 
 		Convey("When it is parsed", func() {
@@ -307,6 +311,10 @@ func TestMCPDocumentInference(t *testing.T) {
 				So(pkg.Warnings, ShouldResemble, []string{
 					"claude: .mcp.json: mcp server empty has neither command nor url; skipped",
 					"claude: .mcp.json: mcp server neither has neither command nor url; skipped",
+					"claude: .mcp.json: mcp server typed-empty-alias has neither command nor url; skipped",
+					"claude: .mcp.json: mcp server typed-empty-http has neither command nor url; skipped",
+					"claude: .mcp.json: mcp server typed-empty-sse has neither command nor url; skipped",
+					"claude: .mcp.json: mcp server typed-empty-stdio has neither command nor url; skipped",
 					`claude: .mcp.json: mcp server unknown-type has unsupported transport "ws"; skipped`,
 				})
 			})

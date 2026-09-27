@@ -25,7 +25,9 @@ type HookPlan struct {
 // The value for the host's `hooks` key is returned as strict JSON, ready for
 // EditJSONC path "hooks"; foreign entries inside the hooks object are kept.
 // existing may be the whole config document or the bare hooks object, and nil
-// when the file does not exist.
+// when the file does not exist. `existing` must be strict JSON: a JSONC caller
+// (a settings.json with comments or trailing commas) standardizes the document
+// first (hujson) and passes the `hooks` member.
 func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook) (HookPlan, error) {
 	events, ok := hookEventsFor(format)
 	if !ok {

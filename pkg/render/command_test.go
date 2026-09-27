@@ -112,8 +112,11 @@ Review $1 please.
 		Convey("When it is parsed", func() {
 			_, err := render.ParseCommandMarkdown([]byte("---\ndescription: [unclosed\n---\nBody\n"))
 
-			Convey("Then an error is reported", func() {
-				So(err, ShouldBeError)
+			target, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then the typed render error is reported", func() {
+				So(ok, ShouldBeTrue)
+				So(target.Kind, ShouldEqual, "command")
 			})
 		})
 	})

@@ -27,7 +27,8 @@ import (
 var ErrNotFound = errors.New("host CLI not found")
 
 // ExitError reports a host CLI that ran and exited non-zero: the host itself
-// rejected the call.
+// rejected the call. Stderr carries the child's stderr verbatim, padding
+// included.
 type ExitError struct {
 	Name   string
 	Code   int
@@ -86,7 +87,8 @@ type Record struct {
 type Records map[string]Record
 
 // LoadRecords reads the records file; a missing file is no records. A file
-// that is not a JSON object is a *RecordsParseError.
+// that is not a JSON object — including a JSON null, which decodes to a nil
+// map — is a *RecordsParseError.
 func LoadRecords(path string) (Records, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: the records file path is resolved by the caller's home
 	if errors.Is(err, fs.ErrNotExist) {
@@ -103,12 +105,21 @@ func LoadRecords(path string) (Records, error) {
 		return nil, &RecordsParseError{Path: path, Cause: err}
 	}
 
+	if records == nil {
+		return nil, &RecordsParseError{Path: path, Cause: errors.New("the records document is not a JSON object")}
+	}
+
 	return records, nil
 }
 
 // Save writes the records file through fsutil.WriteFileAtomic with 0600 and
-// creates the parent directory with 0700.
+// creates the parent directory with 0700. A nil Records is saved as an empty
+// object, so a nil save round-trips through LoadRecords as empty.
 func (r Records) Save(path string) error {
+	if r == nil {
+		r = Records{}
+	}
+
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode host CLI records: %w", err)
@@ -198,7 +209,9 @@ func (r *Resolver) Resolve(name string) (Binary, error) {
 // Check verifies that a recorded location still holds the named executable:
 // an absolute clean path whose base name is the CLI's, a regular executable
 // file (symlinks followed) that other users cannot write, and, for an env
-// shebang script, an interpreter reachable on the recorded PATH.
+// shebang script, an interpreter reachable on the recorded PATH. The check is
+// point-in-time: the record was written by an attended run the user trusted,
+// and a later rename or looser directory permissions are not re-validated.
 func Check(name string, record Record) error {
 	path := record.Path
 

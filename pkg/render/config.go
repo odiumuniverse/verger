@@ -47,11 +47,12 @@ func (e *HandsOffError) Error() string {
 }
 
 // EditJSONC applies key-path edits to a JSONC document, preserving comments and
-// foreign keys with hujson. A key verger never wrote (or whose owned digest no
-// longer matches) is hands-off: nothing is written. Unparsable documents are a
-// *ConfigParseError.
+// foreign keys with hujson. A leading UTF-8 BOM is stripped before parsing
+// (decision T0.5 Q3); an untouched document is returned byte-identical. A key
+// verger never wrote (or whose owned digest no longer matches) is hands-off:
+// nothing is written. Unparsable documents are a *ConfigParseError.
 func EditJSONC(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error) {
-	source := file
+	source := stripBOM(file)
 	if len(bytes.TrimSpace(source)) == 0 {
 		source = []byte("{}")
 	}
@@ -80,6 +81,10 @@ func EditJSONC(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error)
 		return file, nil, nil
 	}
 
+	if key, duplicate := duplicateJSONCKey(&root); duplicate {
+		return nil, nil, &ConfigParseError{Cause: fmt.Errorf("the config repeats the key %q", key)}
+	}
+
 	var (
 		changes []Change
 		changed bool
@@ -105,6 +110,41 @@ func EditJSONC(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error)
 	}
 
 	return root.Pack(), changes, nil
+}
+
+// duplicateJSONCKey reports the first object key a document repeats. JSON
+// semantics keep the last duplicate, while the hujson edit helpers would edit
+// the first, so an ambiguous document is refused instead of half-edited.
+func duplicateJSONCKey(root *hujson.Value) (string, bool) {
+	switch value := root.Value.(type) {
+	case *hujson.Object:
+		seen := map[string]bool{}
+
+		for i := range value.Members {
+			name, ok := hujsonMemberName(&value.Members[i])
+			if !ok {
+				continue
+			}
+
+			if seen[name] {
+				return name, true
+			}
+
+			seen[name] = true
+
+			if key, found := duplicateJSONCKey(&value.Members[i].Value); found {
+				return key, true
+			}
+		}
+	case *hujson.Array:
+		for i := range value.Elements {
+			if key, found := duplicateJSONCKey(&value.Elements[i]); found {
+				return key, true
+			}
+		}
+	}
+
+	return "", false
 }
 
 // applyJSONCEdit validates and applies one edit; a nil change means no-op.
@@ -157,20 +197,25 @@ func applyJSONCEdit(root *hujson.Value, doc map[string]any, edit Edit, owned Own
 }
 
 // EditTOML applies key-path edits to a TOML document with the same ownership
-// semantics as EditJSONC, on top of a comment-preserving span editor. A
-// two-segment map value is written as a [section.sub] table block.
+// semantics as EditJSONC, on top of a comment-preserving span editor. A leading
+// UTF-8 BOM is stripped before parsing (decision T0.5 Q3); an untouched document
+// is returned byte-identical. A two-segment map value is written as a
+// [section.sub] table block.
 func EditTOML(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error) {
+	source := stripBOM(file)
+
 	doc := map[string]any{}
 
-	if len(bytes.TrimSpace(file)) > 0 {
-		if err := toml.Unmarshal(file, &doc); err != nil {
+	if len(bytes.TrimSpace(source)) > 0 {
+		if err := toml.Unmarshal(source, &doc); err != nil {
 			return nil, nil, &ConfigParseError{Cause: err}
 		}
 	}
 
-	spans := scanTOMLSpans(file)
-	tables := scanTOMLTables(file)
-	eol := tomlEOL(file)
+	spans := scanTOMLSpans(source)
+	tables := scanTOMLTables(source)
+	arrayOfTables := scanTOMLArrayOfTables(source)
+	eol := tomlEOL(source)
 
 	if len(edits) == 0 {
 		return file, nil, nil
@@ -183,7 +228,7 @@ func EditTOML(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error) 
 	)
 
 	for _, edit := range edits {
-		editCuts, change, err := applyTOMLEdit(file, spans, tables, doc, eol, edit, owned)
+		editCuts, change, err := applyTOMLEdit(source, spans, tables, arrayOfTables, doc, eol, edit, owned)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -202,20 +247,16 @@ func EditTOML(file []byte, edits []Edit, owned Owned) ([]byte, []Change, error) 
 		return file, nil, nil
 	}
 
-	return applyTOMLCuts(file, cuts), changes, nil
+	return applyTOMLCuts(source, cuts), changes, nil
 }
 
 // applyTOMLEdit validates and places one edit; a nil change means no-op.
 func applyTOMLEdit(
-	file []byte, spans tomlSpanScan, tables []tomlTableSpan, doc map[string]any, eol string, edit Edit, owned Owned,
+	file []byte, spans tomlSpanScan, tables []tomlTableSpan, arrayOfTables [][]string, doc map[string]any, eol string, edit Edit, owned Owned,
 ) ([]tomlCut, *Change, error) {
-	path, err := splitEditPath(edit.Path)
+	path, err := tomlEditPath(arrayOfTables, edit)
 	if err != nil {
-		return nil, nil, &RenderError{Kind: kindConfig, Name: edit.Path, Cause: err}
-	}
-
-	if !edit.Delete && edit.Value == nil {
-		return nil, nil, &RenderError{Kind: kindConfig, Name: edit.Path, Cause: errors.New("nil value without delete")}
+		return nil, nil, err
 	}
 
 	current, exists := tomlLookup(doc, path)
@@ -261,6 +302,37 @@ func applyTOMLEdit(
 	_ = setAt(doc, path, edit.Value)
 
 	return placement, &Change{Path: edit.Path, Existed: exists, Previous: current, Digest: canonicalDigest(edit.Value)}, nil
+}
+
+// tomlEditPath validates one TOML edit and returns its key path: the path must
+// split, a set needs a value, and the key must not lie inside an array of
+// tables.
+func tomlEditPath(arrayOfTables [][]string, edit Edit) ([]string, error) {
+	path, err := splitEditPath(edit.Path)
+	if err != nil {
+		return nil, &RenderError{Kind: kindConfig, Name: edit.Path, Cause: err}
+	}
+
+	if !edit.Delete && edit.Value == nil {
+		return nil, &RenderError{Kind: kindConfig, Name: edit.Path, Cause: errors.New("nil value without delete")}
+	}
+
+	if traversesArrayOfTables(arrayOfTables, path) {
+		return nil, &RenderError{
+			Kind:  kindConfig,
+			Name:  edit.Path,
+			Cause: errors.New("the key lies inside an array of tables this editor cannot rewrite"),
+		}
+	}
+
+	return path, nil
+}
+
+// stripBOM removes a leading UTF-8 byte order mark: hand-edited configs from
+// Windows editors carry one and it never changes the document semantics
+// (decision T0.5 Q3, same policy as pkg/spec).
+func stripBOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 }
 
 // canonicalDigest hashes a config value in its canonical JSON form (json.Marshal

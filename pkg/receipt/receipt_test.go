@@ -235,7 +235,8 @@ func TestReceiptInvalidKeys(t *testing.T) {
 
 		keys := []keyCase{
 			{"package", "", "claude", ScopeUser},
-			{"package", "a//b", "claude", ScopeUser},
+			{"package", "a//", "claude", ScopeUser},
+			{"package", "a///b", "claude", ScopeUser},
 			{"package", "/abs", "claude", ScopeUser},
 			{"package", `a\b`, "claude", ScopeUser},
 			{"host", "owner/name", "a/b", ScopeUser},
@@ -246,8 +247,8 @@ func TestReceiptInvalidKeys(t *testing.T) {
 			{"scope", "owner/name", "claude", ""},
 		}
 
-		unsafeButShaped := keys[1:6]
-		shapeKeys := append([]keyCase{keys[0]}, keys[6:]...)
+		unsafeButShaped := keys[1:7]
+		shapeKeys := append([]keyCase{keys[0]}, keys[7:]...)
 
 		for _, tc := range unsafeButShaped {
 			Convey("When Put gets the unsafe key "+tc.pkg+"/"+tc.host+"/"+tc.scope, func() {
@@ -292,6 +293,47 @@ func TestReceiptInvalidKeys(t *testing.T) {
 				})
 			})
 		}
+	})
+}
+
+func TestReceiptSubpathPackage(t *testing.T) {
+	Convey("Given a receipt for a canonical subpath id", t, func() {
+		dir := filepath.Join(t.TempDir(), "receipts")
+		store := NewStore(dir)
+
+		r := sampleReceipt()
+		r.Package = "vercel-labs/skills//find-skills"
+
+		Convey("When it is put, got and listed", func() {
+			So(store.Put(r), ShouldBeNil)
+
+			got, ok, err := store.Get(r.Package, r.Host, r.Scope)
+			So(err, ShouldBeNil)
+			So(ok, ShouldBeTrue)
+			So(got.Package, ShouldEqual, r.Package)
+
+			list, listErr := store.List()
+			So(listErr, ShouldBeNil)
+			So(list, ShouldHaveLength, 1)
+			So(list[0].Package, ShouldEqual, r.Package)
+
+			_, statErr := os.Stat(filepath.Join(dir, "vercel-labs", "skills", "find-skills", "claude-user.json"))
+			So(statErr, ShouldBeNil)
+		})
+
+		Convey("When an id that maps to the same cell is put", func() {
+			So(store.Put(r), ShouldBeNil)
+
+			other := sampleReceipt()
+			other.Package = "vercel-labs/skills/find-skills"
+
+			err := store.Put(other)
+
+			Convey("Then the write is refused as a key collision", func() {
+				_, ok := errors.AsType[*KeyCollisionError](err)
+				So(ok, ShouldBeTrue)
+			})
+		})
 	})
 }
 

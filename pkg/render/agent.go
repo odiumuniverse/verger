@@ -2,7 +2,6 @@ package render
 
 import (
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 )
@@ -59,7 +58,7 @@ func ParseAgentMarkdown(data []byte) (Agent, error) {
 
 	body, ok, err := unmarshalFrontmatter(data, &raw)
 	if err != nil {
-		return Agent{}, fmt.Errorf("parse frontmatter: %w", err)
+		return Agent{}, &RenderError{Kind: kindAgent, Cause: err}
 	}
 
 	agent := Agent{Body: normalizeBody(body)}

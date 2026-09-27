@@ -332,7 +332,7 @@ func loadState[T any](path string) (T, bool, error) {
 	}
 
 	if err != nil {
-		return doc, false, fmt.Errorf("read %s: %w", path, err)
+		return doc, false, &ConsentParseError{Path: path, Cause: err}
 	}
 
 	if err := json.Unmarshal(data, &doc); err != nil {

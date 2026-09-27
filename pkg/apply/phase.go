@@ -1,0 +1,1844 @@
+package apply
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/vmkteam/embedlog"
+
+	"github.com/odiumuniverse/verger/pkg/digest"
+	"github.com/odiumuniverse/verger/pkg/host"
+	"github.com/odiumuniverse/verger/pkg/lock"
+	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/render"
+	"github.com/odiumuniverse/verger/pkg/store"
+)
+
+// intentExtraKey names the journal Extra field that carries the crash-replay
+// intent of one action.
+const intentExtraKey = "intent"
+
+// intentRecord is the journaled pre-write plan of one action: what will be
+// written and how to reverse it. A restart uses it to forward-commit a
+// completed install or roll back a partial one without touching the adapter
+// again.
+type intentRecord struct {
+	Action    Action             `json:"action"`
+	Artifacts []receipt.Artifact `json:"artifacts"`
+	RMA       []receipt.Op       `json:"rma"`
+}
+
+// Test seams: production leaves them nil. They exist for the crash-replay
+// tests, the accepted package-var exception (pkg/store/trash.go precedent).
+var (
+	// crashAfterInstall aborts the process between the install phase and the
+	// receipt commit.
+	crashAfterInstall func()
+	// crashAfterReceipt aborts the process after the receipt commit and before
+	// the lock commit.
+	crashAfterReceipt func()
+)
+
+// Event step names.
+const (
+	stepPlan     = "plan"
+	stepInstall  = "install"
+	stepVerify   = "verify"
+	stepRemove   = "remove"
+	stepRollback = "rollback"
+	stepReceipt  = "receipt"
+	stepLock     = "lock"
+)
+
+// Removal causes applied when the plan leaves the cause empty.
+const defaultCause = string(receipt.CauseUser)
+
+// Trash causes apply records for its own operations.
+const (
+	causeConflict = "conflict"
+	causeUpdate   = "update"
+	causeRollback = "rollback"
+	causeRecovery = "recovery"
+)
+
+// maxConflictAttempts bounds the trash-and-retry loop of one confirmed
+// collision.
+const maxConflictAttempts = 8
+
+// cellKey identifies one (package, host, scope) cell.
+type cellKey struct {
+	pkg   string
+	host  string
+	scope string
+}
+
+// rmaRef carries the cell identity needed to execute or record RMA ops.
+type rmaRef struct {
+	pkg      string
+	host     host.ID
+	scope    string
+	strategy string
+	version  string
+}
+
+// rmaMode tells the RMA executor how a digest mismatch is interpreted.
+type rmaMode int
+
+const (
+	// modeRemove executes the RMA of a removal or of a dropped artifact: a
+	// mismatch is drift and the target is left in place (hands-off).
+	modeRemove rmaMode = iota
+	// modeRollback undoes a just-attempted install: a mismatch means the step
+	// never ran, so there is nothing to undo.
+	modeRollback
+)
+
+// rmaOutcome reports what an RMA execution did.
+type rmaOutcome struct {
+	notes    []string
+	trashID  string
+	handsOff bool
+	err      error
+}
+
+// recoveredCell is the crash-replay verdict for one cell.
+type recoveredCell struct {
+	status  Status
+	version string
+	note    string
+}
+
+// runner carries one Run call.
+type runner struct {
+	ctx context.Context //nolint:containedctx // the runner is a short-lived per-Run value carrying the call context
+
+	deps   Deps
+	plan   Plan
+	opts   Options
+	now    func() time.Time
+	logger embedlog.Logger
+
+	lockPath string
+	lockGen  int
+
+	mu          sync.Mutex
+	lockChanged bool
+	cells       []CellResult
+	breakers    map[host.ID]CircuitState
+	notes       []string
+	recovered   map[cellKey]recoveredCell
+	confirmErr  error
+}
+
+// newRunner builds the per-run state.
+func newRunner(ctx context.Context, deps Deps, plan Plan, opts Options) *runner {
+	r := &runner{
+		ctx:       ctx,
+		deps:      deps,
+		plan:      plan,
+		opts:      opts,
+		now:       opts.Now,
+		logger:    opts.Logger,
+		lockPath:  deps.LockPath,
+		breakers:  map[host.ID]CircuitState{},
+		recovered: map[cellKey]recoveredCell{},
+	}
+
+	if r.lockPath == "" {
+		r.lockPath = deps.Home.LockPath()
+	}
+
+	r.cells = make([]CellResult, len(plan.Actions))
+
+	return r
+}
+
+// recover reads the journal and finishes every interrupted action without
+// touching the adapters again. Read failures are fatal; per-intent failures
+// only add notes.
+func (r *runner) recover() error {
+	events, err := r.deps.Journal.Read()
+	if err != nil {
+		return &ReceiptError{Cause: fmt.Errorf("read journal: %w", err)}
+	}
+
+	lastCommit := r.trackGenerations(events)
+
+	// Only intents after the last lock commit can be incomplete: a committed
+	// event closes every action of its run.
+	pending := pendingIntents(events, lastCommit)
+
+	if r.opts.DryRun {
+		for _, event := range pending {
+			r.note("dry-run: interrupted action %s on %s would be replayed", event.Package, event.Host)
+		}
+
+		return nil
+	}
+
+	intents, undecodable := lastIntents(pending)
+
+	for _, event := range undecodable {
+		r.note("journal: intent event %d cannot be decoded; ignored", event.Seq)
+	}
+
+	for _, event := range intents {
+		if err := r.recoverIntent(event); err != nil {
+			r.note("recovery of %s on %s: %v", event.Package, event.Host, err)
+		}
+	}
+
+	return nil
+}
+
+// trackGenerations records the highest lock generation and returns the seq of
+// the last lock commit.
+func (r *runner) trackGenerations(events []receipt.Event) int64 {
+	lastCommit := int64(0)
+
+	for _, event := range events {
+		if event.LockGeneration > r.lockGen {
+			r.lockGen = event.LockGeneration
+		}
+
+		if event.Kind == receipt.EventLock && event.Seq > lastCommit {
+			lastCommit = event.Seq
+		}
+	}
+
+	return lastCommit
+}
+
+// pendingIntents lists intent events after the last lock commit.
+func pendingIntents(events []receipt.Event, after int64) []receipt.Event {
+	pending := make([]receipt.Event, 0, len(events))
+
+	for _, event := range events {
+		if event.Seq <= after {
+			continue
+		}
+
+		if _, ok := event.Extra[intentExtraKey]; ok {
+			pending = append(pending, event)
+		}
+	}
+
+	return pending
+}
+
+// lastIntents keeps the newest intent per cell and lists undecodable events.
+func lastIntents(pending []receipt.Event) ([]receipt.Event, []receipt.Event) {
+	last := map[cellKey]receipt.Event{}
+	order := make([]cellKey, 0)
+	undecodable := make([]receipt.Event, 0)
+
+	for _, event := range pending {
+		var intent intentRecord
+
+		if err := json.Unmarshal(event.Extra[intentExtraKey], &intent); err != nil {
+			undecodable = append(undecodable, event)
+
+			continue
+		}
+
+		key := cellKey{intent.Action.Delivery.Package.ID, string(intent.Action.Host), intentScope(intent.Action)}
+
+		if _, seen := last[key]; !seen {
+			order = append(order, key)
+		}
+
+		last[key] = event
+	}
+
+	out := make([]receipt.Event, 0, len(order))
+
+	for _, key := range order {
+		out = append(out, last[key])
+	}
+
+	return out, undecodable
+}
+
+// recoverIntent completes or rolls back one interrupted action.
+func (r *runner) recoverIntent(event receipt.Event) error {
+	var intent intentRecord
+
+	if err := json.Unmarshal(event.Extra[intentExtraKey], &intent); err != nil {
+		return fmt.Errorf("decode intent: %w", err)
+	}
+
+	switch intent.Action.Kind {
+	case ActionInstall, ActionUpdate:
+		return r.recoverInstall(event, intent)
+	case ActionRemove:
+		return r.recoverRemove(event, intent)
+	default:
+		return fmt.Errorf("unknown intent kind %q", intent.Action.Kind)
+	}
+}
+
+// recoverInstall finalises one interrupted install/update: a receipt with the
+// same version and strategy means the action committed; matching artifacts mean
+// the install happened and the receipt is written forward; anything else rolls
+// back through the intent RMA.
+func (r *runner) recoverInstall(event receipt.Event, intent intentRecord) error {
+	action := intent.Action
+	pkg := action.Delivery.Package
+	scope := intentScope(action)
+
+	rec, ok, err := r.deps.Receipts.Get(pkg.ID, string(action.Host), scope)
+	if err != nil {
+		return &ReceiptError{Package: pkg.ID, Host: string(action.Host), Cause: err}
+	}
+
+	if ok && rec.Version == pkg.Version && rec.Strategy == string(action.Delivery.Strategy) {
+		r.upsertLock(rec)
+
+		r.markRecovered(cellKey{pkg.ID, string(action.Host), scope}, StatusCurrent, pkg.Version,
+			"recovered: the interrupted action had already committed")
+		r.note("recovered: the interrupted %s of %s %s on %s had already committed", action.Kind, pkg.ID, pkg.Version, action.Host)
+
+		return nil
+	}
+
+	verified, verifiable := r.verifyArtifacts(intent)
+
+	if verifiable && verified {
+		notes := r.dropOld(action, host.Result{RMA: intent.RMA})
+
+		rma, stale := r.commitRMA(intent.RMA, action.Previous, pkg.ID, string(action.Host))
+
+		installed := event.At
+		if action.Previous != nil && !action.Previous.InstalledAt.IsZero() {
+			installed = action.Previous.InstalledAt
+		}
+
+		record := receipt.Receipt{
+			Schema: receipt.Schema, Package: pkg.ID, Host: string(action.Host), Scope: scope,
+			Strategy: string(action.Delivery.Strategy), Version: pkg.Version,
+			InstalledAt: installed, UpdatedAt: r.now(),
+			Artifacts: intent.Artifacts, RMA: rma,
+		}
+
+		if err := r.deps.Receipts.Put(record); err != nil {
+			return &ReceiptError{Package: pkg.ID, Host: string(action.Host), Cause: err}
+		}
+
+		for _, note := range r.purgeStale(stale) {
+			r.note("%s", note)
+		}
+
+		r.upsertLock(record)
+		r.markRecovered(cellKey{pkg.ID, string(action.Host), scope}, StatusCurrent, pkg.Version,
+			"recovered: the interrupted install was committed from the journal")
+		r.note("recovered: committed the interrupted install of %s %s on %s", pkg.ID, pkg.Version, action.Host)
+
+		for _, note := range notes {
+			r.note("%s", note)
+		}
+
+		return nil
+	}
+
+	return r.rollbackInstall(intent, action, scope)
+}
+
+// rollbackInstall undoes one interrupted install with the intent RMA, whose
+// replaced ops lost their backup ids in the crash, and reports what actually
+// happened: a partial rollback must not claim recovery.
+func (r *runner) rollbackInstall(intent intentRecord, action Action, scope string) error {
+	pkg := action.Delivery.Package
+
+	// The intent RMA is the dry plan: replaced ops lost their backup ids in
+	// the crash. Resolve them from the trash exactly like the forward-commit
+	// and in-process failure paths, so the user's original bytes come back.
+	ops := r.resolveBackups(intent.RMA, action.Previous, pkg.ID, string(action.Host))
+
+	outcome := r.executeRMA(action.Host, rmaRef{
+		pkg: pkg.ID, host: action.Host, scope: scope,
+		strategy: string(action.Delivery.Strategy), version: pkg.Version,
+	}, ops, causeRecovery, modeRollback)
+	if outcome.err != nil {
+		return fmt.Errorf("roll back interrupted install: %w", outcome.err)
+	}
+
+	for _, note := range outcome.notes {
+		r.note("%s", note)
+	}
+
+	if outcome.handsOff {
+		r.note("recovery incomplete: the interrupted install of %s %s on %s could not be fully rolled back; some artifacts were left in place",
+			pkg.ID, pkg.Version, action.Host)
+	} else {
+		r.note("recovered: rolled back the interrupted install of %s %s on %s", pkg.ID, pkg.Version, action.Host)
+	}
+
+	return nil
+}
+
+// recoverRemove rolls one interrupted removal forward: the RMA is idempotent,
+// so completing it is always safe.
+func (r *runner) recoverRemove(event receipt.Event, intent intentRecord) error {
+	action := intent.Action
+	if action.Previous == nil {
+		return errors.New("remove intent without a previous receipt")
+	}
+
+	pkg := action.Previous.Package
+	scope := action.Previous.Scope
+
+	if committed, err := r.removeCommitted(event, pkg, string(action.Host), scope); err != nil {
+		return err
+	} else if committed {
+		r.deleteLock(pkg, string(action.Host), scope)
+		r.markRecovered(cellKey{pkg, string(action.Host), scope}, StatusCurrent, "",
+			"recovered: the interrupted removal had already committed")
+
+		return nil
+	}
+
+	outcome := r.executeRMA(action.Host, rmaRef{
+		pkg: pkg, host: action.Host, scope: scope,
+		strategy: action.Previous.Strategy, version: action.Previous.Version,
+	}, action.Previous.RMA, causeForRemove(action), modeRemove)
+	if outcome.err != nil {
+		return fmt.Errorf("finish interrupted removal: %w", outcome.err)
+	}
+
+	if err := r.finishRemove(action, outcome); err != nil {
+		return err
+	}
+
+	r.markRecovered(cellKey{pkg, string(action.Host), scope}, StatusCurrent, "",
+		"recovered: finished the interrupted removal")
+
+	return nil
+}
+
+// removeCommitted reports whether the removal already wrote its tombstone.
+func (r *runner) removeCommitted(event receipt.Event, pkg, hostID, scope string) (bool, error) {
+	tombstones, err := r.deps.Tombstones.Load()
+	if err != nil {
+		return false, &ReceiptError{Package: pkg, Host: hostID, Cause: err}
+	}
+
+	for _, tombstone := range tombstones {
+		if tombstone.Package == pkg && tombstone.Host == hostID && tombstone.Scope == scope &&
+			!tombstone.RemovedAt.Before(event.At) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// verifyArtifacts reports whether every verifiable artifact of the intent
+// matches the disk; verifiable is false when nothing can be checked.
+func (r *runner) verifyArtifacts(intent intentRecord) (bool, bool) {
+	verifiable := false
+
+	for _, artifact := range intent.Artifacts {
+		ok, checkable := verifyArtifact(intent, artifact)
+		if !checkable {
+			continue
+		}
+
+		verifiable = true
+
+		if !ok {
+			return false, true
+		}
+	}
+
+	return true, verifiable
+}
+
+// verifyArtifact checks one journaled artifact against the disk; checkable is
+// false for artifacts only the host itself can confirm.
+func verifyArtifact(intent intentRecord, artifact receipt.Artifact) (bool, bool) {
+	if artifact.Path == "" || !filepath.IsAbs(artifact.Path) || artifact.Kind == kindMCP {
+		return true, false
+	}
+
+	if op, found := configOpFor(intent.RMA, artifact.Path); found {
+		data, err := os.ReadFile(artifact.Path) //nolint:gosec // G304: the path comes from the journaled intent
+		if err != nil {
+			return false, true
+		}
+
+		current, exists, err := configValueDigest(data, op.KeyPath)
+
+		return err == nil && exists && current == artifact.Digest, true
+	}
+
+	info, err := os.Lstat(artifact.Path)
+	if err != nil {
+		return false, true
+	}
+
+	if info.IsDir() {
+		sum, err := digest.Tree(artifact.Path)
+
+		return err == nil && sum == artifact.Digest, true
+	}
+
+	sum, err := digest.File(artifact.Path)
+
+	return err == nil && sum == artifact.Digest, true
+}
+
+// kindMCP names host-install MCP artifacts, whose presence only the host
+// oracle can prove.
+const kindMCP = "mcp"
+
+// configOpFor finds the config-key op of one artifact path.
+func configOpFor(ops []receipt.Op, path string) (receipt.Op, bool) {
+	for _, op := range ops {
+		if op.Kind == receipt.OpConfigKey && op.Path == path {
+			return op, true
+		}
+	}
+
+	return receipt.Op{}, false
+}
+
+// markRecovered records the crash-replay verdict of one cell.
+func (r *runner) markRecovered(key cellKey, status Status, version, note string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.recovered[key] = recoveredCell{status: status, version: version, note: note}
+}
+
+// execute runs the plan: one goroutine per host, hosts bounded by Parallel,
+// actions sequential in plan order inside a host.
+func (r *runner) execute() {
+	groups := groupByHost(r.plan.Actions)
+
+	limit := r.opts.Parallel
+	if limit <= 0 {
+		limit = defaultParallel
+	}
+
+	sem := make(chan struct{}, limit)
+
+	var wg sync.WaitGroup
+
+	for _, group := range groups {
+		wg.Go(func() {
+			sem <- struct{}{}
+
+			defer func() { <-sem }()
+
+			r.runHost(group)
+		})
+	}
+
+	wg.Wait()
+}
+
+// hostGroup is the ordered action indexes of one host.
+type hostGroup struct {
+	host  host.ID
+	index []int
+}
+
+// groupByHost buckets action indexes by host, preserving plan order.
+func groupByHost(actions []Action) []hostGroup {
+	groups := []hostGroup{}
+
+	index := map[host.ID]int{}
+
+	for i, action := range actions {
+		at, ok := index[action.Host]
+
+		if !ok {
+			index[action.Host] = len(groups)
+			groups = append(groups, hostGroup{host: action.Host, index: []int{i}})
+
+			continue
+		}
+
+		groups[at].index = append(groups[at].index, i)
+	}
+
+	return groups
+}
+
+// runHost executes every action of one host sequentially.
+func (r *runner) runHost(group hostGroup) {
+	for _, idx := range group.index {
+		action := r.plan.Actions[idx]
+
+		if err := r.ctx.Err(); err != nil {
+			r.setCell(idx, failedCell(action, "context canceled: "+err.Error()))
+
+			continue
+		}
+
+		if breaker := r.breaker(group.host); breaker.Tripped {
+			cell := failedCell(action, "circuit breaker: host "+string(group.host)+" failed earlier in this run; not retried")
+			cell.Status = breaker.Status
+			r.setCell(idx, cell)
+
+			continue
+		}
+
+		r.emit(action, stepPlan, fmt.Sprintf("%s %s", action.Kind, actionPackage(action)))
+
+		cell := r.runAction(action)
+		r.setCell(idx, cell)
+
+		switch cell.Status {
+		case StatusSkew, StatusFailed:
+			r.trip(group.host, cell.Status, strings.Join(cell.Notes, "; "))
+		default:
+			// Other statuses (hands-off, needs-auth, foreign) are per-action
+			// verdicts, not host failures: the breaker stays closed.
+		}
+	}
+}
+
+// runAction dispatches one action unless crash replay already settled its cell.
+func (r *runner) runAction(action Action) CellResult {
+	cell := CellResult{
+		Package:  actionPackage(action),
+		Host:     action.Host,
+		Scope:    intentScope(action),
+		Kind:     action.Kind,
+		Strategy: actionStrategy(action),
+		Version:  actionVersion(action),
+	}
+
+	key := cellKey{cell.Package, string(cell.Host), cell.Scope}
+
+	if recovered, ok := r.recoveredCell(key); ok {
+		if action.Kind == ActionRemove || recovered.version == "" || recovered.version == cell.Version {
+			cell.Status = recovered.status
+			cell.Notes = []string{recovered.note}
+
+			return cell
+		}
+	}
+
+	if action.Kind == ActionRemove {
+		return r.runRemove(action, cell)
+	}
+
+	return r.runInstall(action, cell)
+}
+
+// runInstall executes the two phases of one install or update.
+func (r *runner) runInstall(action Action, cell CellResult) CellResult {
+	pkg := action.Delivery.Package
+
+	// A re-install without the previous receipt still replaces what verger
+	// already owns: load it, so drift, drop-old and the RMA see the cell.
+	if action.Previous == nil {
+		stored, ok, err := r.deps.Receipts.Get(pkg.ID, string(action.Host), cell.Scope)
+		if err != nil {
+			return failedCell(action, "receipt: "+err.Error())
+		}
+
+		if ok {
+			action.Previous = &stored
+		}
+	}
+
+	// Drift detection: never replace something that changed behind the receipt.
+	if action.Previous != nil {
+		if drift := r.driftNotes(*action.Previous); len(drift) > 0 {
+			cell.Status = StatusHandsOff
+			cell.Notes = slices.Clone(drift)
+			cell.Notes = append(cell.Notes, "nothing was written")
+
+			return cell
+		}
+	}
+
+	planned, err := r.deliver(action, true)
+	if err != nil {
+		return r.planFailure(cell, action, err)
+	}
+
+	if r.opts.DryRun {
+		cell.Status = StatusCurrent
+		cell.Notes = slices.Clone(planned.Notes)
+		cell.Notes = append(cell.Notes, "dry-run")
+
+		return cell
+	}
+
+	if err := r.journalIntent(action, planned); err != nil {
+		return failedCell(action, "journal intent: "+err.Error())
+	}
+
+	started := r.now()
+	r.emit(action, stepInstall, pkg.ID+" "+pkg.Version)
+
+	result, err := r.deliver(action, false)
+	if err != nil {
+		return r.installFailed(action, cell, planned, result, err)
+	}
+
+	r.emit(action, stepVerify, pkg.ID+" "+pkg.Version+" verified")
+
+	if crash := crashAfterInstall; crash != nil {
+		crash()
+	}
+
+	dropNotes := r.dropOld(action, result)
+
+	return r.commitInstall(action, cell, started, planned, result, dropNotes)
+}
+
+// journalIntent appends the pre-write intent of one install or update.
+func (r *runner) journalIntent(action Action, planned host.Result) error {
+	pkg := action.Delivery.Package
+
+	raw, err := json.Marshal(intentRecord{Action: action, Artifacts: planned.Artifacts, RMA: planned.RMA})
+	if err != nil {
+		return fmt.Errorf("encode intent: %w", err)
+	}
+
+	return r.deps.Journal.Append(receipt.Event{
+		Kind: eventKindFor(action.Kind), Package: pkg.ID, Host: string(action.Host),
+		Scope: intentScope(action), Version: pkg.Version,
+		Extra: map[string]json.RawMessage{intentExtraKey: raw},
+	})
+}
+
+// installFailed rolls one failed install attempt back and reports the cell.
+func (r *runner) installFailed(action Action, cell CellResult, planned, result host.Result, failure error) CellResult {
+	pkg := action.Delivery.Package
+
+	ops := result.RMA
+	if len(ops) == 0 {
+		ops = planned.RMA
+	}
+
+	ops = r.resolveBackups(ops, action.Previous, pkg.ID, string(action.Host))
+
+	outcome := r.executeRMA(action.Host, rmaRef{
+		pkg: pkg.ID, host: action.Host, scope: cell.Scope,
+		strategy: string(action.Delivery.Strategy), version: pkg.Version,
+	}, ops, causeRollback, modeRollback)
+
+	notes := outcome.notes
+	if outcome.err != nil {
+		notes = append(notes, "rollback: "+outcome.err.Error())
+	}
+
+	r.emit(action, stepRollback, fmt.Sprintf("rolled back %s: %v", pkg.ID, failure))
+
+	return r.planFailure(withNotes(cell, notes...), action, failure)
+}
+
+// commitInstall writes the receipt and the lock cell of one successful install.
+func (r *runner) commitInstall(action Action, cell CellResult, started time.Time, planned, result host.Result, dropNotes []string) CellResult {
+	pkg := action.Delivery.Package
+
+	artifacts := result.Artifacts
+	if len(artifacts) == 0 {
+		artifacts = planned.Artifacts
+	}
+
+	rma := result.RMA
+	if len(rma) == 0 {
+		rma = planned.RMA
+	}
+
+	rma, stale := r.commitRMA(rma, action.Previous, pkg.ID, string(action.Host))
+
+	installed := started
+	if action.Previous != nil && !action.Previous.InstalledAt.IsZero() {
+		installed = action.Previous.InstalledAt
+	}
+
+	record := receipt.Receipt{
+		Schema: receipt.Schema, Package: pkg.ID, Host: string(action.Host), Scope: cell.Scope,
+		Strategy: string(action.Delivery.Strategy), Version: pkg.Version,
+		InstalledAt: installed, UpdatedAt: r.now(),
+		Artifacts: artifacts, RMA: rma,
+	}
+
+	if err := r.deps.Receipts.Put(record); err != nil {
+		return withNotes(failedCell(action, "receipt: "+err.Error()), dropNotes...)
+	}
+
+	r.emit(action, stepReceipt, pkg.ID+" "+pkg.Version)
+
+	if crash := crashAfterReceipt; crash != nil {
+		crash()
+	}
+
+	r.upsertLock(record)
+
+	cell.Status = StatusCurrent
+	cell.Notes = slices.Clone(result.Notes)
+	cell.Notes = append(cell.Notes, dropNotes...)
+	cell.Notes = append(cell.Notes, r.purgeStale(stale)...)
+
+	return cell
+}
+
+// runRemove executes one removal: the intent first, the RMA next, the
+// tombstone + receipt deletion last. A dry run stops before any write.
+func (r *runner) runRemove(action Action, cell CellResult) CellResult {
+	prev := action.Previous
+	if prev == nil {
+		cell.Status = StatusMissing
+		cell.Notes = []string{"no previous receipt"}
+
+		return cell
+	}
+
+	if r.opts.DryRun {
+		cell.Status = StatusCurrent
+		cell.Notes = []string{"dry-run"}
+
+		return cell
+	}
+
+	raw, err := json.Marshal(intentRecord{Action: action, Artifacts: prev.Artifacts, RMA: prev.RMA})
+	if err != nil {
+		return failedCell(action, "encode intent: "+err.Error())
+	}
+
+	if err := r.deps.Journal.Append(receipt.Event{
+		Kind: receipt.EventRemove, Package: prev.Package, Host: string(action.Host),
+		Scope: prev.Scope, Version: prev.Version, Cause: causeForRemove(action), Initiator: action.Initiator,
+		Extra: map[string]json.RawMessage{intentExtraKey: raw},
+	}); err != nil {
+		return failedCell(action, "journal intent: "+err.Error())
+	}
+
+	r.emit(action, stepRemove, prev.Package)
+
+	outcome := r.executeRMA(action.Host, rmaRef{
+		pkg: prev.Package, host: action.Host, scope: prev.Scope,
+		strategy: prev.Strategy, version: prev.Version,
+	}, prev.RMA, causeForRemove(action), modeRemove)
+
+	cell.Notes = append(cell.Notes, outcome.notes...)
+
+	if outcome.err != nil {
+		cell.Status = StatusFailed
+		cell.Notes = append(cell.Notes, "remove: "+outcome.err.Error())
+
+		return cell
+	}
+
+	if outcome.handsOff {
+		cell.Status = StatusHandsOff
+
+		return cell
+	}
+
+	if err := r.finishRemove(action, outcome); err != nil {
+		cell.Status = StatusFailed
+		cell.Notes = append(cell.Notes, err.Error())
+
+		return cell
+	}
+
+	cell.Status = StatusCurrent
+
+	return cell
+}
+
+// finishRemove writes the tombstone, deletes the receipt and drops the lock
+// cell of one completed removal.
+func (r *runner) finishRemove(action Action, outcome rmaOutcome) error {
+	prev := action.Previous
+	cause := causeForRemove(action)
+
+	hostID := action.Initiator
+	if hostID == "" {
+		hostID = string(action.Host)
+	}
+
+	tombstone := receipt.Tombstone{
+		Schema: receipt.Schema, Package: prev.Package, Host: hostID, Scope: prev.Scope,
+		RemovedAt: r.now(), Cause: receipt.Cause(cause), TrashID: outcome.trashID,
+	}
+
+	if err := r.deps.Tombstones.Add(tombstone); err != nil {
+		return &ReceiptError{Package: prev.Package, Host: string(action.Host), Cause: err}
+	}
+
+	if err := r.deps.Receipts.Delete(prev.Package, string(action.Host), prev.Scope); err != nil {
+		return &ReceiptError{Package: prev.Package, Host: string(action.Host), Cause: err}
+	}
+
+	r.deleteLock(prev.Package, string(action.Host), prev.Scope)
+
+	r.emit(action, stepReceipt, "removed "+prev.Package)
+
+	return nil
+}
+
+// driftNotes compares the previous receipt against the disk and reports every
+// mismatch; an empty result means the cell is safe to touch.
+func (r *runner) driftNotes(prev receipt.Receipt) []string {
+	var notes []string
+
+	for _, op := range prev.RMA {
+		if note, blocked := r.driftNote(op); blocked {
+			notes = append(notes, note)
+		}
+	}
+
+	return notes
+}
+
+// driftNote checks one receipt operation against the disk; blocked is true when
+// the artifact must not be touched.
+func (r *runner) driftNote(op receipt.Op) (string, bool) {
+	switch op.Kind {
+	case receipt.OpHostInstall:
+		return "", false
+	case receipt.OpConfigKey:
+		return r.driftConfigNote(op)
+	default:
+		return r.driftEntryNote(op)
+	}
+}
+
+// driftConfigNote checks one config key against its receipt digest.
+func (r *runner) driftConfigNote(op receipt.Op) (string, bool) {
+	data, err := os.ReadFile(op.Path) //nolint:gosec // G304: the path comes from a receipt
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false
+	}
+
+	if err != nil {
+		return fmt.Sprintf("%s#%s: cannot read: %v", op.Path, op.KeyPath, err), true
+	}
+
+	current, exists, err := configValueDigest(data, op.KeyPath)
+	if err != nil {
+		return fmt.Sprintf("%s#%s: cannot parse: %v", op.Path, op.KeyPath, err), true
+	}
+
+	if exists && current != op.Digest {
+		return fmt.Sprintf("%s#%s: hands-off (the value changed since the receipt)", op.Path, op.KeyPath), true
+	}
+
+	return "", false
+}
+
+// driftEntryNote checks one file, tree or link against its receipt digest.
+func (r *runner) driftEntryNote(op receipt.Op) (string, bool) {
+	info, err := os.Lstat(op.Path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false
+	}
+
+	if err != nil {
+		return fmt.Sprintf("%s: cannot stat: %v", op.Path, err), true
+	}
+
+	current, err := currentEntryDigest(op.Kind, op.Path, info)
+	if err != nil {
+		return op.Path + ": cannot digest: " + err.Error(), true
+	}
+
+	if current != op.Digest {
+		return op.Path + ": hands-off (the artifact changed since the receipt)", true
+	}
+
+	return "", false
+}
+
+// dropOld executes the previous receipt's RMA for artifacts the new delivery
+// no longer carries.
+func (r *runner) dropOld(action Action, result host.Result) []string {
+	if action.Previous == nil {
+		return nil
+	}
+
+	identities := map[string]bool{}
+
+	for _, op := range result.RMA {
+		identities[opIdentity(op)] = true
+	}
+
+	var dropped []receipt.Op
+
+	for _, op := range action.Previous.RMA {
+		if identities[opIdentity(op)] {
+			continue
+		}
+
+		dropped = append(dropped, op)
+	}
+
+	if len(dropped) == 0 {
+		return nil
+	}
+
+	prev := *action.Previous
+
+	outcome := r.executeRMA(action.Host, rmaRef{
+		pkg: prev.Package, host: action.Host, scope: prev.Scope,
+		strategy: prev.Strategy, version: prev.Version,
+	}, dropped, causeUpdate, modeRemove)
+	if outcome.err != nil {
+		return append(outcome.notes, "drop previous: "+outcome.err.Error())
+	}
+
+	return outcome.notes
+}
+
+// opIdentity compares one RMA operation across receipts.
+func opIdentity(op receipt.Op) string {
+	switch op.Kind {
+	case receipt.OpConfigKey:
+		return "config:" + op.Path + "#" + op.KeyPath
+	case receipt.OpHostInstall:
+		return "host:" + strings.Join(op.Command, "\x00")
+	default:
+		return string(op.Kind) + ":" + op.Path
+	}
+}
+
+// executeRMA runs one reverse manifest in reverse order. Missing targets are
+// tolerated, a digest mismatch leaves the target in place (hands-off in removal
+// mode), host-install ops delegate to the adapter.
+func (r *runner) executeRMA(hostID host.ID, ref rmaRef, ops []receipt.Op, cause string, mode rmaMode) rmaOutcome {
+	out := rmaOutcome{}
+
+	// A rollback undoes as much as it can: one failing op (a host resource
+	// whose install never landed) must not leave every other artifact behind.
+	var rollbackErrs []error
+
+	for _, op := range slices.Backward(ops) {
+		if err := r.ctx.Err(); err != nil {
+			out.err = errors.Join(append(rollbackErrs, err)...)
+
+			return out
+		}
+
+		note, trashID, handsOff, err := r.execRMAOp(hostID, ref, op, cause, mode)
+		if err != nil && mode == modeRollback {
+			rollbackErrs = append(rollbackErrs, err)
+
+			continue
+		}
+
+		if err != nil {
+			out.err = err
+
+			return out
+		}
+
+		if note != "" {
+			out.notes = append(out.notes, note)
+		}
+
+		if trashID != "" {
+			out.trashID = trashID
+		}
+
+		out.handsOff = out.handsOff || handsOff
+	}
+
+	out.err = errors.Join(rollbackErrs...)
+
+	return out
+}
+
+// execRMAOp executes one reverse operation.
+func (r *runner) execRMAOp(hostID host.ID, ref rmaRef, op receipt.Op, cause string, mode rmaMode) (string, string, bool, error) {
+	switch op.Kind {
+	case receipt.OpHostInstall:
+		return "", "", false, r.hostUninstall(hostID, ref, op)
+	case receipt.OpConfigKey:
+		note, handsOff, err := r.undoConfigKey(ref, op, mode)
+
+		return note, "", handsOff, err
+	case receipt.OpWriteFile, receipt.OpCopyTree, receipt.OpSymlink, receipt.OpHardlink:
+		return r.undoEntry(ref, op, cause, mode)
+	default:
+		return "", "", false, fmt.Errorf("unknown rma op %q", op.Kind)
+	}
+}
+
+// hostUninstall delegates one host-install op to the adapter.
+func (r *runner) hostUninstall(hostID host.ID, ref rmaRef, op receipt.Op) error {
+	adapter, ok := r.deps.Hosts[hostID]
+	if !ok {
+		return fmt.Errorf("host %s is not registered", hostID)
+	}
+
+	if _, err := adapter.Uninstall(r.ctx, "", receipt.Receipt{
+		Schema: receipt.Schema, Package: ref.pkg, Host: string(hostID), Scope: ref.scope,
+		Strategy: ref.strategy, Version: ref.version, RMA: []receipt.Op{op},
+	}); err != nil {
+		return fmt.Errorf("host uninstall %s: %w", hostID, err)
+	}
+
+	return nil
+}
+
+// undoEntry reverses one file, tree or link operation.
+func (r *runner) undoEntry(ref rmaRef, op receipt.Op, cause string, mode rmaMode) (string, string, bool, error) {
+	info, err := os.Lstat(op.Path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return r.undoMissing(op)
+	}
+
+	if err != nil {
+		return "", "", false, fmt.Errorf("stat %s: %w", op.Path, err)
+	}
+
+	current, err := currentEntryDigest(op.Kind, op.Path, info)
+	if err != nil {
+		return "", "", false, err
+	}
+
+	if current != op.Digest {
+		return r.undoMismatch(op, mode)
+	}
+
+	if !op.Existed {
+		trashID, err := r.trash(ref, op.Path, cause, current)
+
+		return "", trashID, false, err
+	}
+
+	if op.Backup == "" {
+		return op.Path + ": hands-off (no backup recorded); left in place", "", true, nil
+	}
+
+	return r.undoRestore(ref, op, cause, current)
+}
+
+// undoMissing handles a target that is already gone: an idempotent no-op, or a
+// backup restore when the target replaced something.
+func (r *runner) undoMissing(op receipt.Op) (string, string, bool, error) {
+	if !op.Existed || op.Backup == "" {
+		return "", "", false, nil
+	}
+
+	if _, err := r.deps.Store.Trash().Restore(r.ctx, op.Backup); err != nil {
+		return "", "", false, fmt.Errorf("restore %s: %w", op.Path, err)
+	}
+
+	return fmt.Sprintf("restored %s from the trash", op.Path), "", false, nil
+}
+
+// undoMismatch interprets a digest mismatch for one file operation.
+func (r *runner) undoMismatch(op receipt.Op, mode rmaMode) (string, string, bool, error) {
+	if mode == modeRollback {
+		return "", "", false, nil // the step never ran
+	}
+
+	return op.Path + ": hands-off (the artifact changed since the receipt); left in place", "", true, nil
+}
+
+// undoRestore replaces verger's artifact with the trashed previous bytes.
+func (r *runner) undoRestore(ref rmaRef, op receipt.Op, cause string, current digest.Hash) (string, string, bool, error) {
+	trashID, err := r.trash(ref, op.Path, cause, current)
+	if err != nil {
+		return "", "", false, err
+	}
+
+	if _, err := r.deps.Store.Trash().Restore(r.ctx, op.Backup); err != nil {
+		return "", "", false, fmt.Errorf("restore %s: %w", op.Path, err)
+	}
+
+	return fmt.Sprintf("restored %s from the trash", op.Path), trashID, false, nil
+}
+
+// trash moves one artifact into the store trash with its cell tags.
+func (r *runner) trash(ref rmaRef, path, cause string, sum digest.Hash) (string, error) {
+	entry, err := r.deps.Store.Trash().Put(r.ctx, path, store.PutOptions{
+		Package: ref.pkg, Host: string(ref.host), Cause: cause, Digest: sum,
+	})
+	if err != nil {
+		return "", fmt.Errorf("trash %s: %w", path, err)
+	}
+
+	return entry.ID, nil
+}
+
+// currentEntryDigest hashes one on-disk entry with the op's semantics.
+func currentEntryDigest(kind receipt.OpKind, path string, info fs.FileInfo) (digest.Hash, error) {
+	switch {
+	case kind == receipt.OpSymlink && info.Mode()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", fmt.Errorf("read link %s: %w", path, err)
+		}
+
+		return digest.Bytes([]byte(target)), nil
+	case info.IsDir():
+		sum, err := digest.Tree(path)
+		if err != nil {
+			return "", fmt.Errorf("digest tree %s: %w", path, err)
+		}
+
+		return sum, nil
+	default:
+		sum, err := digest.File(path)
+		if err != nil {
+			return "", fmt.Errorf("digest %s: %w", path, err)
+		}
+
+		return sum, nil
+	}
+}
+
+// resolveBackups fills the Backup of replaced ops that lost their bucket id in
+// a crash: the newest trash entry of the same path and cell is the backup the
+// interrupted run created. A bucket the adapter staged under its own source
+// path is matched by the previous receipt's digest for the op path.
+func (r *runner) resolveBackups(ops []receipt.Op, prev *receipt.Receipt, pkg, hostID string) []receipt.Op {
+	entries, err := r.deps.Store.Trash().List()
+	if err != nil {
+		return ops
+	}
+
+	out := slices.Clone(ops)
+
+	for i, op := range out {
+		if !op.Existed || op.Backup != "" || op.Kind == receipt.OpHostInstall || op.Kind == receipt.OpConfigKey {
+			continue
+		}
+
+		out[i].Backup = backupByPath(entries, op.Path, pkg, hostID)
+
+		if out[i].Backup == "" {
+			out[i].Backup = r.backupByDigest(entries, op, prev, pkg, hostID)
+		}
+	}
+
+	return out
+}
+
+// commitRMA prepares the reverse manifest a receipt records: lost backup ids
+// are resolved, then every op the previous receipt already owned keeps the
+// pre-install state that receipt recorded. It returns the RMA and the stale
+// intermediate buckets to purge once the receipt is written.
+func (r *runner) commitRMA(ops []receipt.Op, prev *receipt.Receipt, pkg, hostID string) ([]receipt.Op, []string) {
+	return inheritPreInstall(r.resolveBackups(ops, prev, pkg, hostID), prev)
+}
+
+// inheritPreInstall keeps the pre-install state of every target the previous
+// receipt owned: a re-delivery or update trashes verger's own previous
+// artifact, which is not what a removal must restore (NF-1). The buckets
+// holding verger's own previous artifacts are returned as stale.
+func inheritPreInstall(ops []receipt.Op, prev *receipt.Receipt) ([]receipt.Op, []string) {
+	if prev == nil {
+		return ops, nil
+	}
+
+	before := make(map[string]receipt.Op, len(prev.RMA))
+	for _, op := range prev.RMA {
+		before[opIdentity(op)] = op
+	}
+
+	out := slices.Clone(ops)
+
+	var stale []string
+
+	for i, op := range out {
+		old, ok := before[opIdentity(op)]
+		if !ok {
+			continue
+		}
+
+		if op.Backup != "" && op.Backup != old.Backup {
+			stale = append(stale, op.Backup)
+		}
+
+		out[i].Existed = old.Existed
+		out[i].Backup = old.Backup
+	}
+
+	return out, stale
+}
+
+// purgeStale removes the trash buckets of verger's own previous artifacts once
+// a receipt no longer references them; a failed purge only leaves a note.
+func (r *runner) purgeStale(ids []string) []string {
+	var notes []string
+
+	for _, id := range ids {
+		if err := r.deps.Store.Trash().Remove(id); err != nil {
+			notes = append(notes, "trash: stale backup "+id+" kept: "+err.Error())
+		}
+	}
+
+	return notes
+}
+
+// backupByPath returns the newest bucket of one path and cell.
+func backupByPath(entries []store.Entry, path, pkg, hostID string) string {
+	for _, entry := range slices.Backward(entries) {
+		if entry.Original == path && entry.Package == pkg && entry.Host == hostID {
+			return entry.ID
+		}
+	}
+
+	return ""
+}
+
+// backupByDigest returns the newest bucket of one cell whose stored payload
+// matches the previous receipt's digest for the op path. The digest check
+// keeps the fallback content-addressed: a bucket staged under a different
+// source path is the recorded previous artifact and nothing else.
+func (r *runner) backupByDigest(entries []store.Entry, op receipt.Op, prev *receipt.Receipt, pkg, hostID string) string {
+	want, ok := previousDigest(prev, op.Path)
+	if !ok {
+		return ""
+	}
+
+	for _, entry := range slices.Backward(entries) {
+		if entry.Package != pkg || entry.Host != hostID {
+			continue
+		}
+
+		if r.payloadDigest(entry) == want {
+			return entry.ID
+		}
+	}
+
+	return ""
+}
+
+// previousDigest returns the digest a previous receipt recorded for one path.
+func previousDigest(prev *receipt.Receipt, path string) (digest.Hash, bool) {
+	if prev == nil {
+		return "", false
+	}
+
+	for _, op := range slices.Backward(prev.RMA) {
+		if op.Path == path && op.Kind != receipt.OpHostInstall && op.Kind != receipt.OpConfigKey && op.Digest.Valid() {
+			return op.Digest, true
+		}
+	}
+
+	return "", false
+}
+
+// payloadDigest hashes the stored payload of one trash bucket; an unreadable
+// bucket reports no digest.
+func (r *runner) payloadDigest(entry store.Entry) digest.Hash {
+	payload := filepath.Join(r.deps.Store.TrashDir(), entry.ID, entry.Stored)
+
+	if entry.Kind == "dir" {
+		sum, err := digest.Tree(payload)
+		if err != nil {
+			return ""
+		}
+
+		return sum
+	}
+
+	sum, err := digest.File(payload)
+	if err != nil {
+		return ""
+	}
+
+	return sum
+}
+
+// deliver calls the adapter, resolving confirmed collisions by moving the
+// foreign path to the trash and retrying.
+func (r *runner) deliver(action Action, dry bool) (host.Result, error) {
+	adapter, ok := r.deps.Hosts[action.Host]
+	if !ok {
+		return host.Result{}, fmt.Errorf("host %s is not registered", action.Host)
+	}
+
+	delivery := action.Delivery
+	delivery.DryRun = dry
+
+	for attempt := 0; attempt <= maxConflictAttempts; attempt++ {
+		result, err := adapter.Deliver(r.ctx, "", delivery)
+		if err == nil {
+			return result, nil
+		}
+
+		collision, isCollision := errors.AsType[*host.CollisionError](err)
+		if !isCollision {
+			return result, err
+		}
+
+		confirmed, confirmErr := r.confirm(Question{
+			Kind: "conflict", Package: action.Delivery.Package.ID, Host: action.Host,
+			Message: collision.Error(),
+		})
+		if confirmErr != nil {
+			return result, confirmErr
+		}
+
+		if !confirmed {
+			return result, &conflictRefusedError{cause: err}
+		}
+
+		if r.opts.DryRun {
+			r.note("dry-run: %s would be moved to the trash to resolve a conflict", collision.Path)
+
+			return result, &conflictDryRunError{path: collision.Path}
+		}
+
+		if attempt == maxConflictAttempts {
+			return result, err
+		}
+
+		if _, err := r.deps.Store.Trash().Put(r.ctx, collision.Path, store.PutOptions{
+			Package: action.Delivery.Package.ID, Host: string(action.Host), Cause: causeConflict,
+		}); err != nil {
+			return result, fmt.Errorf("resolve conflict %s: %w", collision.Path, err)
+		}
+	}
+
+	return host.Result{}, errors.New("conflict resolution did not converge")
+}
+
+// confirm asks the confirmer; a missing confirmer records the run-level
+// ErrConfirmationRequired.
+func (r *runner) confirm(q Question) (bool, error) {
+	if r.opts.Confirm == nil {
+		err := fmt.Errorf("%w: %s", ErrConfirmationRequired, q.Message)
+
+		r.mu.Lock()
+		if r.confirmErr == nil {
+			r.confirmErr = fmt.Errorf("%w on %s", ErrConfirmationRequired, q.Package+"@"+string(q.Host))
+		}
+		r.mu.Unlock()
+
+		return false, err
+	}
+
+	return r.opts.Confirm.Confirm(r.ctx, q)
+}
+
+// conflictRefusedError marks a confirmed conflict the user declined.
+type conflictRefusedError struct {
+	cause error
+}
+
+// Error implements error.
+func (e *conflictRefusedError) Error() string {
+	return "conflict not confirmed; nothing was written: " + e.cause.Error()
+}
+
+// Unwrap returns the underlying collision.
+func (e *conflictRefusedError) Unwrap() error { return e.cause }
+
+// conflictDryRunError marks a conflict a dry run would resolve.
+type conflictDryRunError struct {
+	path string
+}
+
+// Error implements error.
+func (e *conflictDryRunError) Error() string {
+	return "dry-run: " + e.path + " would be moved to the trash"
+}
+
+// planFailure maps one planning error of an action to a cell result.
+func (r *runner) planFailure(cell CellResult, action Action, err error) CellResult {
+	if _, ok := errors.AsType[*conflictDryRunError](err); ok {
+		cell.Status = StatusCurrent
+		cell.Notes = append(cell.Notes, err.Error())
+
+		return cell
+	}
+
+	if handsOff, ok := errors.AsType[*render.HandsOffError](err); ok {
+		_, confirmErr := r.confirm(Question{
+			Kind: "conflict", Package: action.Delivery.Package.ID, Host: action.Host,
+			Message: handsOff.Error(),
+		})
+		if confirmErr != nil {
+			return failedCell(action, confirmErr.Error())
+		}
+
+		cell.Status = StatusHandsOff
+		cell.Notes = append(cell.Notes, err.Error())
+
+		return cell
+	}
+
+	return r.classify(cell, err)
+}
+
+// classify maps an adapter error to the cell status.
+func (r *runner) classify(cell CellResult, err error) CellResult {
+	cell.Notes = append(cell.Notes, err.Error())
+
+	switch {
+	case errors.Is(err, ErrConfirmationRequired):
+		cell.Status = StatusFailed
+	case isErr[*conflictRefusedError](err):
+		cell.Status = StatusForeign
+	case isErr[*host.MissingSecretsError](err):
+		cell.Status = StatusNeedsAuth
+	case isErr[*host.PolicyError](err), isErr[*host.UnsupportedStrategyError](err), isErr[*host.NotSupportedError](err):
+		cell.Status = StatusFailed
+	case isErr[*host.DeliveryError](err) && deliveryStep(err) == "verify":
+		cell.Status = StatusSkew
+	default:
+		cell.Status = StatusFailed
+	}
+
+	return cell
+}
+
+// isErr reports whether err matches a typed error.
+func isErr[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
+
+	return ok
+}
+
+// deliveryStep extracts the failing step of a *host.DeliveryError.
+func deliveryStep(err error) string {
+	target, ok := errors.AsType[*host.DeliveryError](err)
+	if !ok {
+		return ""
+	}
+
+	return target.Step
+}
+
+// failedCell builds a failed cell with one note.
+func failedCell(action Action, note string) CellResult {
+	return CellResult{
+		Package: actionPackage(action), Host: action.Host, Scope: intentScope(action),
+		Kind: action.Kind, Strategy: actionStrategy(action), Version: actionVersion(action),
+		Status: StatusFailed, Notes: []string{note},
+	}
+}
+
+// withNotes appends notes to a cell.
+func withNotes(cell CellResult, notes ...string) CellResult {
+	cell.Notes = append(cell.Notes, notes...)
+
+	return cell
+}
+
+// actionPackage returns the package id an action concerns.
+func actionPackage(action Action) string {
+	if action.Kind == ActionRemove && action.Previous != nil {
+		return action.Previous.Package
+	}
+
+	return action.Delivery.Package.ID
+}
+
+// actionVersion returns the version an action records.
+func actionVersion(action Action) string {
+	if action.Kind == ActionRemove && action.Previous != nil {
+		return action.Previous.Version
+	}
+
+	return action.Delivery.Package.Version
+}
+
+// actionStrategy returns the strategy an action concerns.
+func actionStrategy(action Action) lock.Strategy {
+	if action.Kind == ActionRemove && action.Previous != nil {
+		return lock.Strategy(action.Previous.Strategy)
+	}
+
+	return action.Delivery.Strategy
+}
+
+// intentScope resolves the receipt scope of one action: the delivery or
+// previous receipt scope, defaulting to user.
+func intentScope(action Action) string {
+	if action.Previous != nil && action.Previous.Scope != "" {
+		return action.Previous.Scope
+	}
+
+	if action.Delivery.Package.Scope != "" {
+		return action.Delivery.Package.Scope
+	}
+
+	return receipt.ScopeUser
+}
+
+// causeForRemove returns the registered removal cause, defaulting to user.
+func causeForRemove(action Action) string {
+	if action.Cause == "" {
+		return defaultCause
+	}
+
+	return action.Cause
+}
+
+// eventKindFor maps an action kind to its journal event kind.
+func eventKindFor(kind Kind) receipt.EventKind {
+	switch kind {
+	case ActionUpdate:
+		return receipt.EventUpdate
+	default:
+		return receipt.EventInstall
+	}
+}
+
+// upsertLock stores the lock cell of a committed receipt.
+func (r *runner) upsertLock(record receipt.Receipt) {
+	if record.Version == "" || record.Strategy == "" {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	err := r.deps.Lock.Upsert(lock.Cell{
+		Package: record.Package, Host: record.Host, Scope: record.Scope,
+		Version: record.Version, Strategy: lock.Strategy(record.Strategy), UpdatedAt: r.now(),
+	})
+	if err != nil {
+		r.notes = append(r.notes, "lock cell "+record.Package+"/"+record.Host+": "+err.Error())
+
+		return
+	}
+
+	r.lockChanged = true
+}
+
+// deleteLock drops the lock cell of one removal.
+func (r *runner) deleteLock(pkg, hostID, scope string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.deps.Lock.Delete(pkg, hostID, scope) > 0 {
+		r.lockChanged = true
+	}
+}
+
+// commit saves the lock once at the end and appends its generation event.
+func (r *runner) commit() error {
+	if r.opts.DryRun {
+		return nil
+	}
+
+	r.mu.Lock()
+	changed := r.lockChanged
+	r.mu.Unlock()
+
+	if !changed {
+		return nil
+	}
+
+	if err := r.deps.Lock.Save(r.lockPath); err != nil {
+		return &LockError{Path: r.lockPath, Cause: err}
+	}
+
+	generation := r.lockGen + 1
+
+	r.emit(Action{}, stepLock, fmt.Sprintf("lock generation %d", generation))
+
+	if err := r.deps.Journal.Append(receipt.Event{
+		Kind: receipt.EventLock, LockGeneration: generation, LockDigest: r.deps.Lock.Digest(),
+	}); err != nil {
+		return &ReceiptError{Cause: fmt.Errorf("journal lock generation: %w", err)}
+	}
+
+	r.lockGen = generation
+
+	return nil
+}
+
+// breaker returns the circuit state of one host.
+func (r *runner) breaker(hostID host.ID) CircuitState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.breakers[hostID]
+}
+
+// trip opens the circuit of one host for the rest of the run.
+func (r *runner) trip(hostID host.ID, status Status, cause string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.breakers[hostID] = CircuitState{Host: hostID, Tripped: true, Status: status, Cause: cause}
+}
+
+// note appends one run-level note.
+func (r *runner) note(format string, args ...any) {
+	message := fmt.Sprintf(format, args...)
+
+	r.mu.Lock()
+	r.notes = append(r.notes, message)
+	r.mu.Unlock()
+
+	r.logf("%s", message)
+}
+
+// logf logs when the caller supplied a logger.
+func (r *runner) logf(format string, args ...any) {
+	if r.logger.Log() == nil {
+		return
+	}
+
+	r.logger.Printf(format, args...)
+}
+
+// setCell stores the result of one action.
+func (r *runner) setCell(idx int, cell CellResult) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.cells[idx] = cell
+}
+
+// recoveredCell returns the crash-replay verdict of one cell.
+func (r *runner) recoveredCell(key cellKey) (recoveredCell, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cell, ok := r.recovered[key]
+
+	return cell, ok
+}
+
+// report assembles the run report in plan order.
+func (r *runner) report() Report {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	breakers := make([]CircuitState, 0, len(r.breakers))
+
+	for _, breaker := range r.breakers {
+		if breaker.Tripped {
+			breakers = append(breakers, breaker)
+		}
+	}
+
+	slices.SortFunc(breakers, func(a, b CircuitState) int {
+		return strings.Compare(string(a.Host), string(b.Host))
+	})
+
+	cells := make([]CellResult, 0, len(r.cells))
+
+	for _, cell := range r.cells {
+		if cell.Kind != "" {
+			cells = append(cells, cell)
+		}
+	}
+
+	return Report{Cells: cells, Notes: slices.Clone(r.notes), Breakers: breakers}
+}
+
+// runErr is the run-level error, if any: cancellation wins over confirmation.
+func (r *runner) runErr() error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.confirmErr
+}
+
+// emit sends one progress event; a nil channel drops it and cancellation stops
+// the send.
+func (r *runner) emit(action Action, step, message string) {
+	if r.opts.Events == nil {
+		return
+	}
+
+	event := Event{
+		At: r.now(), Package: actionPackage(action), Host: action.Host,
+		Step: step, Message: message,
+	}
+
+	select {
+	case r.opts.Events <- event:
+	case <-r.ctx.Done():
+	}
+}
+
+// validateDeps rejects a run with missing dependencies.
+func validateDeps(deps Deps) error {
+	var missing string
+
+	switch {
+	case deps.Home == nil:
+		missing = "home"
+	case deps.Store == nil:
+		missing = "store"
+	case deps.Receipts == nil:
+		missing = "receipts"
+	case deps.Journal == nil:
+		missing = "journal"
+	case deps.Tombstones == nil:
+		missing = "tombstones"
+	case deps.Hosts == nil:
+		missing = "hosts"
+	case deps.Owned == nil:
+		missing = "owned"
+	case deps.Lock == nil:
+		missing = "lock"
+	default:
+		return nil
+	}
+
+	return &ConfigError{Cause: errors.New("missing dependency: " + missing)}
+}
+
+// validatePlan rejects actions that cannot be executed.
+func validatePlan(deps Deps, plan Plan) error {
+	for i, action := range plan.Actions {
+		if _, ok := deps.Hosts[action.Host]; !ok {
+			return &ConfigError{Cause: fmt.Errorf("action %d: host %q is not registered", i, action.Host)}
+		}
+
+		switch action.Kind {
+		case ActionInstall, ActionUpdate:
+			if action.Delivery.Package.ID == "" {
+				return &ConfigError{Cause: fmt.Errorf("action %d: package id is required", i)}
+			}
+
+			if action.Delivery.Package.Version == "" {
+				return &ConfigError{Cause: fmt.Errorf("action %d: package version is required", i)}
+			}
+
+			if !deliverableStrategy(action.Delivery.Strategy) {
+				return &ConfigError{Cause: fmt.Errorf("action %d: strategy %q is not deliverable", i, action.Delivery.Strategy)}
+			}
+
+			if action.Kind == ActionUpdate && action.Previous == nil {
+				return &ConfigError{Cause: fmt.Errorf("action %d: update needs a previous receipt", i)}
+			}
+		case ActionRemove:
+			if action.Previous == nil {
+				return &ConfigError{Cause: fmt.Errorf("action %d: remove needs a previous receipt", i)}
+			}
+		default:
+			return &ConfigError{Cause: fmt.Errorf("action %d: unknown kind %q", i, action.Kind)}
+		}
+	}
+
+	return nil
+}
+
+// deliverableStrategy reports whether an adapter can deliver the strategy.
+func deliverableStrategy(strategy lock.Strategy) bool {
+	switch strategy {
+	case lock.StrategyNative, lock.StrategySynth, lock.StrategyLoose:
+		return true
+	default:
+		return false
+	}
+}

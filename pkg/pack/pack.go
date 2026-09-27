@@ -1,8 +1,9 @@
 // Package pack renders a package payload as one chimera directory valid for
 // every Ф1 host installer: the Agent Plugins, Claude, Codex and Gemini
 // manifests coexist in one directory, skills and commands are copied or
-// rendered per dialect, and the host-visible name is the author's
-// "name@owner". Render is pure; Write is the only disk writer.
+// rendered per dialect. Every manifest names the bare plugin; the author is
+// the marketplace, so hosts address the package as "name@owner" (decision
+// F3). Render and RenderMarketplace are pure; Write is the only disk writer.
 package pack
 
 import (
@@ -25,6 +26,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/render"
+	"github.com/odiumuniverse/verger/pkg/store"
 )
 
 // Chimera layout names.
@@ -57,17 +59,18 @@ const (
 	keyName     = "name"
 )
 
-// Input is one package payload to render as a chimera. Name and Owner may be
-// derived from a single-slash ID when they are empty.
+// Input is one package payload to render as a chimera. The identity comes
+// from ID (IdentityOf) when it is set; Name and Owner are read only without an
+// ID and must then be plugin-id parts.
 type Input struct {
-	ID          string // owner/name
-	Name        string // package name without owner
-	Owner       string // author; the host-visible name is "<Name>@<Owner>"
+	ID          string // package id, owner/name[//subpath]
+	Name        string // plugin name without owner (no ID only)
+	Owner       string // author (no ID only); hosts address "<Name>@<Owner>"
 	Version     string
 	Description string
 	License     string
 	Keywords    []string
-	Format      manifest.Format // identity-defining format of the source
+	Format      manifest.Format // identity-defining source format; informational, the chimera renders every format
 	Root        string          // payload root on disk
 	Components  []manifest.Component
 	MCP         []manifest.MCPServer
@@ -77,6 +80,11 @@ type Input struct {
 // Artifact is one rendered chimera: the slash-relative files, the digests of
 // the logical components they carry, the formats rendered valid and the
 // warnings for everything skipped.
+//
+// Digests maps "kind/name" to the component digest: a skill carries its source
+// tree digest (the verbatim copy's digest.Tree), an agent, command or rule the
+// digest of the rendered bytes it produced; MCP servers and hooks have no
+// digest entry.
 type Artifact struct {
 	Files    map[string][]byte      // slash-relative
 	Digests  map[string]digest.Hash // per logical component (kind/name)
@@ -111,35 +119,38 @@ func (e *RenderError) Unwrap() error {
 
 // renderer carries one Render call.
 type renderer struct {
-	in      Input
-	name    string
-	owner   string
-	visible string
-	art     Artifact
+	in    Input
+	name  string // plugin name, an id part
+	owner string // owner marketplace name, an id part
+	art   Artifact
+	// root caches the resolved payload root (EvalSymlinks) for the component
+	// containment checks.
+	root string
+	// folded maps a case-folded output path to the path that claimed it: a
+	// case-insensitive store filesystem would collapse case variants into one
+	// file, silently dropping a component.
+	folded map[string]string
 }
 
 // Render builds the chimera artifact. It is pure: the payload root is only
 // read, and two renders of one input are byte-identical.
 func Render(in Input) (Artifact, error) {
-	name, owner := resolveIdentity(in)
-	if name == "" || owner == "" {
-		return Artifact{}, &RenderError{
-			Component: in.ID,
-			Cause:     errors.New("the package name and owner are required"),
-		}
+	identity, err := resolveIdentity(in)
+	if err != nil {
+		return Artifact{}, err
 	}
 
 	r := &renderer{
-		in:      in,
-		name:    name,
-		owner:   owner,
-		visible: name + "@" + owner,
+		in:    in,
+		name:  identity.Name,
+		owner: identity.Owner,
 		art: Artifact{
 			Files:    map[string][]byte{},
 			Digests:  map[string]digest.Hash{},
 			Formats:  chimeraFormats(),
 			symlinks: map[string]string{},
 		},
+		folded: map[string]string{},
 	}
 
 	mcp := r.renderMCP()
@@ -161,6 +172,98 @@ func Render(in Input) (Artifact, error) {
 	return r.art, nil
 }
 
+// maxIDPart is the longest plugin-id part the hosts accept.
+const maxIDPart = 128
+
+// Identity is the host-visible synth identity of a package (decision F3): the
+// plugin name and the owner marketplace name, both valid plugin-id parts —
+// letters, digits, `.`, `_`, `-`, starting with a letter or digit, at most
+// 128 bytes — so `<Name>@<Owner>` is a reference every host parses. `@`
+// never appears in either part.
+type Identity struct {
+	Owner string
+	Name  string
+}
+
+// IdentityOf projects a package id onto its synth identity: the owner is the
+// first id segment and the name is the rest of the id with every `/` turned
+// into `-` (the `//` subpath separator becomes `--`); any other byte outside
+// the id-part alphabet becomes `-` and a leading non-alphanumeric run is
+// dropped. A plain owner/name id keeps both segments verbatim. The projection
+// is not injective (`acme/b-c` and `acme/b/c` meet); the store dir is
+// (store.SynthElements), and the owner marketplace refuses a second package
+// claiming one name instead of overwriting it.
+func IdentityOf(id string) (Identity, error) {
+	if _, _, err := store.SynthElements(id); err != nil {
+		return Identity{}, err
+	}
+
+	owner, rest, _ := strings.Cut(id, "/")
+
+	identity := Identity{Owner: projectIDPart(owner), Name: projectIDPart(rest)}
+
+	if err := identity.validate(); err != nil {
+		return Identity{}, &RenderError{Component: id, Cause: err}
+	}
+
+	return identity, nil
+}
+
+// projectIDPart maps every byte outside the id-part alphabet (including `/`)
+// to `-` and drops a leading non-alphanumeric run.
+func projectIDPart(value string) string {
+	out := []byte(value)
+
+	for i, c := range out {
+		if !idPartByte(c) {
+			out[i] = '-'
+		}
+	}
+
+	return strings.TrimLeftFunc(string(out), func(r rune) bool { return !isAlphanumeric(r) })
+}
+
+// validate reports why the identity is not a pair of plugin-id parts.
+func (i Identity) validate() error {
+	for _, part := range []struct{ label, value string }{{"owner", i.Owner}, {"name", i.Name}} {
+		if err := validIDPart(part.value); err != nil {
+			return fmt.Errorf("the %s %w", part.label, err)
+		}
+	}
+
+	return nil
+}
+
+// validIDPart reports why value is not a plugin-id part.
+func validIDPart(value string) error {
+	switch {
+	case value == "":
+		return errors.New("is empty")
+	case len(value) > maxIDPart:
+		return fmt.Errorf("%q is longer than %d bytes", value, maxIDPart)
+	case !isAlphanumeric(rune(value[0])):
+		return fmt.Errorf("%q must start with a letter or digit", value)
+	}
+
+	for i := range len(value) {
+		if !idPartByte(value[i]) {
+			return fmt.Errorf("%q may use only letters, digits, '.', '_' and '-'", value)
+		}
+	}
+
+	return nil
+}
+
+// idPartByte reports whether c belongs to the plugin-id part alphabet.
+func idPartByte(c byte) bool {
+	return isAlphanumeric(rune(c)) || c == '.' || c == '_' || c == '-'
+}
+
+// isAlphanumeric reports whether r is an ASCII letter or digit.
+func isAlphanumeric(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+}
+
 // chimeraFormats is the fixed format set every render declares.
 func chimeraFormats() []manifest.Format {
 	return []manifest.Format{
@@ -171,38 +274,70 @@ func chimeraFormats() []manifest.Format {
 	}
 }
 
-// resolveIdentity fills Name and Owner from a single-slash package id.
-func resolveIdentity(in Input) (string, string) {
-	name, owner := in.Name, in.Owner
+// resolveIdentity returns the synth identity of one input: the id is
+// authoritative when set (the CLI's own Name/Owner split of a subpath id is
+// not an identity); without an id, Name and Owner must already be plugin-id
+// parts.
+func resolveIdentity(in Input) (Identity, error) {
+	if in.ID != "" {
+		identity, err := IdentityOf(in.ID)
+		if err != nil {
+			if _, ok := errors.AsType[*RenderError](err); ok {
+				return Identity{}, err
+			}
 
-	if name != "" && owner != "" {
-		return name, owner
+			return Identity{}, &RenderError{Component: in.ID, Cause: err}
+		}
+
+		return identity, nil
 	}
 
-	before, after, ok := strings.Cut(in.ID, "/")
-	if !ok || strings.Contains(after, "/") || before == "" || after == "" {
-		return name, owner
+	identity := Identity{Owner: in.Owner, Name: in.Name}
+
+	if err := identity.validate(); err != nil {
+		return Identity{}, &RenderError{Component: in.Name, Cause: err}
 	}
 
-	if name == "" {
-		name = after
-	}
-
-	if owner == "" {
-		owner = before
-	}
-
-	return name, owner
+	return identity, nil
 }
 
-// addFile inserts one rendered file, refusing duplicate output paths.
+// addFile inserts one rendered file, refusing duplicate output paths: an exact
+// duplicate keeps the existing "duplicate output path" error, a path that
+// differs from an existing one by case alone is refused by the folded-path
+// guard.
 func (r *renderer) addFile(rel string, data []byte) error {
 	if _, ok := r.art.Files[rel]; ok {
 		return &RenderError{Component: rel, Cause: errors.New("duplicate output path")}
 	}
 
+	if err := r.foldPath(rel); err != nil {
+		return err
+	}
+
 	files := r.art.Files
 	files[rel] = data
+
+	return nil
+}
+
+// foldPath records one output path in the case-folded index. Exact duplicates
+// keep their kind-specific semantics (files: "duplicate output path"; symlinks:
+// last write wins); this guard refuses only a path that differs from an
+// already-claimed one by case alone, because a case-insensitive store
+// filesystem would overwrite the first with the second. Only case folding is
+// covered — Unicode NFC/NFD equivalence would need x/text/unicode/norm, which
+// is not an allowed dependency in Ф1.
+func (r *renderer) foldPath(rel string) error {
+	key := strings.ToLower(rel)
+
+	if prev, ok := r.folded[key]; ok && prev != rel {
+		return &RenderError{
+			Component: rel,
+			Cause:     fmt.Errorf("output path %q differs only by case from %q", rel, prev),
+		}
+	}
+
+	r.folded[key] = rel
 
 	return nil
 }
@@ -341,7 +476,7 @@ func (r *renderer) manifests(mcp mcpRender) error {
 
 	agentPlugins := map[string]any{
 		"$schema": agentPluginsSchemaURL,
-		keyName:   r.visible,
+		keyName:   r.name,
 		"author":  author,
 	}
 	putNonEmpty(agentPlugins, "version", r.in.Version)
@@ -349,7 +484,7 @@ func (r *renderer) manifests(mcp mcpRender) error {
 	putNonEmpty(agentPlugins, "license", r.in.License)
 	putKeywords(agentPlugins, r.in.Keywords)
 
-	claude := map[string]any{keyName: r.visible, "author": author}
+	claude := map[string]any{keyName: r.name, "author": author}
 	putNonEmpty(claude, "version", r.in.Version)
 	putNonEmpty(claude, "description", r.in.Description)
 	putNonEmpty(claude, "license", r.in.License)
@@ -359,11 +494,11 @@ func (r *renderer) manifests(mcp mcpRender) error {
 		claude["mcpServers"] = mcp.claude
 	}
 
-	codex := map[string]any{keyName: r.visible}
+	codex := map[string]any{keyName: r.name}
 	putNonEmpty(codex, "version", r.in.Version)
 	putNonEmpty(codex, "description", r.in.Description)
 
-	gemini := map[string]any{keyName: r.visible}
+	gemini := map[string]any{keyName: r.name}
 	putNonEmpty(gemini, "version", r.in.Version)
 	putNonEmpty(gemini, "description", r.in.Description)
 
@@ -371,8 +506,10 @@ func (r *renderer) manifests(mcp mcpRender) error {
 		gemini["mcpServers"] = mcp.gemini
 	}
 
+	// The author's own marketplace (`verger pack`): the package root is the
+	// marketplace, named after the owner, so hosts address it as name@owner.
 	marketplace := map[string]any{
-		keyName: r.visible,
+		keyName: r.owner,
 		"owner": author,
 		"plugins": []any{
 			map[string]any{keyName: r.name, "source": "./"},
@@ -532,6 +669,10 @@ func (r *renderer) skillEntry(out, current string, entry fs.DirEntry) error {
 	case entry.Type()&fs.ModeSymlink != 0:
 		target, err := os.Readlink(current)
 		if err != nil {
+			return err
+		}
+
+		if err := r.foldPath(out); err != nil {
 			return err
 		}
 
@@ -800,14 +941,51 @@ func (r *renderer) sourceDir(component manifest.Component) (string, error) {
 	return source, nil
 }
 
-// sourcePath joins a component path to the payload root; an escaping path is
-// refused.
+// sourcePath joins a component path to the payload root and confirms the
+// resolved target stays inside the resolved root: the lexical guard alone is
+// not enough because the OS follows symlinked ancestors. The lexical path is
+// returned, so a component whose own final element is a symlink is still
+// refused by the Lstat checks in sourceFile and sourceDir.
 func (r *renderer) sourcePath(component manifest.Component) (string, error) {
 	if component.Path == "" || strings.ContainsRune(component.Path, 0) || !filepath.IsLocal(component.Path) {
 		return "", &RenderError{Component: component.Name, Cause: errors.New("source path escapes the package root")}
 	}
 
-	return filepath.Join(r.in.Root, filepath.FromSlash(component.Path)), nil
+	joined := filepath.Join(r.in.Root, filepath.FromSlash(component.Path))
+
+	root, err := r.payloadRoot()
+	if err != nil {
+		return "", &RenderError{Component: component.Name, Cause: err}
+	}
+
+	resolved, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		return "", &RenderError{Component: component.Name, Cause: err}
+	}
+
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", &RenderError{Component: component.Name, Cause: errors.New("source path resolves outside the package root")}
+	}
+
+	return joined, nil
+}
+
+// payloadRoot resolves the payload root once per render; component sources
+// must exist, so the root must resolve too.
+func (r *renderer) payloadRoot() (string, error) {
+	if r.root != "" {
+		return r.root, nil
+	}
+
+	root, err := filepath.EvalSymlinks(r.in.Root)
+	if err != nil {
+		return "", err
+	}
+
+	r.root = root
+
+	return r.root, nil
 }
 
 // validComponentName reports whether a name is safe as one output path

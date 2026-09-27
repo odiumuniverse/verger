@@ -1,0 +1,502 @@
+package host_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/odiumuniverse/verger/pkg/apply"
+	"github.com/odiumuniverse/verger/pkg/digest"
+	"github.com/odiumuniverse/verger/pkg/home"
+	"github.com/odiumuniverse/verger/pkg/host"
+	"github.com/odiumuniverse/verger/pkg/hostcli"
+	"github.com/odiumuniverse/verger/pkg/lock"
+	"github.com/odiumuniverse/verger/pkg/pack"
+	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/store"
+)
+
+// claudeCLI is a stateful fake of the Claude Code 2.1.283 plugin CLI. Its
+// output shapes and refusal texts are the ones captured live for F3/F7
+// (docs/reviews/F3-F7-fix-claude.md): marketplaces register under the name
+// their marketplace.json declares, installs resolve the plugin through that
+// document, and an uninstall leaves the plugin cache behind, as the real
+// CLI does.
+type claudeCLI struct {
+	mu           sync.Mutex
+	configDir    string
+	marketplaces map[string]string // name → dir
+	installed    map[string]string // plugin@marketplace → version
+	servers      map[string]string // MCP server name → the add argv that configured it
+	fail         map[string]hostcli.Response
+	calls        []string
+}
+
+// newClaudeCLI builds the fake over one Claude config dir.
+func newClaudeCLI(configDir string) *claudeCLI {
+	return &claudeCLI{
+		configDir:    configDir,
+		marketplaces: map[string]string{},
+		installed:    map[string]string{},
+		servers:      map[string]string{},
+		fail:         map[string]hostcli.Response{},
+	}
+}
+
+// Server reports the add argv of a configured MCP server.
+func (c *claudeCLI) Server(name string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	argv, ok := c.servers[name]
+
+	return argv, ok
+}
+
+// mcp runs one `claude mcp get|add|remove`, refusing like the real CLI: an add
+// of a configured name and a get or remove of an unknown one.
+func (c *claudeCLI) mcp(args []string) ([]byte, error) {
+	name := args[len(args)-1]
+
+	switch args[1] {
+	case "get":
+		if _, ok := c.servers[name]; !ok {
+			return nil, refused(1, "No MCP server found with name: %s", name)
+		}
+
+		return []byte(name + ":\n  Scope: User config\n"), nil
+	case "add":
+		name = args[6]
+		if _, ok := c.servers[name]; ok {
+			return nil, refused(1, "MCP server %s already exists in user config", name)
+		}
+
+		c.servers[name] = strings.Join(args, " ")
+
+		return []byte("Added MCP server " + name), nil
+	case "remove":
+		if _, ok := c.servers[name]; !ok {
+			return nil, refused(1, "No MCP server found with name: %s", name)
+		}
+
+		delete(c.servers, name)
+
+		return []byte("Removed MCP server " + name), nil
+	default:
+		return nil, refused(127, "unknown mcp verb %s", args[1])
+	}
+}
+
+// Run implements hostcli.Runner.
+func (c *claudeCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, error) {
+	key := strings.Join(args, " ")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.calls = append(c.calls, bin.Name+" "+key)
+
+	if resp, ok := c.fail[key]; ok {
+		return resp.Stdout, &hostcli.ExitError{Name: bin.Name, Code: resp.Code, Stderr: resp.Stderr}
+	}
+
+	switch {
+	case len(args) >= 3 && args[0] == "mcp":
+		return c.mcp(args)
+	case key == "plugin marketplace list --json":
+		return c.marketplaceList()
+	case key == "plugin list --json":
+		return c.pluginList()
+	case len(args) == 4 && args[0] == "plugin" && args[1] == "marketplace":
+		return c.marketplace(args[2], args[3])
+	case len(args) == 3 && args[0] == "plugin":
+		return c.plugin(args[1], args[2])
+	default:
+		return nil, refused(127, "unscripted: %s", key)
+	}
+}
+
+// Calls returns the recorded calls as `<name> <joined args>` keys.
+func (c *claudeCLI) Calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return slices.Clone(c.calls)
+}
+
+// Registered reports the dir of a registered marketplace.
+func (c *claudeCLI) Registered(name string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	dir, ok := c.marketplaces[name]
+
+	return dir, ok
+}
+
+// Installed reports the version of an installed plugin id.
+func (c *claudeCLI) Installed(id string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	version, ok := c.installed[id]
+
+	return version, ok
+}
+
+// refused is a non-zero exit of the fake CLI.
+func refused(code int, format string, args ...any) error {
+	return &hostcli.ExitError{Name: "claude", Code: code, Stderr: fmt.Sprintf(format, args...)}
+}
+
+// marketplaceList is `claude plugin marketplace list --json`.
+func (c *claudeCLI) marketplaceList() ([]byte, error) {
+	out := []map[string]string{}
+
+	for _, name := range slices.Sorted(maps.Keys(c.marketplaces)) {
+		dir := c.marketplaces[name]
+		out = append(out, map[string]string{"name": name, "source": "directory", "path": dir, "installLocation": dir})
+	}
+
+	return json.Marshal(out)
+}
+
+// pluginList is `claude plugin list --json`.
+func (c *claudeCLI) pluginList() ([]byte, error) {
+	out := []map[string]any{}
+
+	for _, id := range slices.Sorted(maps.Keys(c.installed)) {
+		plugin, marketplace := splitTestID(id)
+		out = append(out, map[string]any{
+			"id": id, "version": c.installed[id], "scope": "user", "enabled": true,
+			"installPath": filepath.Join(c.configDir, "plugins", "cache", marketplace, plugin, c.installed[id]),
+		})
+	}
+
+	return json.Marshal(out)
+}
+
+// marketplace runs one `claude plugin marketplace <verb> <arg>`.
+func (c *claudeCLI) marketplace(verb, arg string) ([]byte, error) {
+	switch verb {
+	case "add":
+		name, _, err := readTestMarketplace(arg)
+		if err != nil {
+			return nil, refused(1, "✘ Failed to add marketplace: %v", err)
+		}
+
+		if dir, ok := c.marketplaces[name]; ok && dir != arg {
+			return nil, refused(1, "✘ Failed to add marketplace: Marketplace '%s' already exists", name)
+		}
+
+		c.marketplaces[name] = arg
+
+		return []byte("✔ Successfully added marketplace: " + name), nil
+	case "update":
+		if _, ok := c.marketplaces[arg]; !ok {
+			return nil, refused(1, "✘ Failed to update marketplace: Marketplace '%s' not found", arg)
+		}
+
+		return []byte("✔ Successfully updated marketplace: " + arg), nil
+	case "rm", "remove":
+		if _, ok := c.marketplaces[arg]; !ok {
+			return nil, refused(1, "✘ Failed to remove marketplace: Marketplace '%s' not found", arg)
+		}
+
+		delete(c.marketplaces, arg)
+
+		return []byte("✔ Successfully removed marketplace: " + arg), nil
+	default:
+		return nil, refused(127, "unknown marketplace verb %s", verb)
+	}
+}
+
+// plugin runs one `claude plugin <verb> <id>`.
+func (c *claudeCLI) plugin(verb, id string) ([]byte, error) {
+	switch verb {
+	case "install", "update":
+		if verb == "update" {
+			if _, ok := c.installed[id]; !ok {
+				return nil, refused(1, "✘ Failed to update plugin %q: Plugin %q is not installed", id, id)
+			}
+		}
+
+		version, err := c.resolve(id)
+		if err != nil {
+			return nil, err
+		}
+
+		c.installed[id] = version
+
+		plugin, marketplace := splitTestID(id)
+		cache := filepath.Join(c.configDir, "plugins", "cache", marketplace, plugin, version, ".claude-plugin")
+
+		if err := os.MkdirAll(cache, 0o700); err != nil {
+			return nil, err
+		}
+
+		return []byte("✔ Successfully installed plugin: " + id), os.WriteFile(filepath.Join(cache, "plugin.json"), []byte(`{"name":"`+plugin+`"}`), 0o600)
+	case "uninstall":
+		if _, ok := c.installed[id]; !ok {
+			return nil, refused(1, "✘ Failed to uninstall plugin %q: Plugin %q not found in installed plugins", id, id)
+		}
+
+		delete(c.installed, id)
+
+		return []byte("✔ Successfully uninstalled plugin: " + id), nil
+	default:
+		return nil, refused(127, "unknown plugin verb %s", verb)
+	}
+}
+
+// resolve finds the version a registered marketplace serves for a plugin id.
+func (c *claudeCLI) resolve(id string) (string, error) {
+	plugin, marketplace := splitTestID(id)
+
+	dir, ok := c.marketplaces[marketplace]
+	if !ok {
+		return "", refused(1, "✘ Failed to install plugin %q: Marketplace %q not found", id, marketplace)
+	}
+
+	_, sources, err := readTestMarketplace(dir)
+	if err != nil {
+		return "", refused(1, "✘ Failed to install plugin %q: %v", id, err)
+	}
+
+	source, ok := sources[plugin]
+	if !ok {
+		return "", refused(1, "✘ Failed to install plugin %q: Plugin %q not found in marketplace %q", id, plugin, marketplace)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(source), ".claude-plugin", "plugin.json")) //nolint:gosec // G304: the fake reads its own temp store
+	if err != nil {
+		return "", refused(1, "✘ Failed to install plugin %q: %v", id, err)
+	}
+
+	var manifest struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+
+	if err := json.Unmarshal(data, &manifest); err != nil || manifest.Name != plugin {
+		return "", refused(1, "✘ Failed to install plugin %q: plugin.json names %q", id, manifest.Name)
+	}
+
+	return manifest.Version, nil
+}
+
+// readTestMarketplace reads a dir marketplace: its name and plugin sources.
+func readTestMarketplace(dir string) (string, map[string]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ".claude-plugin", "marketplace.json")) //nolint:gosec // G304: the fake reads its own temp store
+	if err != nil {
+		return "", nil, err
+	}
+
+	var doc struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			Name   string `json:"name"`
+			Source string `json:"source"`
+		} `json:"plugins"`
+	}
+
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return "", nil, err
+	}
+
+	sources := map[string]string{}
+
+	for _, plugin := range doc.Plugins {
+		sources[plugin.Name] = plugin.Source
+	}
+
+	return doc.Name, sources, nil
+}
+
+// splitTestID splits a plugin id at the last @.
+func splitTestID(id string) (string, string) {
+	index := strings.LastIndexByte(id, '@')
+	if index < 0 {
+		return id, ""
+	}
+
+	return id[:index], id[index+1:]
+}
+
+// synthPackage lays out one synth package in the store the way pack.Write
+// does (<store>/synth/<owner>/<name>/<version>) with a Claude manifest named
+// after the plugin identity, and returns the package the CLI would deliver.
+func synthPackage(t *testing.T, st *store.Store, id, version string) host.Package {
+	t.Helper()
+
+	dir, err := st.EnsureSynthPath(id, version)
+	if err != nil {
+		t.Fatalf("synth path: %v", err)
+	}
+
+	identity, err := pack.IdentityOf(id)
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+
+	writeFixtureFile(t, filepath.Join(dir, ".claude-plugin", "plugin.json"),
+		`{"name":"`+identity.Name+`","version":"`+version+`"}`, 0o600)
+
+	return host.Package{ID: id, Version: version, SynthDir: dir, Marketplace: identity.Name + "@" + identity.Owner}
+}
+
+// applyWorld builds the pkg/apply dependencies over the adapter's own store,
+// so the trash buckets a delivery records are the ones a removal restores.
+func applyWorld(t *testing.T, st *store.Store, owner host.PathOwner) apply.Deps {
+	t.Helper()
+
+	if err := st.Ensure(); err != nil {
+		t.Fatalf("ensure store: %v", err)
+	}
+
+	hm, err := home.New(filepath.Join(t.TempDir(), "verger-home"))
+	if err != nil {
+		t.Fatalf("home: %v", err)
+	}
+
+	return apply.Deps{
+		Home:       hm,
+		Store:      st,
+		Receipts:   receipt.NewStore(hm.ReceiptsDir()),
+		Journal:    receipt.OpenJournal(hm.JournalPath()),
+		Tombstones: receipt.NewTombstoneStore(hm.TombstonesPath()),
+		Hosts:      map[host.ID]host.Host{},
+		Owned:      owner,
+		Lock:       lock.New(),
+		LockPath:   hm.LockPath(),
+	}
+}
+
+// receiptsOwner resolves path ownership from a receipt store, as the CLI
+// wiring does.
+type receiptsOwner struct {
+	receipts *receipt.Store
+}
+
+// Owner implements host.PathOwner.
+func (o receiptsOwner) Owner(path string) (string, bool) {
+	_, pkg, ok := o.artifact(path)
+
+	return pkg, ok
+}
+
+// ArtifactDigest implements host.ArtifactDigests.
+func (o receiptsOwner) ArtifactDigest(path string) (digest.Hash, bool) {
+	artifact, _, ok := o.artifact(path)
+
+	return artifact.Digest, ok
+}
+
+// artifact finds the receipt artifact recorded at a path.
+func (o receiptsOwner) artifact(path string) (receipt.Artifact, string, bool) {
+	list, err := o.receipts.List()
+	if err != nil {
+		return receipt.Artifact{}, "", false
+	}
+
+	for _, record := range list {
+		for _, artifact := range record.Artifacts {
+			if artifact.Path == path {
+				return artifact, record.Package, true
+			}
+		}
+	}
+
+	return receipt.Artifact{}, "", false
+}
+
+// refuseConflicts answers every apply confirmation with no.
+type refuseConflicts struct{}
+
+// Confirm implements apply.Confirmer.
+func (refuseConflicts) Confirm(context.Context, apply.Question) (bool, error) {
+	return false, nil
+}
+
+// trashedValue reads the payload of one trash bucket.
+func trashedValue(t *testing.T, st *store.Store, id string) string {
+	t.Helper()
+
+	entry, err := st.Trash().Get(id)
+	if err != nil {
+		t.Fatalf("trash bucket %s: %v", id, err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(st.TrashDir(), id, entry.Stored)) //nolint:gosec // G304: the test reads its own temp store
+	if err != nil {
+		t.Fatalf("read trash bucket %s: %v", id, err)
+	}
+
+	return string(data)
+}
+
+// assertConcurrentDryRun runs concurrent dry runs of one adapter and pins that
+// every run is clean and nothing was written.
+func assertConcurrentDryRun(t *testing.T, h host.Host, home, marker string, pkg func() host.Package) {
+	t.Helper()
+
+	const workers = 8
+
+	var (
+		wg   sync.WaitGroup
+		errs = make([]error, workers)
+	)
+
+	for i := range workers {
+		wg.Go(func() {
+			_, errs[i] = h.Deliver(t.Context(), home, host.Delivery{Package: pkg(), Strategy: host.Loose, DryRun: true})
+		})
+	}
+
+	wg.Wait()
+
+	Convey("When they finish", func() {
+		Convey("Then every run is clean and nothing was written", func() {
+			for i := range workers {
+				So(errs[i], ShouldBeNil)
+			}
+
+			So(fileExists(marker), ShouldBeFalse)
+		})
+	})
+}
+
+// assertCLIPolicyBlocked pins the `disableCommandPluginSources` verdict on the
+// native and synth strata of one adapter.
+func assertCLIPolicyBlocked(t *testing.T, home string, pkg host.Package, adapter func(*hostcli.ScriptRunner) host.Host) {
+	t.Helper()
+
+	for _, strategy := range []host.Strategy{host.Native, host.Synth} {
+		Convey("When "+string(strategy)+" wants a CLI install", func() {
+			runner := hostcli.NewScriptRunner(nil)
+			h := adapter(runner)
+
+			blocked := pkg
+			blocked.SynthDir = t.TempDir()
+
+			_, err := h.Deliver(t.Context(), home, host.Delivery{Package: blocked, Strategy: strategy})
+
+			Convey("Then the CLI install is blocked with the rule named", func() {
+				typed, ok := errors.AsType[*host.PolicyError](err)
+				So(ok, ShouldBeTrue)
+				So(typed.Rule, ShouldEqual, "disableCommandPluginSources")
+				So(runner.Calls(), ShouldBeEmpty)
+			})
+		})
+	}
+}

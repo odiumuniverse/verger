@@ -1,7 +1,6 @@
 package pack
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -162,6 +161,22 @@ func TestWriteUpdateReplaces(t *testing.T) {
 
 		first, err := Write(t.Context(), st, in)
 		So(err, ShouldBeNil)
+
+		Convey("When the target gains a foreign file", func() {
+			foreign := filepath.Join(first.Dir, "zz-foreign.txt")
+			writeFile(t, foreign, "stray\n")
+
+			third, thirdErr := Write(t.Context(), st, in)
+
+			Convey("Then the target is replaced and the foreign file is gone", func() {
+				So(thirdErr, ShouldBeNil)
+				So(third.Dir, ShouldEqual, first.Dir)
+
+				_, statErr := os.Lstat(foreign)
+				So(errors.Is(statErr, fs.ErrNotExist), ShouldBeTrue)
+				So(stagingLeftovers(t, filepath.Dir(third.Dir)), ShouldBeEmpty)
+			})
+		})
 
 		Convey("When the payload changes and the package is written again", func() {
 			writeFile(t, filepath.Join(root, "skills", "solo", "SKILL.md"), "---\nname: solo\n---\n\nTwo.\n")
@@ -465,7 +480,7 @@ func TestWriteTouchesOnlySynth(t *testing.T) {
 				target := synthTarget(t, st)
 				data, readErr := os.ReadFile(filepath.Join(target, "plugin.json")) //nolint:gosec // G304: the test reads its own synth path
 				So(readErr, ShouldBeNil)
-				So(bytes.Contains(data, []byte(goldenVisible)), ShouldBeTrue)
+				So(manifestName(t, data), ShouldEqual, goldenName)
 			})
 		})
 	})

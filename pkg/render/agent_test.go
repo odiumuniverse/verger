@@ -90,8 +90,11 @@ Review carefully.
 		Convey("When it is parsed", func() {
 			_, err := render.ParseAgentMarkdown([]byte("---\ntools: [unclosed\n---\nBody\n"))
 
-			Convey("Then an error is reported", func() {
-				So(err, ShouldBeError)
+			target, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then the typed render error is reported", func() {
+				So(ok, ShouldBeTrue)
+				So(target.Kind, ShouldEqual, "agent")
 			})
 		})
 	})

@@ -235,6 +235,33 @@ func TestTrustSaveLoadRoundTrip(t *testing.T) {
 	})
 }
 
+func TestTrustUnreadableFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are meaningless as root")
+	}
+
+	Convey("Given an unreadable trust file", t, func() {
+		dir := filepath.Join(t.TempDir(), "state")
+		path := filepath.Join(dir, "trust.json")
+		So(os.MkdirAll(dir, 0o700), ShouldBeNil)
+		So(os.WriteFile(path, []byte(`{"schema":1,"projects":{}}`), 0o600), ShouldBeNil)
+		So(os.Chmod(path, 0o000), ShouldBeNil)
+
+		t.Cleanup(func() { _ = os.Chmod(path, 0o600) }) //nolint:gosec // G302: restoring the fixture file
+
+		Convey("When the store loads it", func() {
+			err := NewTrustStore(path, fixedClock()).Load()
+
+			Convey("Then it reports the typed parse error", func() {
+				target, ok := errors.AsType[*ConsentParseError](err)
+				So(ok, ShouldBeTrue)
+				So(target.Path, ShouldEqual, path)
+				So(target.Cause, ShouldNotBeNil)
+			})
+		})
+	})
+}
+
 func TestTrustCorruptAndSchema(t *testing.T) {
 	Convey("Given a trust store path", t, func() {
 		path := filepath.Join(t.TempDir(), "trust.json")

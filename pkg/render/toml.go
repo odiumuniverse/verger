@@ -625,6 +625,49 @@ func (ix tomlLineIndex) offset(line int) int {
 	return ix.starts[line-1]
 }
 
+// scanTOMLArrayOfTables records the dotted paths of every array-of-tables
+// header (`[[path]]`); the editor refuses to rewrite anything inside them.
+func scanTOMLArrayOfTables(data []byte) [][]string {
+	index := newTOMLIndex(data)
+
+	var paths [][]string
+
+	for line := 1; line <= len(index.starts); line++ {
+		text := strings.TrimLeft(index.line(line), " \t")
+
+		inner, ok := strings.CutPrefix(text, "[[")
+		if !ok {
+			continue
+		}
+
+		content, _, ok := strings.Cut(inner, "]]")
+		if !ok {
+			continue
+		}
+
+		path, ok := splitTOMLPath(strings.TrimSpace(content))
+		if !ok {
+			continue
+		}
+
+		paths = append(paths, path)
+	}
+
+	return paths
+}
+
+// traversesArrayOfTables reports whether one edit path lies on or below an
+// array-of-tables path.
+func traversesArrayOfTables(arrayOfTables [][]string, path []string) bool {
+	for _, prefix := range arrayOfTables {
+		if len(prefix) <= len(path) && slices.Equal(prefix, path[:len(prefix)]) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // tomlTableSpan is one table header and the range it owns.
 type tomlTableSpan struct {
 	path      []string

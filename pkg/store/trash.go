@@ -18,6 +18,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/fsutil"
+	pkgid "github.com/odiumuniverse/verger/pkg/id"
 )
 
 const (
@@ -236,7 +237,7 @@ func (t *Trash) List() ([]Entry, error) {
 	list := make([]Entry, 0, len(entries))
 
 	for _, dir := range entries {
-		if !dir.IsDir() || !ValidElement(dir.Name()) {
+		if !dir.IsDir() || !pkgid.ValidateElement(dir.Name()) {
 			continue
 		}
 
@@ -265,7 +266,7 @@ func (t *Trash) List() ([]Entry, error) {
 
 // Get returns one trash entry; a missing bucket is a NotFoundError.
 func (t *Trash) Get(id string) (Entry, error) {
-	if !ValidElement(id) {
+	if !pkgid.ValidateElement(id) {
 		return Entry{}, &InvalidIDError{Value: id, Reason: "invalid trash id"}
 	}
 
@@ -287,7 +288,7 @@ func (t *Trash) Get(id string) (Entry, error) {
 // payload is unreadable is a CorruptTrashError. Mutators are serialized by the
 // trash lock.
 func (t *Trash) Restore(ctx context.Context, id string) (Entry, error) {
-	if !ValidElement(id) {
+	if !pkgid.ValidateElement(id) {
 		return Entry{}, &InvalidIDError{Value: id, Reason: "invalid trash id"}
 	}
 
@@ -387,7 +388,7 @@ func (t *Trash) lockExistingBucket(ctx context.Context, bucket string) (func() e
 // Remove permanently deletes one trash bucket. Mutators are serialized by the
 // trash lock.
 func (t *Trash) Remove(id string) error {
-	if !ValidElement(id) {
+	if !pkgid.ValidateElement(id) {
 		return &InvalidIDError{Value: id, Reason: "invalid trash id"}
 	}
 
@@ -446,7 +447,7 @@ func (t *Trash) PurgeBefore(before time.Time) (int, error) {
 	count := 0
 
 	for _, dir := range entries {
-		if !dir.IsDir() || !ValidElement(dir.Name()) {
+		if !dir.IsDir() || !pkgid.ValidateElement(dir.Name()) {
 			continue
 		}
 
@@ -532,7 +533,7 @@ func (t *Trash) loadEntry(id string) (Entry, error) {
 		return Entry{}, &CorruptTrashError{ID: id, Cause: errors.New("entry original is not absolute")}
 	}
 
-	if !ValidElement(entry.Stored) {
+	if !pkgid.ValidateElement(entry.Stored) {
 		return Entry{}, &CorruptTrashError{ID: id, Cause: fmt.Errorf("stored name %q is not a safe element", entry.Stored)}
 	}
 
@@ -540,13 +541,12 @@ func (t *Trash) loadEntry(id string) (Entry, error) {
 }
 
 // rollbackPut returns the payload to its original path and drops the bucket;
-// when the move back fails the payload is left in the bucket and the error
-// names its location.
+// when the move back fails the bucket is kept — the payload inside it is the
+// only copy — and the error names the bucket.
 func rollbackPut(ctx context.Context, bucket, payload, original string, cause error) error {
 	if moveErr := moveEntry(ctx, payload, original); moveErr != nil {
-		_ = os.RemoveAll(bucket)
-
-		return fmt.Errorf("write entry: %w (rollback failed to restore %s: %w)", cause, original, moveErr)
+		return fmt.Errorf("write entry: %w (rollback failed to restore %s; bucket not removed: %s: %w)",
+			cause, original, bucket, moveErr)
 	}
 
 	_ = os.RemoveAll(bucket)

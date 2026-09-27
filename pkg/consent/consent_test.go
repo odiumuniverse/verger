@@ -353,6 +353,44 @@ func TestConsentSaveLoadRoundTrip(t *testing.T) {
 	})
 }
 
+func TestConsentUnreadableFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks are meaningless as root")
+	}
+
+	Convey("Given an unreadable consent file", t, func() {
+		dir := filepath.Join(t.TempDir(), "state")
+		path := filepath.Join(dir, "consent.json")
+		So(os.MkdirAll(dir, 0o700), ShouldBeNil)
+		So(os.WriteFile(path, []byte(`{"schema":1,"hooks":{}}`), 0o600), ShouldBeNil)
+		So(os.Chmod(path, 0o000), ShouldBeNil)
+
+		t.Cleanup(func() { _ = os.Chmod(path, 0o600) }) //nolint:gosec // G302: restoring the fixture file
+
+		Convey("When the store loads it", func() {
+			err := NewStore(path, fixedClock()).Load()
+
+			Convey("Then it reports the typed parse error, not a bare read error", func() {
+				target, ok := errors.AsType[*ConsentParseError](err)
+				So(ok, ShouldBeTrue)
+				So(target.Path, ShouldEqual, path)
+				So(target.Cause, ShouldNotBeNil)
+			})
+		})
+
+		Convey("When a missing file is loaded instead", func() {
+			missing := NewStore(filepath.Join(t.TempDir(), "missing.json"), fixedClock())
+
+			Convey("Then ENOENT still means an empty store", func() {
+				So(missing.Load(), ShouldBeNil)
+
+				_, present := missing.Hooks("acme/foo")
+				So(present, ShouldBeFalse)
+			})
+		})
+	})
+}
+
 func TestConsentCorruptAndSchema(t *testing.T) {
 	Convey("Given a consent store path", t, func() {
 		path := filepath.Join(t.TempDir(), "consent.json")

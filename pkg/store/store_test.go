@@ -275,11 +275,12 @@ func TestStoreLayoutPaths(t *testing.T) {
 
 func TestStorePathValidation(t *testing.T) {
 	Convey("Given an open store", t, func() {
-		s, err := Open(filepath.Join(t.TempDir(), "store"))
+		root := filepath.Join(t.TempDir(), "store")
+		s, err := Open(root)
 		So(err, ShouldBeNil)
 
 		invalidPackages := []string{
-			"", ".", "..", "/abs", "a//b", `a\b`, "a/./b", "a/../b", "a\x00b",
+			"", ".", "..", "/abs", "a//", "//x", "a///b", "a//b//c", "./x", `a\b`, "a/./b", "a/../b", "a\x00b",
 			"a b", "a$b", "a/", "/", "~x",
 		}
 
@@ -302,6 +303,7 @@ func TestStorePathValidation(t *testing.T) {
 		validPackages := []string{
 			"owner/name", "mcp:io.github.github/github-mcp-server", "acme/review-kit",
 			"vercel-labs/skills", "owner/name_2.0", "a+b/c@d", "UPPER/Case",
+			"a//b", "vercel-labs/skills//find-skills",
 		}
 
 		for _, pkg := range validPackages {
@@ -313,6 +315,15 @@ func TestStorePathValidation(t *testing.T) {
 				})
 			})
 		}
+
+		Convey("When PackageDataPath gets a canonical subpath id", func() {
+			path, err := s.PackageDataPath("vercel-labs/skills//find-skills", "claude")
+
+			Convey("Then the subpath nests as directories", func() {
+				So(err, ShouldBeNil)
+				So(path, ShouldEqual, filepath.Join(root, "data", "vercel-labs", "skills", "find-skills", "claude"))
+			})
+		})
 
 		invalidHosts := []string{"", ".", "..", "a/b", "a b", "a:b", `a\b`, "a\x00b", "/a", "a$"}
 
@@ -337,22 +348,6 @@ func TestStorePathValidation(t *testing.T) {
 
 				_, ok := errors.AsType[*InvalidIDError](err)
 				So(ok, ShouldBeTrue)
-			})
-		})
-	})
-}
-
-func TestStoreValidElement(t *testing.T) {
-	Convey("Given path elements", t, func() {
-		Convey("When ValidElement checks them", func() {
-			Convey("Then hosts, versions and trash ids pass and separators fail", func() {
-				for _, valid := range []string{"claude", "codex", "1.2.3", "v0.1.0-beta+meta", "20260925T123045.123456789Z-2"} {
-					So(ValidElement(valid), ShouldBeTrue)
-				}
-
-				for _, invalid := range []string{"", ".", "..", "a/b", "a b", "a:b", `a\b`, "a\x00b", "/a", "a$"} {
-					So(ValidElement(invalid), ShouldBeFalse)
-				}
 			})
 		})
 	})

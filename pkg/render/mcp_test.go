@@ -183,6 +183,63 @@ func TestEncodeMCPEdge(t *testing.T) {
 	})
 }
 
+func TestEncodeMCPTransportContradictions(t *testing.T) {
+	Convey("Given an explicit stdio transport with a url", t, func() {
+		server := manifest.MCPServer{Name: "mixed", Transport: "stdio", URL: "https://x.test/mcp"}
+
+		Convey("When it is encoded", func() {
+			_, err := render.EncodeMCP(manifest.FormatClaude, server)
+
+			_, ok := errors.AsType[*render.RenderError](err)
+
+			Convey("Then the contradictory transport is refused", func() {
+				So(ok, ShouldBeTrue)
+			})
+		})
+	})
+
+	Convey("Given an explicit remote transport with a command", t, func() {
+		cases := []struct {
+			name      string
+			transport string
+		}{
+			{"sse", "sse"},
+			{"streamable-http", "streamable-http"},
+		}
+
+		for _, tc := range cases {
+			server := manifest.MCPServer{Name: "mixed", Transport: tc.transport, Command: []string{"node", "x.js"}}
+
+			Convey("When the "+tc.name+" transport is encoded", func() {
+				for _, format := range []manifest.Format{manifest.FormatClaude, manifest.FormatCodex, manifest.FormatGemini} {
+					_, err := render.EncodeMCP(format, server)
+
+					_, ok := errors.AsType[*render.RenderError](err)
+
+					Convey("Then it is refused on "+string(format), func() {
+						So(ok, ShouldBeTrue)
+					})
+				}
+			})
+		}
+	})
+
+	Convey("Given an unset transport", t, func() {
+		Convey("When a command or a url picks the shape", func() {
+			command := manifest.MCPServer{Name: "cmd", Command: []string{"node", "x.js"}}
+			url := manifest.MCPServer{Name: "url", URL: "https://x.test/mcp"}
+
+			Convey("Then both still encode", func() {
+				_, commandErr := render.EncodeMCP(manifest.FormatClaude, command)
+				_, urlErr := render.EncodeMCP(manifest.FormatClaude, url)
+
+				So(commandErr, ShouldBeNil)
+				So(urlErr, ShouldBeNil)
+			})
+		})
+	})
+}
+
 func TestMCPEdits(t *testing.T) {
 	Convey("Given servers for the JSONC dialects", t, func() {
 		servers := []manifest.MCPServer{

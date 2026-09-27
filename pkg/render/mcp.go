@@ -206,7 +206,10 @@ func claudeTransport(server manifest.MCPServer) string {
 	}
 }
 
-// validateMCP rejects servers outside the canonical union.
+// validateMCP rejects servers outside the canonical union: an unknown
+// transport, neither a command nor a url, both, or an explicit transport that
+// contradicts the shape (stdio is command-based; sse and streamable-http are
+// url-based). An unset transport is inferred from the command/url shape.
 func validateMCP(server manifest.MCPServer) error {
 	switch server.Transport {
 	case "", transportStdio, "streamable-http", transportSSE:
@@ -219,6 +222,10 @@ func validateMCP(server manifest.MCPServer) error {
 		return &RenderError{Kind: kindMCP, Name: server.Name, Cause: errors.New("the server has neither a command nor a url")}
 	case len(server.Command) > 0 && server.URL != "":
 		return &RenderError{Kind: kindMCP, Name: server.Name, Cause: errors.New("the server carries both a command and a url")}
+	case server.Transport == transportStdio && server.URL != "":
+		return &RenderError{Kind: kindMCP, Name: server.Name, Cause: errors.New("the stdio transport needs a command, not a url")}
+	case server.Transport != "" && server.Transport != transportStdio && len(server.Command) > 0:
+		return &RenderError{Kind: kindMCP, Name: server.Name, Cause: fmt.Errorf("the %s transport needs a url, not a command", server.Transport)}
 	}
 
 	return nil

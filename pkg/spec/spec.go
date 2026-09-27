@@ -18,6 +18,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/fsutil"
+	pkgid "github.com/odiumuniverse/verger/pkg/id"
 )
 
 // Schema is the newest spec schema version understood by this package.
@@ -203,8 +204,15 @@ func (s *Spec) Marshal() ([]byte, error) {
 }
 
 // Save writes the spec to path atomically. New files get mode 0600; an
-// existing file keeps its mode. The parent directory must exist.
+// existing file keeps its mode. The parent directory must exist. A hand-built
+// spec with an out-of-range Schema is refused before anything is written:
+// Schema > Schema reports *SchemaNewerError, Schema <= 0 *SchemaInvalidError,
+// both with Path set.
 func (s *Spec) Save(path string) error {
+	if err := checkSchema(s.Schema, path); err != nil {
+		return err
+	}
+
 	data, err := s.Marshal()
 	if err != nil {
 		return err
@@ -238,37 +246,28 @@ func (s *Spec) Digest() digest.Hash {
 	return digest.Bytes(data)
 }
 
-// ValidateID reports whether id is safe as a relative package id: empty,
-// whitespace, control bytes, backslashes, absolute or trailing slashes and
-// ".." path segments are rejected. Letters, digits, ".", "_", "@", ":", "+",
-// "-" and the "/" and "//" separators are allowed.
+// ValidateID reports whether id is a canonical package id per the shared
+// grammar in pkg/id: segments of letters, digits, `.`, `_`, `@`, `:`, `+`
+// and `-` separated by single `/`, plus at most one `//` separator before a
+// non-empty subpath (`owner/repo//skills/foo`, DESIGN §3.4). Empty ids,
+// whitespace, control bytes, backslashes, absolute paths, trailing slashes
+// and `.`/`..` segments are rejected.
 func ValidateID(id string) error {
-	if id == "" {
-		return &InvalidIDError{Value: id, Reason: "empty"}
-	}
-
-	if strings.HasPrefix(id, "/") {
-		return &InvalidIDError{Value: id, Reason: "absolute path"}
-	}
-
-	if strings.HasSuffix(id, "/") {
-		return &InvalidIDError{Value: id, Reason: "trailing slash"}
-	}
-
-	if slices.Contains(strings.Split(id, "/"), "..") {
-		return &InvalidIDError{Value: id, Reason: "parent directory segment"}
-	}
-
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '/', r == '.', r == '_', r == '@', r == ':', r == '+', r == '-':
-		default:
-			return &InvalidIDError{Value: id, Reason: fmt.Sprintf("disallowed character %q", r)}
-		}
+	if err := pkgid.ValidatePackage(id); err != nil {
+		return &InvalidIDError{Value: id, Reason: idReason(err)}
 	}
 
 	return nil
+}
+
+// idReason extracts the grammar violation reason, falling back to the whole
+// error text.
+func idReason(err error) string {
+	if target, ok := errors.AsType[*pkgid.InvalidIDError](err); ok {
+		return target.Reason
+	}
+
+	return err.Error()
 }
 
 // SchemaNewerError reports a spec whose schema is newer than this version

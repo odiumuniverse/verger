@@ -17,7 +17,7 @@ import (
 )
 
 // PackWriteError reports a staging or rename failure. The target keeps its
-// previous content, or stays absent.
+// previous content, or is left empty.
 type PackWriteError struct {
 	Dir   string
 	Cause error
@@ -42,9 +42,6 @@ type Result struct {
 	Dir      string
 	Artifact Artifact
 }
-
-// errTargetDiffers marks a synth target that does not match a fresh render.
-var errTargetDiffers = errors.New("synth target differs")
 
 // Write renders in and installs it at st.EnsureSynthPath(in.ID, in.Version).
 // Files go through fsutil.WriteFileAtomic into a staging sibling, which is
@@ -183,6 +180,7 @@ func chmodDirs(root string) error {
 // every file byte-equal, every symlink equal, no foreign file.
 func sameTarget(target string, art Artifact) bool {
 	seen := 0
+	differ := false
 
 	err := filepath.WalkDir(target, func(current string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -194,30 +192,37 @@ func sameTarget(target string, art Artifact) bool {
 			return relErr
 		}
 
-		if rel == "." {
+		if rel == "." || entry.IsDir() {
 			return nil
 		}
 
 		matched, matchErr := sameEntry(current, filepath.ToSlash(rel), entry, art)
-		if matched {
-			seen++
+		if matchErr != nil {
+			return matchErr
 		}
 
-		return matchErr
+		if !matched {
+			differ = true
+
+			return fs.SkipAll
+		}
+
+		seen++
+
+		return nil
 	})
 
-	return err == nil && seen == len(art.Files)+len(art.symlinks)
+	return err == nil && !differ && seen == len(art.Files)+len(art.symlinks)
 }
 
-// sameEntry compares one target entry against the artifact.
+// sameEntry compares one non-directory target entry against the artifact; a
+// mismatch reports (false, nil) so the walk can stop early.
 func sameEntry(current, rel string, entry fs.DirEntry, art Artifact) (bool, error) {
 	switch {
-	case entry.IsDir():
-		return false, nil
 	case entry.Type()&fs.ModeSymlink != 0:
 		want, ok := art.symlinks[rel]
 		if !ok {
-			return false, errTargetDiffers
+			return false, nil
 		}
 
 		got, err := os.Readlink(current)
@@ -225,15 +230,11 @@ func sameEntry(current, rel string, entry fs.DirEntry, art Artifact) (bool, erro
 			return false, err
 		}
 
-		if got != want {
-			return false, errTargetDiffers
-		}
-
-		return true, nil
+		return got == want, nil
 	case entry.Type().IsRegular():
 		want, ok := art.Files[rel]
 		if !ok {
-			return false, errTargetDiffers
+			return false, nil
 		}
 
 		got, err := os.ReadFile(current) //nolint:gosec // G304: the target is a store synth dir
@@ -241,13 +242,9 @@ func sameEntry(current, rel string, entry fs.DirEntry, art Artifact) (bool, erro
 			return false, err
 		}
 
-		if !bytes.Equal(got, want) {
-			return false, errTargetDiffers
-		}
-
-		return true, nil
+		return bytes.Equal(got, want), nil
 	default:
-		return false, errTargetDiffers
+		return false, nil
 	}
 }
 

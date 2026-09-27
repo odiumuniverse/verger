@@ -2,7 +2,9 @@ package pack
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +17,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/render"
+	"github.com/odiumuniverse/verger/pkg/store"
 )
 
 // Golden identities of the fixture package.
@@ -23,7 +26,6 @@ const (
 	goldenID      = "JuliusBrussee/caveman"
 	goldenName    = "caveman"
 	goldenOwner   = "JuliusBrussee"
-	goldenVisible = "caveman@JuliusBrussee"
 	goldenVersion = "1.2.3"
 )
 
@@ -252,7 +254,7 @@ func TestRenderGoldenChimera(t *testing.T) {
 // tests match parsed JSON values via ShouldEqualJSON.
 const goldenPluginManifest = `{
   "$schema": "` + pluginSchema + `",
-  "name": "caveman@JuliusBrussee",
+  "name": "caveman",
   "version": "1.2.3",
   "description": "Caveman toolkit.",
   "author": {"name": "JuliusBrussee"},
@@ -261,7 +263,7 @@ const goldenPluginManifest = `{
 }`
 
 const goldenClaudeManifest = `{
-  "name": "caveman@JuliusBrussee",
+  "name": "caveman",
   "version": "1.2.3",
   "description": "Caveman toolkit.",
   "author": {"name": "JuliusBrussee"},
@@ -283,13 +285,13 @@ const goldenClaudeManifest = `{
 }`
 
 const goldenCodexManifest = `{
-  "name": "caveman@JuliusBrussee",
+  "name": "caveman",
   "version": "1.2.3",
   "description": "Caveman toolkit."
 }`
 
 const goldenGeminiManifest = `{
-  "name": "caveman@JuliusBrussee",
+  "name": "caveman",
   "version": "1.2.3",
   "description": "Caveman toolkit.",
   "mcpServers": {
@@ -306,7 +308,7 @@ const goldenGeminiManifest = `{
 }`
 
 const goldenMarketplace = `{
-  "name": "caveman@JuliusBrussee",
+  "name": "JuliusBrussee",
   "owner": {"name": "JuliusBrussee"},
   "description": "Caveman toolkit.",
   "plugins": [{"name": "caveman", "source": "./"}]
@@ -426,7 +428,7 @@ func TestRenderManifestsParseBack(t *testing.T) {
 
 			Convey("Then identity, components, MCP and canonical hooks come back", func() {
 				So(parseErr, ShouldBeNil)
-				So(pkg.Name, ShouldEqual, goldenVisible)
+				So(pkg.Name, ShouldEqual, goldenName)
 				So(pkg.Version, ShouldEqual, goldenVersion)
 				So(componentNames(pkg, manifest.KindSkill), ShouldResemble, []string{"alpha", "beta"})
 				So(componentNames(pkg, manifest.KindAgent), ShouldResemble, []string{"reviewer"})
@@ -441,7 +443,7 @@ func TestRenderManifestsParseBack(t *testing.T) {
 
 			Convey("Then it sees the same payload", func() {
 				So(parseErr, ShouldBeNil)
-				So(pkg.Name, ShouldEqual, goldenVisible)
+				So(pkg.Name, ShouldEqual, goldenName)
 				So(componentNames(pkg, manifest.KindSkill), ShouldResemble, []string{"alpha", "beta"})
 				So(componentNames(pkg, manifest.KindCommand), ShouldResemble, []string{"dev", "empty"})
 				So(pkg.MCP, ShouldHaveLength, 2)
@@ -454,7 +456,7 @@ func TestRenderManifestsParseBack(t *testing.T) {
 
 			Convey("Then it sees the Gemini command render and its hooks", func() {
 				So(parseErr, ShouldBeNil)
-				So(pkg.Name, ShouldEqual, goldenVisible)
+				So(pkg.Name, ShouldEqual, goldenName)
 				So(componentNames(pkg, manifest.KindSkill), ShouldResemble, []string{"alpha", "beta"})
 				So(componentNames(pkg, manifest.KindCommand), ShouldResemble, []string{"dev"})
 				So(pkg.MCP, ShouldHaveLength, 2)
@@ -467,7 +469,7 @@ func TestRenderManifestsParseBack(t *testing.T) {
 
 			Convey("Then the closed manifest gates the payload", func() {
 				So(parseErr, ShouldBeNil)
-				So(pkg.Name, ShouldEqual, goldenVisible)
+				So(pkg.Name, ShouldEqual, goldenName)
 				So(componentNames(pkg, manifest.KindSkill), ShouldResemble, []string{"alpha", "beta"})
 				So(pkg.MCP, ShouldHaveLength, 2)
 			})
@@ -502,18 +504,22 @@ func TestRenderNameInvisibility(t *testing.T) {
 				}
 			})
 
-			Convey("Then the author name is visible in every manifest and the marketplace", func() {
+			Convey("Then every manifest names the bare plugin and no name carries '@' (decision F3)", func() {
 				for _, rel := range []string{
 					"plugin.json",
 					".claude-plugin/plugin.json",
 					".codex-plugin/plugin.json",
 					"gemini-extension.json",
-					".claude-plugin/marketplace.json",
 				} {
-					if !bytes.Contains(art.Files[rel], []byte(goldenVisible)) {
-						t.Errorf("%s does not carry %s", rel, goldenVisible)
-					}
+					So(manifestName(t, art.Files[rel]), ShouldEqual, goldenName)
 				}
+
+				So(bytes.Contains(art.Files[".claude-plugin/marketplace.json"], []byte("@")), ShouldBeFalse)
+			})
+
+			Convey("Then the author is visible as the marketplace name, so the host reference is name@owner", func() {
+				So(manifestName(t, art.Files[".claude-plugin/marketplace.json"]), ShouldEqual, goldenOwner)
+				So(string(art.Files[".claude-plugin/plugin.json"]), ShouldContainSubstring, goldenOwner)
 			})
 		})
 	})
@@ -627,6 +633,41 @@ func TestRenderTraversalRefused(t *testing.T) {
 		}
 	})
 
+	Convey("Given existing targets outside the payload root", t, func() {
+		root := t.TempDir()
+		outside := t.TempDir()
+
+		writeFile(t, filepath.Join(outside, "evil.md"), "outside agent\n")
+		writeFile(t, filepath.Join(outside, "skill", "SKILL.md"), "outside skill\n")
+
+		sibling := "../" + filepath.Base(outside)
+
+		bad := []struct {
+			name      string
+			component manifest.Component
+		}{
+			{"existing sibling file", manifest.Component{Kind: manifest.KindAgent, Name: "evil", Path: sibling + "/evil.md"}},
+			{"existing sibling skill", manifest.Component{Kind: manifest.KindSkill, Name: "skill", Path: sibling + "/skill"}},
+		}
+
+		for _, item := range bad {
+			Convey("When component "+item.name+" is rendered", func() {
+				in := Input{ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion, Root: root}
+				in.Components = []manifest.Component{item.component}
+
+				art, err := Render(in)
+
+				target, ok := errors.AsType[*RenderError](err)
+
+				Convey("Then the lexical guard refuses it, naming the escape", func() {
+					So(ok, ShouldBeTrue)
+					So(target.Cause.Error(), ShouldContainSubstring, "escapes the package root")
+					So(art.Files, ShouldBeEmpty)
+				})
+			})
+		}
+	})
+
 	Convey("Given two components that share one output path", t, func() {
 		in := fixtureInput(t)
 		in.Components = append(in.Components, skillComponent(t, "alpha"))
@@ -636,6 +677,246 @@ func TestRenderTraversalRefused(t *testing.T) {
 
 			Convey("Then the duplicate is refused", func() {
 				_ = renderError(t, err)
+			})
+		})
+	})
+}
+
+// TestRenderCaseFoldCollisionRefused pins the [R1] guard: two output paths that
+// differ only by case are refused at render time. The check is lexical — it
+// must fail on a case-sensitive filesystem too, because the store may live on a
+// case-insensitive one (APFS default), where the second write would silently
+// overwrite the first.
+func TestRenderCaseFoldCollisionRefused(t *testing.T) {
+	// caseFoldSkills builds two skill trees named after the given pair.
+	caseFoldSkills := func(t *testing.T, first, second string) Input {
+		t.Helper()
+
+		root := t.TempDir()
+
+		for _, tree := range []string{"one", "two"} {
+			writeFile(t, filepath.Join(root, "src", tree, "SKILL.md"), "---\nname: skill\n---\n\nbody\n")
+		}
+
+		return Input{
+			ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion,
+			Root: root,
+			Components: []manifest.Component{
+				{Kind: manifest.KindSkill, Name: first, Path: "src/one"},
+				{Kind: manifest.KindSkill, Name: second, Path: "src/two"},
+			},
+		}
+	}
+
+	Convey("Given two skills whose names differ only by case", t, func() {
+		in := caseFoldSkills(t, "Alpha", "alpha")
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the folded duplicate is a typed *RenderError and nothing is produced", func() {
+				target := renderError(t, err)
+				So(target.Cause.Error(), ShouldContainSubstring, "differs only by case")
+				So(art.Files, ShouldBeEmpty)
+			})
+		})
+
+		Convey("When the package reaches Write", func() {
+			st, openErr := store.Open(filepath.Join(t.TempDir(), "store"))
+			So(openErr, ShouldBeNil)
+
+			_, writeErr := Write(t.Context(), st, in)
+
+			Convey("Then the render refusal comes through and no synth dir appears", func() {
+				_, ok := errors.AsType[*RenderError](writeErr)
+				So(ok, ShouldBeTrue)
+
+				target, pathErr := st.SynthPath(in.ID, in.Version)
+				So(pathErr, ShouldBeNil)
+
+				_, statErr := os.Lstat(target)
+				So(errors.Is(statErr, fs.ErrNotExist), ShouldBeTrue)
+			})
+		})
+	})
+
+	Convey("Given two skills whose symlinks differ only by case", t, func() {
+		root := t.TempDir()
+
+		for _, tree := range []string{"one", "two"} {
+			dir := filepath.Join(root, "src", tree)
+			So(os.MkdirAll(dir, 0o700), ShouldBeNil)
+			So(os.Symlink("../SKILL.md", filepath.Join(dir, "link")), ShouldBeNil)
+		}
+
+		in := Input{
+			ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion,
+			Root: root,
+			Components: []manifest.Component{
+				{Kind: manifest.KindSkill, Name: "Alpha", Path: "src/one"},
+				{Kind: manifest.KindSkill, Name: "alpha", Path: "src/two"},
+			},
+		}
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the folded symlink duplicate is refused by the recorder too", func() {
+				target := renderError(t, err)
+				So(target.Cause.Error(), ShouldContainSubstring, "differs only by case")
+				So(art.symlinks, ShouldBeEmpty)
+			})
+		})
+	})
+}
+
+// TestWriteArtifactDiskCountInvariant re-checks the pack's own counter: a
+// written artifact must produce exactly one on-disk entry per artifact
+// file/symlink, and no two on-disk paths may fold onto one.
+func TestWriteArtifactDiskCountInvariant(t *testing.T) {
+	Convey("Given a valid package written to the store", t, func() {
+		st, openErr := store.Open(filepath.Join(t.TempDir(), "store"))
+		So(openErr, ShouldBeNil)
+
+		res, err := Write(t.Context(), st, fixtureInput(t))
+
+		Convey("Then artifact and disk agree and no output path folds onto another", func() {
+			So(err, ShouldBeNil)
+
+			foldedArtifact := map[string][]string{}
+			for rel := range res.Artifact.Files {
+				foldedArtifact[strings.ToLower(rel)] = append(foldedArtifact[strings.ToLower(rel)], rel)
+			}
+
+			for rel := range res.Artifact.symlinks {
+				foldedArtifact[strings.ToLower(rel)] = append(foldedArtifact[strings.ToLower(rel)], rel)
+			}
+
+			for key, paths := range foldedArtifact {
+				So(key, ShouldNotBeEmpty)
+				So(paths, ShouldHaveLength, 1)
+			}
+
+			onDisk := 0
+			foldedDisk := map[string][]string{}
+
+			walkErr := filepath.WalkDir(res.Dir, func(current string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if current == res.Dir {
+					return nil
+				}
+
+				rel, relErr := filepath.Rel(res.Dir, current)
+				if relErr != nil {
+					return relErr
+				}
+
+				slash := filepath.ToSlash(rel)
+
+				if entry.IsDir() {
+					return nil
+				}
+
+				onDisk++
+
+				key := strings.ToLower(slash)
+				foldedDisk[key] = append(foldedDisk[key], slash)
+
+				return nil
+			})
+			So(walkErr, ShouldBeNil)
+			So(onDisk, ShouldEqual, len(res.Artifact.Files)+len(res.Artifact.symlinks))
+
+			for key, paths := range foldedDisk {
+				So(key, ShouldNotBeEmpty)
+				So(paths, ShouldHaveLength, 1)
+			}
+		})
+	})
+}
+
+func TestRenderSymlinkedAncestorContainment(t *testing.T) {
+	Convey("Given a component reached through a symlinked ancestor to an outside tree", t, func() {
+		root := t.TempDir()
+		outside := t.TempDir()
+
+		writeFile(t, filepath.Join(outside, "inner", "SKILL.md"), "outside skill\n")
+		writeFile(t, filepath.Join(outside, "evil.md"), "outside agent\n")
+
+		if err := os.Symlink(outside, filepath.Join(root, "linkdir")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		base := Input{ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion, Root: root}
+
+		Convey("When a skill is declared through the link", func() {
+			in := base
+			in.Components = []manifest.Component{{Kind: manifest.KindSkill, Name: "inner", Path: "linkdir/inner"}}
+
+			art, err := Render(in)
+
+			target, ok := errors.AsType[*RenderError](err)
+
+			Convey("Then it is refused and the outside tree is not copied", func() {
+				So(ok, ShouldBeTrue)
+				So(target.Cause.Error(), ShouldContainSubstring, "resolves outside the package root")
+				So(art.Files, ShouldBeEmpty)
+				So(art.symlinks, ShouldBeEmpty)
+			})
+		})
+
+		Convey("When an agent file is declared through the link", func() {
+			in := base
+			in.Components = []manifest.Component{{Kind: manifest.KindAgent, Name: "evil", Path: "linkdir/evil.md"}}
+
+			art, err := Render(in)
+
+			target, ok := errors.AsType[*RenderError](err)
+
+			Convey("Then it is refused and the outside file is not copied", func() {
+				So(ok, ShouldBeTrue)
+				So(target.Cause.Error(), ShouldContainSubstring, "resolves outside the package root")
+				So(art.Files, ShouldBeEmpty)
+			})
+		})
+	})
+
+	Convey("Given a component reached through a symlinked ancestor inside the root", t, func() {
+		root := t.TempDir()
+
+		writeFile(t, filepath.Join(root, "actual", "inner", "SKILL.md"), "# inner\n")
+		writeFile(t, filepath.Join(root, "actual", "evil.md"), "# inside\n")
+
+		if err := os.Symlink(filepath.Join(root, "actual"), filepath.Join(root, "linkdir")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		base := Input{ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion, Root: root}
+
+		Convey("When a skill resolves within the root", func() {
+			in := base
+			in.Components = []manifest.Component{{Kind: manifest.KindSkill, Name: "inner", Path: "linkdir/inner"}}
+
+			art, err := Render(in)
+
+			Convey("Then the resolved target is copied", func() {
+				So(err, ShouldBeNil)
+				So(art.Files["skills/inner/SKILL.md"], ShouldResemble, []byte("# inner\n"))
+			})
+		})
+
+		Convey("When an agent file resolves within the root", func() {
+			in := base
+			in.Components = []manifest.Component{{Kind: manifest.KindAgent, Name: "evil", Path: "linkdir/evil.md"}}
+
+			art, err := Render(in)
+
+			Convey("Then the resolved target is read", func() {
+				So(err, ShouldBeNil)
+				So(string(art.Files["agents/evil.md"]), ShouldContainSubstring, "# inside")
 			})
 		})
 	})
@@ -790,7 +1071,8 @@ func TestRenderIdentityDerivedFromID(t *testing.T) {
 
 			Convey("Then name and owner come from the id", func() {
 				So(err, ShouldBeNil)
-				So(bytes.Contains(art.Files["plugin.json"], []byte(goldenVisible)), ShouldBeTrue)
+				So(manifestName(t, art.Files["plugin.json"]), ShouldEqual, goldenName)
+				So(manifestName(t, art.Files[".claude-plugin/marketplace.json"]), ShouldEqual, goldenOwner)
 			})
 		})
 	})
@@ -808,6 +1090,102 @@ func TestRenderIdentityDerivedFromID(t *testing.T) {
 				_ = renderError(t, err)
 			})
 		})
+	})
+
+	Convey("Given a subpath id with the CLI's last-slash split in Name/Owner", t, func() {
+		in := fixtureInput(t)
+		in.ID = "vercel-labs/skills//find-skills"
+		in.Name = "find-skills"
+		in.Owner = "vercel-labs/skills/"
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the id is authoritative: the projected identity names every manifest", func() {
+				So(err, ShouldBeNil)
+				So(manifestName(t, art.Files[".claude-plugin/plugin.json"]), ShouldEqual, "skills--find-skills")
+				So(manifestName(t, art.Files["gemini-extension.json"]), ShouldEqual, "skills--find-skills")
+				So(manifestName(t, art.Files[".claude-plugin/marketplace.json"]), ShouldEqual, "vercel-labs")
+			})
+		})
+	})
+
+	Convey("Given no id and a Name or Owner outside the plugin-id alphabet", t, func() {
+		for _, identity := range []Identity{
+			{Owner: "acme", Name: "caveman@acme"},
+			{Owner: "acme/x", Name: "caveman"},
+			{Owner: "acme", Name: "-caveman"},
+		} {
+			in := fixtureInput(t)
+			in.ID = ""
+			in.Name = identity.Name
+			in.Owner = identity.Owner
+
+			Convey("When "+identity.Name+"@"+identity.Owner+" is rendered", func() {
+				_, err := Render(in)
+
+				Convey("Then rendering refuses the name", func() {
+					_ = renderError(t, err)
+				})
+			})
+		}
+	})
+}
+
+// manifestName decodes the top-level "name" of one rendered JSON document.
+func manifestName(t *testing.T, data []byte) string {
+	t.Helper()
+
+	var doc struct {
+		Name string `json:"name"`
+	}
+
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+
+	return doc.Name
+}
+
+// TestIdentityOf pins the host-visible synth identity (decision F3): the owner
+// marketplace and the plugin name are valid plugin-id parts, a plain id keeps
+// its segments, and every other id is projected deterministically.
+func TestIdentityOf(t *testing.T) {
+	cases := map[string]Identity{
+		"JuliusBrussee/caveman":           {Owner: "JuliusBrussee", Name: "caveman"},
+		"acme/foo.nvim":                   {Owner: "acme", Name: "foo.nvim"},
+		"acme/my_plugin":                  {Owner: "acme", Name: "my_plugin"},
+		"vercel-labs/skills//find-skills": {Owner: "vercel-labs", Name: "skills--find-skills"},
+		"gitlab.com/group/repo":           {Owner: "gitlab.com", Name: "group-repo"},
+		"npm:@scope/pkg":                  {Owner: "npm--scope", Name: "pkg"},
+		"acme/.github":                    {Owner: "acme", Name: "github"},
+		"acme/repo//sub@1":                {Owner: "acme", Name: "repo--sub-1"},
+	}
+
+	Convey("Given package ids of every shape", t, func() {
+		for id, want := range cases {
+			Convey("When "+id+" is projected", func() {
+				got, err := IdentityOf(id)
+
+				Convey("Then the identity is "+want.Name+"@"+want.Owner+" and never carries '@'", func() {
+					So(err, ShouldBeNil)
+					So(got, ShouldResemble, want)
+					So(strings.Contains(got.Name+got.Owner, "@"), ShouldBeFalse)
+				})
+			})
+		}
+	})
+
+	Convey("Given ids with no synth identity", t, func() {
+		for _, id := range []string{"caveman", "", "../x", "acme/" + strings.Repeat("a", 129), "acme/---"} {
+			Convey("When "+id+" is projected", func() {
+				_, err := IdentityOf(id)
+
+				Convey("Then it is refused", func() {
+					So(err, ShouldNotBeNil)
+				})
+			})
+		}
 	})
 }
 

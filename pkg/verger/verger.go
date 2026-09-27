@@ -1,20 +1,26 @@
 // Package verger is the embedding facade: beadle and CLIs open a Client and ask
 // it for machine paths and, in later phases, plan/apply/status/watch. The Ф0
 // surface is Open/Close, the WithHome/WithLogger/WithStore options and
-// Machine(); host, plan, apply, status and watch APIs arrive with their owning
-// tasks and are deliberately absent here.
+// Machine(); secrets (T1.1: WithSecrets, else <home>/state/secrets.json) and
+// host adapters (T1.6: WithHosts) arrived additively. A missing secrets file is
+// an empty store; an unreadable or corrupt one fails with
+// *OpenError{Option: OptionSecrets}. Client.Secrets is never nil after a
+// successful Open. Plan/apply/status/watch APIs arrive with their owning tasks
+// and are deliberately absent here.
 package verger
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/vmkteam/embedlog"
 
 	"github.com/odiumuniverse/verger/pkg/home"
+	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/secret"
 	"github.com/odiumuniverse/verger/pkg/store"
 )
@@ -25,6 +31,7 @@ type Client struct {
 	store   *store.Store
 	secrets *secret.Store
 	logger  embedlog.Logger
+	hosts   []host.Host
 
 	mu     sync.Mutex
 	closed bool
@@ -40,6 +47,8 @@ type config struct {
 	secretsSet bool
 	logger     embedlog.Logger
 	loggerSet  bool
+	hosts      []host.Host
+	hostsSet   bool
 }
 
 // Option configures Open.
@@ -83,8 +92,23 @@ func WithSecrets(s *secret.Store) Option {
 	}
 }
 
+// WithHosts overrides host discovery with an explicit adapter list; a nil
+// element is rejected by Open with *OpenError{Option: OptionHosts}. The
+// adapters must be built over the store the client opens — the same store as
+// Client.Store(), passed as host.WithStore and host.WithTrash(store.Trash()):
+// the trash buckets an adapter records in a receipt are the ones apply
+// restores from that store, so an adapter on another store makes every
+// replaced artifact unrecoverable.
+func WithHosts(hosts ...host.Host) Option {
+	return func(c *config) {
+		c.hosts = hosts
+		c.hostsSet = true
+	}
+}
+
 // Open resolves the facade: home discovery (or WithHome), the machine store
-// (or WithStore / DefaultRoot) and the logger. It writes nothing and takes no
+// (or WithStore / DefaultRoot), secrets (WithSecrets, else
+// <home>/state/secrets.json) and the logger. It writes nothing and takes no
 // locks; creating home or store layout is an explicit Ensure decision by the
 // caller.
 func Open(ctx context.Context, opts ...Option) (*Client, error) {
@@ -118,7 +142,12 @@ func Open(ctx context.Context, opts ...Option) (*Client, error) {
 		logger = embedlog.NewLogger(false, false)
 	}
 
-	return &Client{home: h, store: st, secrets: secrets, logger: logger}, nil
+	hosts, err := resolveHosts(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{home: h, store: st, secrets: secrets, logger: logger, hosts: hosts}, nil
 }
 
 // resolveHome applies WithHome or discovery.
@@ -184,6 +213,21 @@ func resolveSecrets(cfg config, h *home.Home) (*secret.Store, error) {
 	return secrets, nil
 }
 
+// resolveHosts applies WithHosts; the adapters stay owned by the caller.
+func resolveHosts(cfg config) ([]host.Host, error) {
+	if !cfg.hostsSet {
+		return nil, nil
+	}
+
+	for _, adapter := range cfg.hosts {
+		if adapter == nil {
+			return nil, &OpenError{Option: OptionHosts, Cause: errors.New("nil host adapter")}
+		}
+	}
+
+	return slices.Clone(cfg.hosts), nil
+}
+
 // Close releases facade resources. In Ф0 nothing is held, so it is idempotent
 // and always returns nil; resolved paths stay readable.
 func (c *Client) Close() error {
@@ -211,17 +255,23 @@ func (c *Client) Secrets() *secret.Store {
 	return c.secrets
 }
 
+// Hosts returns the configured host adapters; ownership stays with the client.
+func (c *Client) Hosts() []host.Host {
+	return slices.Clone(c.hosts)
+}
+
 // OpenError.Option values: which Open step failed.
 const (
 	OptionHome    = "home"
 	OptionStore   = "store"
 	OptionSecrets = "secrets"
+	OptionHosts   = "hosts"
 	OptionCtx     = "ctx"
 )
 
 // OpenError reports a failed Open step.
 type OpenError struct {
-	Option string // OptionHome | OptionStore | OptionCtx
+	Option string // OptionHome | OptionStore | OptionSecrets | OptionHosts | OptionCtx
 	Value  string
 	Cause  error
 }

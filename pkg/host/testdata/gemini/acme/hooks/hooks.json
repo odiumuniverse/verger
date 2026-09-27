@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "node \"${extensionPath}/hooks/guard.js\"", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}

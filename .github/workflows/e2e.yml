@@ -1,0 +1,126 @@
+name: e2e
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'   # nightly; agent CLI drift is caught here (DESIGN risk 1)
+  pull_request:
+    paths:
+      - 'pkg/host/**'
+      - 'pkg/pack/**'
+      - 'pkg/apply/**'
+      - 'e2e/**'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.host }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: node:22-bookworm   # spec rule 1: one job per host
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: claude
+            package: '@anthropic-ai/claude-code'
+            version: 2.1.283
+          - host: codex
+            package: '@openai/codex'
+            version: 0.157.1
+          - host: gemini
+            package: '@google/gemini-cli'
+            version: 0.61.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet the tagged driver
+        run: go vet -mod=vendor -tags e2e ./e2e
+
+      - name: Preflight — the scenario tests must exist
+        run: |
+          listed="$(go test -mod=vendor -tags e2e -list 'TestE2E(Local|Remote)' ./e2e/...)"
+          for want in TestE2ELocalFixtureScenario TestE2ERemoteArchiveScenario; do
+            if ! printf '%s\n' "$listed" | grep -qx "$want"; then
+              echo "preflight: $want is not selected — a stale -run pattern would silently pass" >&2
+              printf '%s\n' "$listed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install host CLI
+        run: npm install -g '${{ matrix.package }}@${{ matrix.version }}'
+
+      - name: e2e scenario
+        env:
+          E2E: '1'
+          # the job already installed the CLI; this makes a binary-name drift
+          # attempt an npm install (loud failure) instead of a silent skip (N1)
+          E2E_NPM_INSTALL: '1'
+          E2E_HOST: ${{ matrix.host }}
+          E2E_VERSION: ${{ matrix.version }}
+          E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+        run: go test -mod=vendor -tags e2e -count=1 -timeout 30m -v ./e2e/...
+
+      - name: Failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ matrix.host }}
+          path: e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  negative:
+    name: e2e (no host on PATH)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: node:22-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [claude, codex, gemini]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet the tagged driver
+        run: go vet -mod=vendor -tags e2e ./e2e
+
+      - name: Preflight — the negative test must exist
+        run: |
+          listed="$(go test -mod=vendor -tags e2e -list 'TestE2ENegative' ./e2e/...)"
+          if ! printf '%s\n' "$listed" | grep -qx TestE2ENegative; then
+            echo "preflight: TestE2ENegative is not selected — a stale -run pattern would silently pass" >&2
+            printf '%s\n' "$listed" >&2
+            exit 1
+          fi
+
+      # deliberately installs no host CLI: the CLI must fail cleanly
+      - name: e2e negative leg
+        env:
+          E2E: '1'
+          E2E_NEGATIVE: '1'
+          E2E_HOST: ${{ matrix.host }}
+          E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+        run: go test -mod=vendor -tags e2e -count=1 -timeout 10m -v -run TestE2ENegative ./e2e/...
+
+      - name: Failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-negative-${{ matrix.host }}
+          path: e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 7

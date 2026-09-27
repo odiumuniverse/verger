@@ -405,6 +405,31 @@ func TestRecords(t *testing.T) {
 	})
 }
 
+func TestRecordsNullIsParseError(t *testing.T) {
+	Convey("Given a records file holding JSON null", t, func() {
+		path := filepath.Join(t.TempDir(), "state", "hostcli.json")
+
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		records, err := hostcli.LoadRecords(path)
+
+		_, ok := errors.AsType[*hostcli.RecordsParseError](err)
+
+		Convey("When it is loaded", func() {
+			Convey("Then it is a parse error, never nil records", func() {
+				So(ok, ShouldBeTrue)
+				So(records, ShouldBeNil)
+			})
+		})
+	})
+}
+
 func TestRecordsEdges(t *testing.T) {
 	Convey("Given a records file path", t, func() {
 		path := filepath.Join(t.TempDir(), "state", "hostcli.json")
@@ -519,6 +544,29 @@ func TestRecordsEdges(t *testing.T) {
 			Convey("Then the write failure names the path", func() {
 				So(err, ShouldBeError)
 				So(err.Error(), ShouldContainSubstring, blocker)
+			})
+		})
+	})
+}
+
+func TestRecordsNilSave(t *testing.T) {
+	Convey("Given a nil Records", t, func() {
+		path := filepath.Join(t.TempDir(), "state", "hostcli.json")
+
+		var records hostcli.Records
+
+		Convey("When it is saved", func() {
+			So(records.Save(path), ShouldBeNil)
+
+			raw, readErr := os.ReadFile(path) //nolint:gosec // G304: test reads its own temp file
+			So(readErr, ShouldBeNil)
+
+			loaded, err := hostcli.LoadRecords(path)
+
+			Convey("Then an empty object round-trips", func() {
+				So(strings.TrimSpace(string(raw)), ShouldEqual, "{}")
+				So(err, ShouldBeNil)
+				So(loaded, ShouldBeEmpty)
 			})
 		})
 	})

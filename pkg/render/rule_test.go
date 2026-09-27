@@ -5,11 +5,82 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	. "github.com/smartystreets/goconvey/convey"
+	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/odiumuniverse/verger/pkg/render"
 )
+
+func TestRuleSkillLongSlug(t *testing.T) {
+	Convey("Given a name whose slug exceeds the filesystem name bound", t, func() {
+		long := strings.Repeat("я", 200) // 400 bytes
+
+		rel, content, err := render.RuleSkill(long, []byte("Do it.\n"))
+
+		Convey("When the rule is wrapped", func() {
+			Convey("Then the slug is capped, unique and deterministic", func() {
+				So(err, ShouldBeNil)
+
+				name := strings.TrimPrefix(rel, "skills/")
+				So(name, ShouldStartWith, "rule-")
+				So(len(name), ShouldBeLessThanOrEqualTo, 255)
+				So(len(name), ShouldBeLessThan, len("rule-")+len(long))
+				So(skillNameOf(t, string(content)), ShouldEqual, name)
+
+				other, _, otherErr := render.RuleSkill(long+"x", []byte("Do it.\n"))
+				So(otherErr, ShouldBeNil)
+				So(other, ShouldNotEqual, rel)
+
+				again, _, _ := render.RuleSkill(long, []byte("Do it.\n"))
+				So(again, ShouldEqual, rel)
+			})
+		})
+	})
+}
+
+// descriptionOf decodes the frontmatter description of a rendered SKILL.md; the
+// YAML emitter may quote or escape multibyte scalars, so the test must decode
+// rather than read the raw line.
+func descriptionOf(t *testing.T, content string) string {
+	t.Helper()
+
+	front, _, ok := strings.Cut(content, "\n---\n")
+	if !ok {
+		t.Fatalf("rendered skill has no closing frontmatter fence:\n%s", content)
+	}
+
+	var doc struct {
+		Description string `yaml:"description"`
+	}
+
+	if err := yaml.Unmarshal([]byte(front), &doc); err != nil {
+		t.Fatalf("parse rendered frontmatter: %v", err)
+	}
+
+	return doc.Description
+}
+
+// skillNameOf decodes the frontmatter name of a rendered SKILL.md.
+func skillNameOf(t *testing.T, content string) string {
+	t.Helper()
+
+	front, _, ok := strings.Cut(content, "\n---\n")
+	if !ok {
+		t.Fatalf("rendered skill has no closing frontmatter fence:\n%s", content)
+	}
+
+	var doc struct {
+		Name string `yaml:"name"`
+	}
+
+	if err := yaml.Unmarshal([]byte(front), &doc); err != nil {
+		t.Fatalf("parse rendered frontmatter: %v", err)
+	}
+
+	return doc.Name
+}
 
 func TestRuleSkill(t *testing.T) {
 	Convey("Given a two-line rule", t, func() {
@@ -56,26 +127,32 @@ Second line.
 	})
 
 	Convey("Given a very long first line", t, func() {
-		line := strings.Repeat("a", 130)
+		cases := []struct {
+			name string
+			line string
+		}{
+			{"ascii", strings.Repeat("a", 130)},
+			{"cyrillic", strings.Repeat("я", 130)},
+			{"emoji", strings.Repeat("😀", 130)},
+			{"mixed multibyte boundary", strings.Repeat("a", 119) + "€"},
+		}
 
-		rel, content, err := render.RuleSkill("long", []byte(line+"\nbody\n"))
+		for _, item := range cases {
+			Convey("When the "+item.name+" line is truncated", func() {
+				rel, content, err := render.RuleSkill("long", []byte(item.line+"\nbody\n"))
 
-		Convey("When the description is extracted", func() {
-			Convey("Then it is truncated to 120 characters", func() {
-				So(err, ShouldBeNil)
-				So(rel, ShouldEqual, "skills/rule-long")
+				Convey("Then exactly 120 runes survive as valid UTF-8", func() {
+					So(err, ShouldBeNil)
+					So(rel, ShouldEqual, "skills/rule-long")
 
-				description := ""
+					description := descriptionOf(t, string(content))
 
-				for l := range strings.SplitSeq(string(content), "\n") {
-					if after, ok := strings.CutPrefix(l, "description: "); ok {
-						description = after
-					}
-				}
-
-				So(len([]rune(description)), ShouldEqual, 120)
+					So(description, ShouldEqual, string([]rune(item.line)[:120]))
+					So(utf8.RuneCountInString(description), ShouldEqual, 120)
+					So(utf8.ValidString(description), ShouldBeTrue)
+				})
 			})
-		})
+		}
 	})
 
 	Convey("Given an empty rule", t, func() {
