@@ -6,8 +6,6 @@ are installed from npm in a `node:22-bookworm` container, the driver builds
 and asserts the host's own JSON output. **No LLM calls** — only
 `plugin/extensions list --json` oracles and file assertions.
 
-Full contract, maturity rule and expectations: [`docs/e2e.md`](../docs/e2e.md).
-
 ## Run locally (Docker)
 
 ```sh
@@ -36,7 +34,7 @@ E2E=1 E2E_HOST=claude go test -tags e2e -count=1 -timeout 25m -v -run 'TestE2E(L
 
 Two scenarios: the local fixture (loose → oracle must not see it; synth →
 oracle must see it) and the loopback-pinned remote archive (always
-host-registering → oracle must see it). See `docs/e2e.md`.
+host-registering → oracle must see it).
 
 Without `E2E=1` every scenario skips itself with a reason; a missing host CLI
 also skips (with the exact `npm install -g` line to fix it), so the suite is

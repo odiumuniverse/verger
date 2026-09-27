@@ -17,9 +17,6 @@ OpenCode, Kilo, Pi, DeepSeek Harness.
   wherever the repo carries that agent's format. Install a plugin in any agent
   the usual way and `verger watch` spreads it to the rest.
 
-The design lives in [docs/DESIGN.md](docs/DESIGN.md); the work breakdown is in
-[docs/TASKS.md](docs/TASKS.md).
-
 ## Status
 
 Ф0 done; Ф1 (Claude/Codex/Gemini adapters, apply, CLI, e2e) — in review.
