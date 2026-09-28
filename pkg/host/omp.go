@@ -161,6 +161,36 @@ func (h *omp) deliverLoose(ctx context.Context, home string, d Delivery) (Result
 	userHome := h.base.effectiveHome(home)
 	spec := ompSpec(userHome)
 
+	// The MCP document belongs to no one tool: the host, beadle's omp surface
+	// and verger all edit <agentDir>/mcp.json, and a compare-and-swap on the
+	// other side is worth nothing unless this side holds the same lock across
+	// the whole read-modify-write. So a delivery that will write it plans AND
+	// writes under the shared lock (take the lock, re-read, change only
+	// verger's keys, write, release); a dry run and a package without MCP
+	// servers take no lock, because neither writes.
+	if d.DryRun || len(d.Package.MCP) == 0 {
+		return h.planAndExecuteLoose(ctx, userHome, spec, d)
+	}
+
+	var (
+		result Result
+		err    error
+	)
+
+	if lockErr := h.withPluginLock(ctx, userHome, func() error {
+		result, err = h.planAndExecuteLoose(ctx, userHome, spec, d)
+
+		return err
+	}); lockErr != nil {
+		return Result{}, lockErr
+	}
+
+	return result, err
+}
+
+// planAndExecuteLoose plans one loose delivery and, unless it is a dry run,
+// executes it: the caller owns any lock that must cover the read and the write.
+func (h *omp) planAndExecuteLoose(ctx context.Context, userHome string, spec looseSpec, d Delivery) (Result, error) {
 	plan, err := planLoose(ctx, h.base, spec, d)
 	if err != nil {
 		return Result{}, err
@@ -689,7 +719,10 @@ func (h *omp) withPluginLock(ctx context.Context, userHome string, run func() er
 	fileLock := flock.New(filepath.Join(dir, ompPluginLock))
 
 	if _, err := fileLock.TryLockContext(ctx, lockRetryDelay); err != nil {
-		return &DeliveryError{Host: string(Omp), Step: stepInstall, Cause: fmt.Errorf("lock %s: %w", fileLock.Path(), err)}
+		return &DeliveryError{
+			Host: string(Omp), Step: stepInstall,
+			Cause: fmt.Errorf("another writer holds %s: %w", fileLock.Path(), err),
+		}
 	}
 
 	defer func() { _ = fileLock.Unlock() }()

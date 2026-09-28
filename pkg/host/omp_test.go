@@ -1,6 +1,7 @@
 package host_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -8,7 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gofrs/flock"
 	. "github.com/smartystreets/goconvey/convey"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
@@ -222,7 +225,10 @@ func TestOmpDetect(t *testing.T) {
 				So(err, ShouldBeNil)
 				So(fileExists(filepath.Join(profile, "agents", "reviewer.md")), ShouldBeTrue)
 				So(fileExists(filepath.Join(profile, "rules", "caveman.md")), ShouldBeTrue)
-				So(fileExists(filepath.Join(home, ".omp")), ShouldBeFalse)
+				// The relocated agent dir is not created below the home; the
+				// shared lock still lives at the plugin state root (its own
+				// convention, shared with beadle).
+				So(fileExists(filepath.Join(home, ".omp", "agent")), ShouldBeFalse)
 			})
 		})
 	})
@@ -302,6 +308,9 @@ func TestOmpLooseGolden(t *testing.T) {
 					".agents/skills/alpha/SKILL.md",
 					".agents/skills/alpha/scripts/run.sh",
 					".agents/skills/beta/SKILL.md",
+					// The shared lock, not a delivered artifact: the MCP document
+					// is edited under it (see TestOmpMCPSharedLock).
+					".omp/.omp-plugin.verger.lock",
 					".omp/agent/agents/reviewer.md",
 					".omp/agent/commands/dev.md",
 					".omp/agent/mcp.json",
@@ -1540,4 +1549,167 @@ func TestOmpProfileMatchesTheHost(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestOmpMCPSharedDocumentMerge pins the read-modify-write itself: two
+// deliveries in a row, under the shared lock, keep the user's own key and
+// comment beside both writers' servers.
+func TestOmpMCPSharedDocumentMerge(t *testing.T) {
+	Convey("Given a foreign key and comment in the shared document", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		writeFixtureFile(t, filepath.Join(home, ".omp", "agent", "mcp.json"), `{
+  // the user's own comment
+  "mcpServers": {},
+  "disabledServers": ["legacy"]
+}`, 0o600)
+
+		h, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+		Convey("When two packages are delivered one after another", func() {
+			first, firstErr := h.Deliver(t.Context(), home, host.Delivery{Package: ompPackage(t), Strategy: host.Loose})
+			So(firstErr, ShouldBeNil)
+			So(first.Artifacts, ShouldNotBeEmpty)
+
+			// Only the shared document is under test here: the second package
+			// carries no component of its own, so both deliveries touch
+			// mcp.json alone and no ownership map is involved.
+			second := ompPackage(t)
+			second.ID = "acme/other"
+			second.Components = nil
+			second.MCP = []manifest.MCPServer{{Name: "other", Command: []string{"node", "other.js"}}}
+
+			h2, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+			_, secondErr := h2.Deliver(t.Context(), home, host.Delivery{Package: second, Strategy: host.Loose})
+
+			Convey("Then both writers' keys and the user's own survive", func() {
+				So(secondErr, ShouldBeNil)
+
+				doc := readTestFile(t, filepath.Join(home, ".omp", "agent", "mcp.json"))
+				So(doc, ShouldContainSubstring, "the user's own comment")
+				So(doc, ShouldContainSubstring, "disabledServers")
+				So(doc, ShouldContainSubstring, `"fs"`)
+				So(doc, ShouldContainSubstring, `"web"`)
+				So(doc, ShouldContainSubstring, `"other"`)
+			})
+		})
+	})
+
+	_ = lockPathOf
+}
+
+// lockPathOf is the shared lock of one test home.
+func lockPathOf(home string) string {
+	return filepath.Join(home, ".omp", ".omp-plugin.verger.lock")
+}
+
+// TestOmpMCPSharedLock pins the contract with the other writer of
+// <agentDir>/mcp.json (beadle's omp surface, and the host itself): the whole
+// read-modify-write of that document runs under the shared
+// <state root>/.omp-plugin.verger.lock, a held lock makes the delivery refuse
+// instead of writing, and a released lock lets the next writer in.
+func TestOmpMCPSharedLock(t *testing.T) {
+	lockPath := func(home string) string {
+		return filepath.Join(home, ".omp", ".omp-plugin.verger.lock")
+	}
+
+	Convey("Given a lock held by another writer", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		if err := os.MkdirAll(filepath.Dir(lockPath(home)), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		held := flock.New(lockPath(home))
+		if _, err := held.TryLock(); err != nil {
+			t.Fatalf("hold the lock: %v", err)
+		}
+
+		h, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+
+		_, err := h.Deliver(ctx, home, host.Delivery{Package: ompPackage(t), Strategy: host.Loose})
+
+		Convey("When the package is delivered", func() {
+			Convey("Then nothing is written and the refusal names the other writer", func() {
+				failure, ok := errors.AsType[*host.DeliveryError](err)
+				So(ok, ShouldBeTrue)
+				So(failure.Error(), ShouldContainSubstring, "another writer holds")
+				So(failure.Error(), ShouldContainSubstring, ".omp-plugin.verger.lock")
+				So(fileExists(filepath.Join(home, ".omp", "agent", "mcp.json")), ShouldBeFalse)
+				So(fileExists(filepath.Join(home, ".agents")), ShouldBeFalse)
+			})
+		})
+
+		Convey("And once the lock is released the same delivery writes", func() {
+			if err := held.Unlock(); err != nil {
+				t.Fatalf("release the lock: %v", err)
+			}
+
+			fresh := t.TempDir()
+
+			releasedStore := openStore(t)
+
+			released, _ := newOmp(t, fresh, nil,
+				host.WithStore(releasedStore), host.WithTrash(releasedStore.Trash()), host.WithSecrets(ompSecrets(t)))
+
+			_, deliverErr := released.Deliver(t.Context(), fresh, host.Delivery{Package: ompPackage(t), Strategy: host.Loose})
+
+			So(deliverErr, ShouldBeNil)
+			So(fileExists(filepath.Join(fresh, ".omp", "agent", "mcp.json")), ShouldBeTrue)
+		})
+	})
+
+	Convey("Given a package without MCP servers", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		h, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+		pkg := ompPackage(t)
+		pkg.MCP = nil
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose})
+		So(err, ShouldBeNil)
+
+		Convey("When it is delivered", func() {
+			Convey("Then no lock is taken for a write that cannot happen", func() {
+				So(fileExists(lockPath(home)), ShouldBeFalse)
+			})
+		})
+	})
+
+	Convey("Given a dry run of a package with MCP servers", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		h, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+		_, dryErr := h.Deliver(t.Context(), home, host.Delivery{Package: ompPackage(t), Strategy: host.Loose, DryRun: true})
+
+		Convey("When it is planned", func() {
+			Convey("Then nothing is written and no lock is taken", func() {
+				So(dryErr, ShouldBeNil)
+				So(fileExists(lockPath(home)), ShouldBeFalse)
+				So(fileExists(filepath.Join(home, ".omp", "agent", "mcp.json")), ShouldBeFalse)
+			})
+		})
+	})
 }
