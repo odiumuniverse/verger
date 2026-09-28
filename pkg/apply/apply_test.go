@@ -245,17 +245,11 @@ func (f *fakeHost) snapshot(d host.Delivery) deliverState {
 	}
 }
 
-// beginDelivery counts a real delivery and signals the test.
+// beginDelivery counts a real delivery and then signals the test: the signal
+// comes last, so a test that saw it also sees the delivery in the counters.
 func (f *fakeHost) beginDelivery(d host.Delivery) {
 	if d.DryRun {
 		return
-	}
-
-	if f.signal != nil {
-		select {
-		case f.signal <- struct{}{}:
-		default:
-		}
 	}
 
 	f.mu.Lock()
@@ -270,6 +264,13 @@ func (f *fakeHost) beginDelivery(d host.Delivery) {
 
 	if f.track != nil {
 		f.track.enter()
+	}
+
+	if f.signal != nil {
+		select {
+		case f.signal <- struct{}{}:
+		default:
+		}
 	}
 }
 
