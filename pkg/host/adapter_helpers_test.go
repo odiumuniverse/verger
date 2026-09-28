@@ -953,6 +953,28 @@ func (o *ompCLI) dispatchPlugin(bare []string, key string) ([]byte, error) {
 	}
 }
 
+// RunStreams implements hostcli.StreamRunner: the adapter reads stderr, where
+// omp reports a module that failed to load while still exiting 0.
+func (o *ompCLI) RunStreams(ctx context.Context, bin hostcli.Binary, args []string, stdin []byte) ([]byte, []byte, error) {
+	key := strings.Join(args, " ")
+
+	o.mu.Lock()
+
+	o.calls = append(o.calls, bin.Name+" "+key)
+
+	resp, scripted := o.fail[key]
+
+	o.mu.Unlock()
+
+	if scripted {
+		return resp.Stdout, []byte(resp.Stderr), &hostcli.ExitError{Name: bin.Name, Code: resp.Code, Stderr: resp.Stderr}
+	}
+
+	out, err := o.Run(ctx, bin, args, stdin)
+
+	return out, nil, err
+}
+
 // Calls returns the recorded calls as `<name> <joined args>` keys.
 func (o *ompCLI) Calls() []string {
 	o.mu.Lock()

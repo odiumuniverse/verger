@@ -44,10 +44,22 @@ const (
 	// (docs/reviews/omp-grammar.probe.log; OMPDOC
 	// plugin-manager-installer-plumbing.md#lock-state-management-details).
 	ompPluginLock = ".omp-plugin.verger.lock"
-	// ompHooksBlocked is the delivery note of the hook component: omp has no
-	// declarative hook document at all, only TS/JS modules under
-	// hooks/{pre,post}/ that no manifest kind can express.
+	// ompHooksBlocked is the delivery note of the declarative hook component:
+	// omp has no hook document at all, only TS/JS modules under
+	// hooks/{pre,post}/, which the payload carries as host modules instead
+	// (hookModulesDir).
 	ompHooksBlocked = "omp hooks are TS/JS modules under hooks/{pre,post}/ and have no declarative surface"
+	ompHooksDir     = "hooks" // hook modules, below the agent dir: hooks/{pre,post}/<name>.{ts,js}
+	// ompHookProbePrompt and ompHookProbeTime bound the only load check omp
+	// offers: a headless session start. Hook modules are compiled and imported
+	// before omp needs a model, so the probe works without credentials, and
+	// --max-time keeps a session that has no model from waiting for input.
+	ompHookProbePrompt = "omp"
+	ompHookProbeTime   = "3"
+	// ompHookLoadFailure is the stderr marker of a module that did not load.
+	// The exit code proves nothing: a broken module still ends the session
+	// normally (the hooks contract, E5/E6).
+	ompHookLoadFailure = "Failed to load extension"
 )
 
 // omp is the oh-my-pi adapter. Its install grammar is the one of omp 18.4.1,
@@ -128,7 +140,10 @@ func ompSpec(userHome string) looseSpec {
 		rulesDir:     filepath.Join(agentDir, ompRulesDir),
 		settingsPath: filepath.Join(agentDir, ompMCPDoc),
 		hooksBlocked: ompHooksBlocked,
-		renderAgent:  ompAgent,
+		// The declarative hook document has no omp surface (hooksBlocked), but
+		// the payload's host modules do: runtime/omp/hooks/{pre,post}/<name>.ts.
+		hookModulesDir: filepath.Join(agentDir, ompHooksDir),
+		renderAgent:    ompAgent,
 		mcpConfig: &mcpConfigSpec{
 			path:   filepath.Join(agentDir, ompMCPDoc),
 			format: manifest.FormatClaude,
@@ -154,8 +169,72 @@ func (h *omp) deliverLoose(ctx context.Context, home string, d Delivery) (Result
 	// The result is the executed plan even on error (NF-5, Host.Deliver); it
 	// is composed after execution, which records the trash buckets.
 	err = h.base.executeLoose(ctx, spec, d.Package, plan)
+	result := plan.result(d.Strategy, false)
 
-	return plan.result(d.Strategy, false), err
+	if err == nil && d.AllowHooks {
+		if verifyErr := h.verifyHookModules(ctx, userHome, d.Package); verifyErr != nil {
+			return result, verifyErr
+		}
+	}
+
+	return result, err
+}
+
+// verifyHookModules proves the delivered hook modules load, because no omp
+// command reports it: the only signal is a `Failed to load extension <path>`
+// line on stderr of a session start, and the exit code stays 0 even for a
+// module that failed to build. The probe runs headless with a bounded session
+// and no model: modules are imported before omp asks for credentials.
+func (h *omp) verifyHookModules(ctx context.Context, userHome string, pkg Package) error {
+	modules, err := scanHookModules(pkg.Root, string(Omp))
+	if err != nil || len(modules) == 0 {
+		return err
+	}
+
+	stdout, stderr, runErr := h.base.runStreams(ctx, wordOmp, []string{"-p", ompHookProbePrompt, "--max-time", ompHookProbeTime})
+	if errors.Is(runErr, hostcli.ErrNotFound) {
+		return nil // no CLI to ask; the delivery stands on its own
+	}
+
+	// Both streams are read: the marker is a diagnostic line, not a document,
+	// and which stream carries it is a host implementation detail.
+	output := string(stdout) + "\n" + string(stderr)
+
+	var failed []string
+
+	for line := range strings.SplitSeq(output, "\n") {
+		if !strings.Contains(line, ompHookLoadFailure) {
+			continue
+		}
+
+		for _, module := range modules {
+			// omp abbreviates HOME to "~" in the message, so the file is
+			// matched by its module path, never by an absolute prefix.
+			if strings.Contains(line, filepath.Join(ompHooksDir, module.phase, module.name+module.ext)) {
+				failed = append(failed, strings.TrimSpace(line))
+			}
+		}
+	}
+
+	if len(failed) > 0 {
+		return &DeliveryError{
+			Host: string(Omp), Package: pkg.ID, Step: stepVerify,
+			Cause: fmt.Errorf("the delivered hook module(s) did not load: %s", strings.Join(failed, "; ")),
+		}
+	}
+
+	agentDir := ompAgentDir(userHome)
+
+	for _, module := range modules {
+		if !isFile(filepath.Join(agentDir, ompHooksDir, module.phase, module.name+module.ext)) {
+			return &DeliveryError{
+				Host: string(Omp), Package: pkg.ID, Step: stepVerify,
+				Cause: fmt.Errorf("the hook module %s is not on disk after delivery", module.name+module.ext),
+			}
+		}
+	}
+
+	return nil
 }
 
 // ompAgent renders one subagent for omp, which silently skips a file whose

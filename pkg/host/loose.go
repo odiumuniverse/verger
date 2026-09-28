@@ -137,6 +137,7 @@ type looseSpec struct {
 	hooksFormat    manifest.Format                            // hook dialect, default FormatClaude
 	hooksTrustNote bool                                       // Codex: hooks need a /hooks review
 	hooksBlocked   string                                     // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
+	hookModulesDir string                                     // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
 	mcpConfig      *mcpConfigSpec                             // config-document MCP surface (Codex, Gemini)
 	variables      map[string]string                          // host-specific braced variables (Gemini extensionPath)
 }
@@ -351,6 +352,10 @@ func planLoose(ctx context.Context, base *Base, spec looseSpec, d Delivery) (*lo
 	}
 
 	if err := planner.hooks(); err != nil {
+		return nil, err
+	}
+
+	if err := planner.hookModules(); err != nil {
 		return nil, err
 	}
 
@@ -898,6 +903,63 @@ func (p *loosePlanner) planHooks(file string, existing []byte, rewritten []manif
 		name:  "hooks",
 		owned: ownedDigest,
 	})
+
+	return nil
+}
+
+// hookModules plans the host-native hook modules of the payload: files below
+// <payload>/runtime/<host>/hooks/{pre,post} are copied verbatim into the host's
+// hook directory, because such a host discovers code modules, not a declarative
+// hook document (omp 18.4.1: a factory directly in hooks/ is silently ignored,
+// so only a pre|post directory is delivered). A module is code the host runs on
+// every session without a sandbox or a trust gate, so it is written only for a
+// delivery that carries hook consent, and the plan says so out loud.
+func (p *loosePlanner) hookModules() error {
+	if p.spec.hookModulesDir == "" {
+		return nil
+	}
+
+	modules, err := scanHookModules(p.pkg.Root, string(p.spec.host))
+	if err != nil {
+		return p.deliveryError(stepPlan, err)
+	}
+
+	if len(modules) == 0 {
+		return nil
+	}
+
+	if !p.d.AllowHooks {
+		p.note("%d host hook module(s) skipped: consent is pending (allow-hooks is false)", len(modules))
+
+		return nil
+	}
+
+	written := 0
+
+	for _, module := range modules {
+		target := filepath.Join(p.spec.hookModulesDir, module.phase, module.name+module.ext)
+
+		keep, err := p.checkOwnership(target, false)
+		if err != nil || !keep {
+			return err
+		}
+
+		data, err := os.ReadFile(module.path) //nolint:gosec // G304: a module below the payload root
+		if err != nil {
+			return p.deliveryError(stepPlan, err)
+		}
+
+		_, existed := p.ownerOf(target)
+
+		if err := p.writeRendered("hook-module", module.name, target, data, existed); err != nil {
+			return err
+		}
+
+		written++
+	}
+
+	p.note("%d hook module(s) are code the host runs unsandboxed on every session, with no trust gate of its own; %s loads them from the next session",
+		written, p.spec.host)
 
 	return nil
 }
@@ -1916,4 +1978,97 @@ func validElement(value string) bool {
 	}
 
 	return true
+}
+
+// Hook module payload layout and phases (omp 18.4.1): a package ships host
+// module sources below runtime/<host>/hooks/{pre,post}/, and the host discovers
+// only those two directories — a module placed directly in hooks/ is ignored
+// silently, and .mjs/.cjs are not auto-discovered at all.
+const (
+	hookModulePhasePre  = "pre"
+	hookModulePhasePost = "post"
+	hookModuleRuntime   = "runtime"
+	// hookModuleExts are the module extensions the host auto-discovers.
+	hookModuleExts = ".ts,.js"
+)
+
+// HasHookModules reports whether a payload carries host hook modules for any
+// host (<root>/runtime/<host>/hooks/{pre,post}/<name>.{ts,js}). The CLI asks it
+// before the hooks consent question: such a module is code the host runs on
+// every session, exactly like a declarative hook, and a payload that carries
+// only modules declares no declarative hook for the question to key on.
+func HasHookModules(root string) bool {
+	entries, err := os.ReadDir(filepath.Join(root, hookModuleRuntime))
+	if err != nil {
+		return false
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		modules, err := scanHookModules(root, entry.Name())
+		if err == nil && len(modules) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hookModule is one file of a package's host module payload.
+type hookModule struct {
+	phase string // pre|post
+	name  string // file stem (the host's module identity)
+	ext   string // .ts|.js
+	path  string // source file below the payload root
+}
+
+// scanHookModules lists the host module files a payload carries for one host:
+// <root>/runtime/<host>/hooks/{pre,post}/<name>.{ts,js}, sorted by phase and
+// name. Another host's modules are not this host's business, and a module
+// extension the host never auto-discovers (.mjs, .cjs, anything else) is
+// reported rather than delivered silently dead.
+func scanHookModules(root, hostID string) ([]hookModule, error) {
+	base := filepath.Join(root, hookModuleRuntime, hostID, "hooks")
+
+	var modules []hookModule
+
+	for _, phase := range []string{hookModulePhasePre, hookModulePhasePost} {
+		dir := filepath.Join(base, phase)
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+
+			return nil, err
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() || entry.Type()&fs.ModeSymlink != 0 {
+				return nil, &NotSupportedError{
+					Host:      ID(hostID),
+					Operation: "a symlinked hook module in " + filepath.ToSlash(filepath.Join(hookModuleRuntime, hostID, "hooks", phase, entry.Name())),
+				}
+			}
+
+			ext := filepath.Ext(entry.Name())
+			if !slices.Contains(strings.Split(hookModuleExts, ","), ext) {
+				return nil, &NotSupportedError{
+					Host:      ID(hostID),
+					Operation: "a hook module " + entry.Name() + " (the host auto-discovers .ts and .js only)",
+				}
+			}
+
+			modules = append(modules, hookModule{
+				phase: phase, name: strings.TrimSuffix(entry.Name(), ext), ext: ext,
+				path: filepath.Join(dir, entry.Name()),
+			})
+		}
+	}
+
+	return modules, nil
 }

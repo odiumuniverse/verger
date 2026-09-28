@@ -453,7 +453,10 @@ func (a *app) ask(message string, defaultYes bool) (bool, error) {
 // question; -y accepts the default; a detached stdin without -y refuses with
 // ErrConfirmationRequired before anything is written.
 func (a *app) hooksDecision(client *verger.Client, pkg host.Package, mode spec.HooksMode) (bool, error) {
-	if len(pkg.Hooks) == 0 {
+	// A payload can carry hooks without a declarative hook: a host module in
+	// runtime/<host>/hooks/{pre,post}/ is code the host runs on every session,
+	// so it asks the same question (pkg/host.HasHookModules).
+	if len(pkg.Hooks) == 0 && !host.HasHookModules(pkg.Root) {
 		return false, nil
 	}
 
