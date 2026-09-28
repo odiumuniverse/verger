@@ -86,6 +86,14 @@ func policyFiles(host ID, home string) []string {
 		// marketplace allow/deny list, and there is no `EditYAML` to write it
 		// anyway — a policy verger cannot read is not a policy it may claim.
 		return nil
+	case OpenCode, Kilo:
+		// Conscious nil: neither host ships a managed policy document
+		// (OpenCode's config carries plugins, MCP servers and permissions, and
+		// the binary knows none of the Claude managed keys — live-checked on
+		// 2.0.18). The shared dispatch still routes both hosts through
+		// checkPolicy, so the gate is in place the day such a document exists;
+		// today nothing is read and nothing is claimed.
+		return nil
 	default:
 		return nil
 	}

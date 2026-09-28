@@ -842,7 +842,7 @@ func (r *renderer) hooksDocument() error {
 	events := map[string]any{}
 
 	for _, format := range []manifest.Format{manifest.FormatClaude, manifest.FormatGemini} {
-		plan, err := render.PlanHooks(format, nil, r.in.Hooks)
+		plan, err := render.PlanHooks(format, nil, r.in.Hooks, nil)
 		if err != nil {
 			return &RenderError{Component: hookDocument, Cause: err}
 		}

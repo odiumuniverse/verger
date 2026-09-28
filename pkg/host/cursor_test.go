@@ -1,14 +1,17 @@
 package host_test
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
 
+	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/hostcli"
@@ -18,6 +21,10 @@ import (
 )
 
 const cursorFixtureRoot = "testdata/cursor/acme"
+
+// commentStrip matches the // line comments the host's own loader removes
+// before it parses a hooks document.
+var commentStrip = regexp.MustCompile(`//[^\n]*`)
 
 // fakeCursor puts an executable `cursor-agent` shim at the front of PATH.
 func fakeCursor(t *testing.T) {
@@ -126,11 +133,12 @@ func TestCursorLooseGolden(t *testing.T) {
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true})
 
 		Convey("When it is delivered loose", func() {
-			Convey("Then skills, the rule wrapper, the agent and the MCP document land; nothing else", func() {
+			Convey("Then skills, the rule wrapper, the agent, the MCP and the hooks documents land; nothing else", func() {
 				So(err, ShouldBeNil)
 				So(homeFiles(t, home), ShouldResemble, []string{
 					".cursor/agents/reviewer.md",
 					".cursor/commands/dev.md",
+					".cursor/hooks.json",
 					".cursor/mcp.json",
 					".cursor/skills/alpha/SKILL.md",
 					".cursor/skills/alpha/scripts/run.sh",
@@ -140,12 +148,13 @@ func TestCursorLooseGolden(t *testing.T) {
 				So(runner.Calls(), ShouldBeEmpty)
 			})
 
-			Convey("Then commands are delivered and the surfaces without a document say so", func() {
+			Convey("Then commands are delivered and the rule wrapper still says so", func() {
 				So(readTestFile(t, filepath.Join(cursorHome(home), "commands", "dev.md")), ShouldContainSubstring, "Run the dev loop.")
 
 				notes := strings.Join(res.Notes, "\n")
-				So(notes, ShouldContainSubstring, "1 hook(s) skipped")
-				So(notes, ShouldContainSubstring, "camelCase events in hooks.json")
+				// Hooks are delivered now, so the old "hook(s) skipped" note
+				// is gone; the rule wrapper note stays.
+				So(notes, ShouldNotContainSubstring, "hook(s) skipped")
 				So(notes, ShouldContainSubstring, "rule is delivered as a skill wrapper")
 			})
 
@@ -428,4 +437,310 @@ func TestCursorMCPProseSkipped(t *testing.T) {
 			})
 		})
 	})
+}
+
+// --- W4-CURSOR-HOOKS: the hooks document, its ownership and its gates ---
+
+// cursorHooksDoc reads the delivered ~/.cursor/hooks.json of one test home.
+func cursorHooksDoc(t *testing.T, home string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(cursorHome(home), "hooks.json")) //nolint:gosec // G304: the path is inside the test's own temp home
+	if err != nil {
+		t.Fatalf("read hooks.json: %v", err)
+	}
+
+	return string(data)
+}
+
+// seedCursorHooksDoc writes an existing hooks document before a delivery.
+func seedCursorHooksDoc(t *testing.T, home, body string) {
+	t.Helper()
+
+	if err := os.MkdirAll(cursorHome(home), 0o700); err != nil {
+		t.Fatalf("mkdir .cursor: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(cursorHome(home), "hooks.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("seed hooks.json: %v", err)
+	}
+}
+
+func TestCursorHooksRenderTheHostDialect(t *testing.T) {
+	Convey("Given a cursor package carrying a hook", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := cursorPackage(t)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true})
+		So(err, ShouldBeNil)
+
+		Convey("When the document is read back", func() {
+			body := cursorHooksDoc(t, home)
+
+			Convey("Then it is Cursor's own flat camelCase dialect, not a Claude group", func() {
+				So(body, ShouldContainSubstring, `"preToolUse"`)
+				So(body, ShouldNotContainSubstring, "PreToolUse")
+				So(cursorHasRecord(t, body, "preToolUse", "guard.js"), ShouldBeTrue)
+				So(body, ShouldNotContainSubstring, `"type": "command"`)
+				So(body, ShouldNotContainSubstring, `"hooks": [`)
+			})
+
+			Convey("Then the record carries the command and a numeric timeout", func() {
+				So(body, ShouldContainSubstring, `"command"`)
+				So(body, ShouldContainSubstring, `"timeout"`)
+				So(body, ShouldContainSubstring, "guard.js")
+			})
+
+			Convey("Then no key verger invented is present", func() {
+				// Ownership is a receipt, never a marker inside the document.
+				So(body, ShouldNotContainSubstring, "_verger")
+			})
+		})
+	})
+}
+
+func TestCursorHooksPreserveForeignRecords(t *testing.T) {
+	Convey("Given a hooks document the user wrote by hand", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := cursorPackage(t)
+
+		seedCursorHooksDoc(t, home, `{
+  // my own hook, do not touch
+  "hooks": {
+    "preToolUse": [
+      {"command": "echo mine", "matcher": "Read"}
+    ]
+  }
+}
+`)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true})
+		So(err, ShouldBeNil)
+
+		Convey("When the package is delivered", func() {
+			body := cursorHooksDoc(t, home)
+
+			Convey("Then the foreign record survives verbatim", func() {
+				So(body, ShouldContainSubstring, "echo mine")
+				// The merged object is re-serialised, so assert structurally
+				// rather than on the spacing json.MarshalIndent happened to pick.
+				So(cursorHasRecord(t, body, "preToolUse", "echo mine"), ShouldBeTrue)
+			})
+
+			Convey("Then the comment the user wrote survives", func() {
+				So(body, ShouldContainSubstring, "my own hook, do not touch")
+			})
+
+			Convey("Then verger's own record is added alongside it", func() {
+				So(body, ShouldContainSubstring, "guard.js")
+			})
+		})
+	})
+}
+
+func TestCursorHooksNeedConsent(t *testing.T) {
+	Convey("Given a delivery whose consent is pending", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := cursorPackage(t)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
+
+		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: false})
+		So(err, ShouldBeNil)
+
+		Convey("Then nothing is written to the hooks document", func() {
+			_, statErr := os.Stat(filepath.Join(cursorHome(home), "hooks.json"))
+			So(os.IsNotExist(statErr), ShouldBeTrue)
+			So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "consent is pending")
+		})
+	})
+}
+
+func TestCursorHooksDryRunWritesNothing(t *testing.T) {
+	Convey("Given a dry run", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := cursorPackage(t)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true, DryRun: true})
+		So(err, ShouldBeNil)
+
+		Convey("Then no hooks document is created", func() {
+			_, statErr := os.Stat(filepath.Join(cursorHome(home), "hooks.json"))
+			So(os.IsNotExist(statErr), ShouldBeTrue)
+		})
+	})
+}
+
+// cursorHasRecord reports whether the hooks document carries a record for an
+// event whose `command` contains the needle. The document is JSONC, so the
+// comment is stripped the way the host's own loader strips it.
+func cursorHasRecord(t *testing.T, body, event, needle string) bool {
+	t.Helper()
+
+	clean := commentStrip.ReplaceAllString(body, "")
+
+	var doc struct {
+		Hooks map[string][]map[string]any `json:"hooks"`
+	}
+
+	if err := json.Unmarshal([]byte(clean), &doc); err != nil {
+		t.Fatalf("parse hooks document: %v", err)
+	}
+
+	for _, record := range doc.Hooks[event] {
+		if command, ok := record["command"].(string); ok && strings.Contains(command, needle) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestCursorHooksHandEditedRecordIsHandsOff drives the delivery through
+// pkg/apply, because the ownership it checks is the receipt's per-record
+// digest and a receipt is only written by a committed run.
+func TestCursorHooksHandEditedRecordIsHandsOff(t *testing.T) {
+	Convey("Given a hooks record verger wrote", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := cursorPackage(t)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
+		deps := applyWorld(t, st, ownerMap{})
+		deps.Hosts[host.Cursor] = h
+
+		install := func() apply.CellResult {
+			report, err := apply.Run(t.Context(), deps, apply.Plan{Actions: []apply.Action{{
+				Kind: apply.ActionInstall, Host: host.Cursor,
+				Delivery: host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true},
+			}}}, apply.Options{})
+			So(err, ShouldBeNil)
+
+			return report.Cells[0]
+		}
+
+		Convey("When it is installed", func() {
+			So(install().Status, ShouldEqual, apply.StatusCurrent)
+			So(cursorHooksDoc(t, home), ShouldContainSubstring, "guard.js")
+
+			Convey("Then the receipt holds a digest for that record", func() {
+				recorded := cursorHookRecordDigests(t, deps.Home.ReceiptsDir())
+				So(len(recorded), ShouldBeGreaterThan, 0)
+			})
+
+			Convey("When a user adds their OWN record to the same document", func() {
+				// The whole-document digest changes, so the coarse check above
+				// would refuse everything. Per-record ownership is what keeps
+				// our record updatable while the user's stays.
+				doc := cursorHooksDoc(t, home)
+				withForeign := strings.Replace(doc,
+					`"preToolUse":[`,
+					`"postToolUse":[{"command":"echo theirs","failClosed":true}],"preToolUse":[`, 1)
+				So(withForeign, ShouldNotEqual, doc)
+				So(os.WriteFile(filepath.Join(cursorHome(home), "hooks.json"), []byte(withForeign), 0o600), ShouldBeNil)
+
+				cell := install()
+
+				Convey("Then nothing is lost: the foreign record is still there", func() {
+					body := cursorHooksDoc(t, home)
+					So(body, ShouldContainSubstring, "echo theirs")
+					So(body, ShouldContainSubstring, "failClosed")
+					// The cell is hands-off, not failed: the document's whole
+					// `hooks` digest moved, and pkg/apply checks a config-key
+					// op before the per-record guard. Safe, but stricter than
+					// per-record ownership intends — see the report.
+					So(cell.Status, ShouldEqual, apply.StatusHandsOff)
+				})
+			})
+
+			Convey("When the user edits the record's timeout and it is delivered again", func() {
+				doc := cursorHooksDoc(t, home)
+				edited := strings.Replace(doc, `"timeout":5`, `"timeout":99`, 1)
+				So(edited, ShouldNotEqual, doc)
+				So(os.WriteFile(filepath.Join(cursorHome(home), "hooks.json"), []byte(edited), 0o600), ShouldBeNil)
+
+				cell := install()
+
+				Convey("Then the record keeps the user's bytes", func() {
+					So(cursorHooksDoc(t, home), ShouldContainSubstring, `"timeout":99`)
+				})
+
+				Convey("Then the delivery is hands-off and writes nothing", func() {
+					notes := strings.Join(cell.Notes, "\n")
+					So(notes, ShouldContainSubstring, "hands-off")
+					So(notes, ShouldContainSubstring, "nothing was written")
+				})
+			})
+		})
+	})
+}
+
+// cursorHookRecordDigests reads the per-record digests a receipt recorded for
+// the cursor hooks document.
+func cursorHookRecordDigests(t *testing.T, receiptsDir string) map[string]digest.Hash {
+	t.Helper()
+
+	out := map[string]digest.Hash{}
+
+	// The receipt store nests by package id and then by host+scope.
+	var walk func(string, int)
+
+	walk = func(dir string, depth int) {
+		if depth > 4 {
+			return
+		}
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				walk(path, depth+1)
+
+				continue
+			}
+
+			data, err := os.ReadFile(path) //nolint:gosec // G304: inside the test's own temp home
+			if err == nil {
+				cursorCollectRecordDigests(data, out)
+			}
+		}
+	}
+
+	walk(receiptsDir, 0)
+
+	return out
+}
+
+func cursorCollectRecordDigests(data []byte, out map[string]digest.Hash) {
+	var rec struct {
+		Artifacts []struct {
+			Kind   string `json:"kind"`
+			Path   string `json:"path"`
+			Digest string `json:"digest"`
+		} `json:"artifacts"`
+	}
+
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return
+	}
+
+	for _, artifact := range rec.Artifacts {
+		if artifact.Kind == "hook-record" {
+			out[artifact.Path] = digest.Hash(artifact.Digest)
+		}
+	}
 }

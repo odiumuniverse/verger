@@ -26,14 +26,30 @@ const (
 	// cursorMCPListArgs is the host's own MCP listing: the CLI prints one
 	// `<identifier>: <status>` line per configured server and has no JSON mode.
 	cursorMCPListArgs = "list"
-	// cursorHooksBlocked is the delivery note of the hook component: cursor
-	// hooks are flat camelCase records (afterFileEdit, afterMCPExecution) in
-	// hooks.json, a dialect the renderers do not carry yet. Writing the
-	// claude-shaped document there would be invented, not delivered.
-	cursorHooksBlocked = "cursor hooks are flat records with camelCase events in hooks.json, a dialect verger does not render yet"
+	// cursorHooksDoc is the host's own hook document. The loader (live
+	// cursor-agent bundle 2026.06.15-18-00-12-6f5a2cf, chunk 2097.index.js)
+	// reads `~/.cursor/hooks.json` at user scope, `<project>/.cursor/hooks.json`
+	// at project scope, `<root>/team-hooks/hooks.json` for a team, and an
+	// enterprise document at /Library/Application Support/Cursor/hooks.json on
+	// macOS and /etc/cursor/hooks.json on Linux. It also reads the Claude
+	// settings files as hook sources; those are separate documents and nothing
+	// here merges them.
+	cursorHooksDoc = "hooks.json"
 	// cursorApprovalNote is the gate the host keeps for a written MCP server.
 	cursorApprovalNote = "cursor loads an MCP server only after `cursor-agent mcp enable <name>` (or an approval prompt); a written server shows as \"needs approval\" until then"
 )
+
+// cursorHookRecordKind names a record artifact in a cursor hooks receipt.
+const cursorHookRecordKind = "hook-record"
+
+// cursorHookRecordPath is the receipt identity of one record in
+// ~/.cursor/hooks.json, so each record verger writes keeps its own digest and a
+// hand edit inside it is reported hands-off instead of overwritten. It is a
+// receipt path, not a file: nothing of the sort is written into the host's
+// document, which carries only what Cursor's own loader reads.
+func cursorHookRecordPath(event, command string) string {
+	return "cursor://hooks/" + event + "/" + command
+}
 
 // cursor is the Cursor agent adapter. It is loose-only on purpose: cursor-agent
 // is a real CLI (the Ф1 design assumed a GUI-only host), but it exposes no
@@ -106,14 +122,22 @@ func cursorSpec(userHome string) looseSpec {
 	dir := cursorConfigDir(userHome)
 
 	return looseSpec{
-		host:         Cursor,
-		binary:       wordCursorAgent,
-		home:         userHome,
-		skillsDir:    filepath.Join(dir, cursorSkillsDir),
-		agentsDir:    filepath.Join(dir, cursorAgentsDir),
-		commandsDir:  filepath.Join(dir, cursorCommandsDir),
-		settingsPath: filepath.Join(dir, "hooks.json"),
-		hooksBlocked: cursorHooksBlocked,
+		host:        Cursor,
+		binary:      wordCursorAgent,
+		home:        userHome,
+		skillsDir:   filepath.Join(dir, cursorSkillsDir),
+		agentsDir:   filepath.Join(dir, cursorAgentsDir),
+		commandsDir: filepath.Join(dir, cursorCommandsDir),
+		// Cursor reads its hooks from ~/.cursor/hooks.json: a `hooks` object
+		// of flat camelCase-event arrays whose records carry `command`, an
+		// optional numeric `timeout` and an optional `matcher` — no `type`
+		// and no nested handler group. Read from the live cursor-agent bundle
+		// 2026.06.15-18-00-12-6f5a2cf (chunk 2097.index.js); the old
+		// refusal said the dialect was "not rendered yet", which is no longer
+		// true. Consent is still the shared --hooks gate.
+		hooksPath:      filepath.Join(dir, cursorHooksDoc),
+		hooksFormat:    manifest.FormatCursor,
+		hookRecordPath: cursorHookRecordPath,
 		mcpConfig: &mcpConfigSpec{
 			path:   filepath.Join(dir, cursorMCPDoc),
 			format: manifest.FormatClaude,

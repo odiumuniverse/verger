@@ -34,6 +34,10 @@ const (
 	markdownExt = ".md"
 	tomlExt     = ".toml"
 	artifactMCP = "mcp" // receipt artifact kind of an MCP server
+	// artifactPatchDocument is the receipt artifact kind of a config document
+	// whose records the adapter owns by id (the DSH home patch layer); it
+	// matches pkg/apply's kindPatchDocument.
+	artifactPatchDocument = "patch-document"
 )
 
 // Plugin variable names of the host dialects.
@@ -136,10 +140,14 @@ type looseSpec struct {
 	hooksPath      string                                     // hooks document, default settingsPath
 	hooksFormat    manifest.Format                            // hook dialect, default FormatClaude
 	hooksTrustNote bool                                       // Codex: hooks need a /hooks review
-	hooksBlocked   string                                     // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
-	hookModulesDir string                                     // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
-	mcpConfig      *mcpConfigSpec                             // config-document MCP surface (Codex, Gemini)
-	variables      map[string]string                          // host-specific braced variables (Gemini extensionPath)
+	// hookRecordPath names the receipt identity of one hook record, so a
+	// record verger wrote keeps its own digest and a hand edit inside it is
+	// hands-off instead of an overwrite. nil leaves whole-document ownership.
+	hookRecordPath func(event, command string) string
+	hooksBlocked   string            // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
+	hookModulesDir string            // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
+	mcpConfig      *mcpConfigSpec    // config-document MCP surface (Codex, Gemini)
+	variables      map[string]string // host-specific braced variables (Gemini extensionPath)
 }
 
 // mcpConfigSpec describes an MCP surface written into a shared config document
@@ -149,6 +157,52 @@ type mcpConfigSpec struct {
 	format manifest.Format
 	toml   bool // TOML (Codex config.toml) vs JSONC (Gemini settings.json)
 	edit   func([]byte, []render.Edit, render.Owned) ([]byte, []render.Change, error)
+	// prefix overrides the container key of the dialect; empty keeps the
+	// format's own. OpenCode carries the same values under `mcp.servers.`
+	// (v2) and `mcp.` (v1), and the adapter picks the container the config
+	// already declares.
+	prefix string
+	// entries replaces render.MCPEdits when the host's entry shape differs
+	// from the dialect format names (pi writes `transport` and no `type`;
+	// Antigravity writes `serverUrl`; a patch layer writes whole records).
+	entries func([]manifest.MCPServer) ([]render.Edit, error)
+	// member reads one record of a document the JSONC/TOML decoder cannot
+	// read — a YAML patch layer. Nil reads a key path of the document.
+	member func([]byte, string) (any, bool, error)
+	// wholeFile marks a document the key-path receipt machinery cannot undo:
+	// the adapter edits it as a node tree and a dotted key path means nothing
+	// in it, so pkg/apply rolls the document back as one file. The receipt
+	// then owns the document — a removal restores the trashed bytes, foreign
+	// entries and comments included — instead of one op per record.
+	wholeFile bool
+	// recordPath is the receipt identity of one record of a whole-file
+	// document. The adapter asks the previous receipt for the digest this path
+	// carries and hands it to the editor as render.Owned, so a record the user
+	// edited by hand is hands-off instead of being overwritten. Nil keeps a
+	// document without per-record ownership.
+	recordPath func(name string) string
+	// recordArtifacts returns one receipt artifact per owned record of a
+	// whole-file document, carrying that record's own value digest.
+	recordArtifacts func([]render.Edit) []receipt.Artifact
+}
+
+// readMember reads one record of the surface document by its key path.
+func (s *mcpConfigSpec) readMember(file []byte, keyPath string) (any, bool, error) {
+	if s.member != nil {
+		return s.member(file, keyPath)
+	}
+
+	return configMember(file, keyPath, s.toml)
+}
+
+// configEditsUnder returns one key-path edit per server for the surface, under
+// the container prefix the surface declares.
+func (s *mcpConfigSpec) configEditsUnder(servers []manifest.MCPServer) ([]render.Edit, error) {
+	if s.entries != nil {
+		return s.entries(servers)
+	}
+
+	return render.MCPEditsUnder(s.format, mcpContainerPrefix(s), servers)
 }
 
 // agentExtension returns the agent file extension of the surface.
@@ -599,6 +653,14 @@ func (p *loosePlanner) skill(component manifest.Component) error {
 
 // agent plans one host-side agent file.
 func (p *loosePlanner) agent(component manifest.Component) error {
+	// A host with no subagent surface (pi, DSH) skips the component: joining
+	// an empty dir would plan a path relative to the process, not to the home.
+	if p.spec.agentsDir == "" {
+		p.note("%s component %q is not expressible in loose %s; skipped", component.Kind, component.Name, p.spec.host)
+
+		return nil
+	}
+
 	target := filepath.Join(p.spec.agentsDir, component.Name+p.spec.agentExtension())
 
 	keep, err := p.checkOwnership(target, false)
@@ -893,7 +955,7 @@ func (p *loosePlanner) planHooks(file string, existing []byte, rewritten []manif
 		return p.deliveryError(stepPlan, err)
 	}
 
-	plan, err := render.PlanHooks(p.spec.hooksDialect(), planning, rewritten)
+	plan, err := render.PlanHooks(p.spec.hooksDialect(), planning, rewritten, p.hookRecordOwnership())
 	if err != nil {
 		return p.deliveryError(stepPlan, err)
 	}
@@ -928,7 +990,43 @@ func (p *loosePlanner) planHooks(file string, existing []byte, rewritten []manif
 		owned: ownedDigest,
 	})
 
+	p.recordHookRecords(plan, file)
+
 	return nil
+}
+
+// recordHookRecords claims one receipt artifact per record the plan wrote, so a
+// later delivery can tell a hand edit from its own bytes. The op is
+// receipt.OpRecord: it has no inverse of its own — the document's own write is
+// what a removal reverses — and it keeps "every artifact is claimed by an op on
+// its path" true, which pkg/receipt validates.
+func (p *loosePlanner) recordHookRecords(plan render.HookPlan, hooksFile string) {
+	if p.spec.hookRecordPath == nil {
+		return
+	}
+
+	for _, event := range plan.Events {
+		for _, record := range event.Records {
+			p.plan.record(
+				receipt.Artifact{
+					Kind:   cursorHookRecordKind,
+					Name:   record.Name,
+					Path:   p.spec.hookRecordPath(event.Name, record.Name),
+					Digest: record.Digest,
+				},
+				receipt.Op{
+					Kind: receipt.OpRecord,
+					Path: p.spec.hookRecordPath(event.Name, record.Name),
+					// Note names the DOCUMENT, not the record: it is what
+					// tells pkg/apply the document's own records are checked
+					// one by one here, so the file-level byte check is skipped
+					// for it and a user adding their own record is not a drift
+					// on ours.
+					Note: hooksFile,
+				},
+			)
+		}
+	}
 }
 
 // hookModules plans the host-native hook modules of the payload: files below
@@ -1005,6 +1103,15 @@ type pendingConfig struct {
 	file    string
 	tomlDoc bool
 	edit    func([]byte, []render.Edit, render.Owned) ([]byte, []render.Change, error)
+	// member reads one record of a document the JSONC/TOML decoder cannot
+	// read; nil reads a key path of the document.
+	member func([]byte, string) (any, bool, error)
+	// wholeFile records the document as one file op rather than one
+	// config-key op per record (see mcpConfigSpec.wholeFile).
+	wholeFile bool
+	// records returns one receipt artifact per owned record of a whole-file
+	// document (see mcpConfigSpec.recordArtifacts).
+	records func([]render.Edit) []receipt.Artifact
 	edits   []pendingEdit
 	// recorded are keys this document owns without writing them: their value
 	// already matches, and they must still be recorded or the next receipt
@@ -1012,6 +1119,28 @@ type pendingConfig struct {
 	recorded []pendingEdit
 	owned    render.Owned
 	secret   bool
+}
+
+// readMember reads one record of this document by its key path.
+func (cfg *pendingConfig) readMember(file []byte, keyPath string) (any, bool, error) {
+	if cfg.member != nil {
+		return cfg.member(file, keyPath)
+	}
+
+	return configMember(file, keyPath, cfg.tomlDoc)
+}
+
+// setMember installs the record reader of a document the JSONC/TOML decoder
+// cannot read (the DSH home patch layer).
+func (cfg *pendingConfig) setMember(member func([]byte, string) (any, bool, error)) {
+	cfg.member = member
+}
+
+// setWholeFile marks the document as one file op rather than one config-key op
+// per record and installs the per-record receipt identities of the surface.
+func (cfg *pendingConfig) setWholeFile(whole bool, records func([]render.Edit) []receipt.Artifact) {
+	cfg.wholeFile = whole
+	cfg.records = records
 }
 
 // pendingEdit is one key edit plus the artifact identity it records.
@@ -1084,22 +1213,16 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 	// Nothing is written for a document whose keys this delivery only records,
 	// so a read-only file is not an obstacle to owning them.
 	if len(cfg.edits) == 0 {
-		p.recordUnchanged(cfg.file, cfg.tomlDoc, cfg.recorded, existing)
+		p.recordUnchangedOrWholeFile(cfg, cfg.recorded, existing)
 
 		return nil
 	}
 
-	if info, statErr := os.Stat(cfg.file); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o200 == 0 {
+	if isReadOnlyConfig(cfg.file) {
 		return p.deliveryError(stepPlan, fmt.Errorf("%s is read-only", cfg.file))
 	}
 
-	edits := make([]render.Edit, 0, len(cfg.edits))
-
-	for _, pe := range cfg.edits {
-		edits = append(edits, pe.edit)
-	}
-
-	out, changes, err := cfg.edit(existing, edits, cfg.owned)
+	out, changes, err := cfg.edit(existing, cfg.keyEdits(), cfg.owned)
 	if err != nil {
 		return err
 	}
@@ -1107,16 +1230,13 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 	if len(changes) == 0 {
 		owned := append(slices.Clone(cfg.edits), cfg.recorded...)
 
-		p.recordUnchanged(cfg.file, cfg.tomlDoc, owned, existing)
+		p.recordUnchangedOrWholeFile(cfg, owned, existing)
 
 		return nil
 	}
 
-	mode := configMode(cfg.file)
-	if cfg.secret {
-		mode = 0o600
-
-		p.note("%s carries a resolved secret; mode is 0600", cfg.file)
+	if cfg.wholeFile {
+		return p.addWholeFile(cfg, existing, out, p.configWriteMode(cfg))
 	}
 
 	ops := make([]receipt.Op, 0, len(changes))
@@ -1135,11 +1255,45 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 	ops = p.appendUnchanged(cfg, existing, changes, ops)
 
 	p.plan.addConfig(
-		looseStep{kind: stepConfig, path: cfg.file, data: out, mode: mode, digest: changes[0].Digest},
+		looseStep{kind: stepConfig, path: cfg.file, data: out, mode: p.configWriteMode(cfg), digest: changes[0].Digest},
 		documentArtifact(cfg.file, cfg.editFor(changes[0].Path), changes[0].Digest), ops, replaced,
 	)
 
 	return nil
+}
+
+// keyEdits returns the plain key edits of a document, in planning order.
+func (cfg *pendingConfig) keyEdits() []render.Edit {
+	edits := make([]render.Edit, 0, len(cfg.edits))
+
+	for _, pe := range cfg.edits {
+		edits = append(edits, pe.edit)
+	}
+
+	return edits
+}
+
+// configWriteMode is the mode the document is written with: its own, or 0600
+// when it carries a resolved secret — which the delivery says out loud.
+func (p *loosePlanner) configWriteMode(cfg *pendingConfig) fs.FileMode {
+	if !cfg.secret {
+		return configMode(cfg.file)
+	}
+
+	p.note("%s carries a resolved secret; mode is 0600", cfg.file)
+
+	return 0o600
+}
+
+// isReadOnlyConfig reports whether a config document cannot be written because
+// the user removed the write bit; a missing document is written, not refused.
+func isReadOnlyConfig(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.Mode().IsRegular() && info.Mode().Perm()&0o200 == 0
 }
 
 // appendUnchanged adds one pre-existing op per owned key the write did not have
@@ -1158,7 +1312,7 @@ func (p *loosePlanner) appendUnchanged(cfg *pendingConfig, existing []byte, chan
 			continue
 		}
 
-		current, exists, err := configMember(existing, pe.edit.Path, cfg.tomlDoc)
+		current, exists, err := cfg.readMember(existing, pe.edit.Path)
 		if err != nil || !exists {
 			continue
 		}
@@ -1172,11 +1326,109 @@ func (p *loosePlanner) appendUnchanged(cfg *pendingConfig, existing []byte, chan
 	return ops
 }
 
+// recordUnchangedOrWholeFile keeps a document owned when the delivery writes
+// nothing. A key-path document keeps one op per key; a whole-file document
+// records one file op with no backup, so a removal leaves the document in place
+// instead of deleting a file the user also owns. A document this package never
+// touched records nothing.
+func (p *loosePlanner) recordUnchangedOrWholeFile(cfg *pendingConfig, edits []pendingEdit, existing []byte) {
+	if !cfg.wholeFile {
+		p.recordUnchanged(cfg, edits, existing)
+
+		return
+	}
+
+	if len(edits) == 0 {
+		return
+	}
+
+	sum := digest.Bytes(existing)
+	first := pendingEdit{edit: render.Edit{Path: cfg.file}, kind: cfg.documentKind()}
+
+	p.plan.recordConfig(documentArtifact(cfg.file, first, sum), []receipt.Op{
+		{Kind: receipt.OpWriteFile, Path: cfg.file, Digest: sum, Existed: true},
+	})
+
+	p.appendRecordArtifacts(cfg, keyEditsOf(edits))
+}
+
+// addWholeFile records a whole-file document write as one file op, so pkg/apply
+// restores the trashed bytes verbatim: a document verger co-owns with the user
+// keeps every foreign entry and comment its next removal would otherwise drop.
+func (p *loosePlanner) addWholeFile(cfg *pendingConfig, existing, out []byte, mode fs.FileMode) error {
+	sum := digest.Bytes(out)
+	existed := existing != nil
+
+	step := looseStep{kind: stepConfig, path: cfg.file, data: out, mode: mode, existed: existed, digest: sum}
+	first := pendingEdit{edit: render.Edit{Path: cfg.file}, kind: cfg.documentKind()}
+
+	p.plan.addConfig(
+		step,
+		documentArtifact(cfg.file, first, sum),
+		[]receipt.Op{{Kind: receipt.OpWriteFile, Path: cfg.file, Digest: sum, Existed: existed}},
+		nil,
+	)
+	p.appendRecordArtifacts(cfg, cfg.keyEdits())
+
+	return nil
+}
+
+// keyEditsOf returns the plain key edits of a list of pending edits.
+func keyEditsOf(edits []pendingEdit) []render.Edit {
+	out := make([]render.Edit, 0, len(edits))
+
+	for _, pe := range edits {
+		out = append(out, pe.edit)
+	}
+
+	return out
+}
+
+// documentKind is the artifact kind of a whole-file document: the records of
+// such a document are owned by id, so only the adapter can verify them and
+// pkg/apply must not hold the artifact against a byte digest of a file the user
+// may also edit. Every other document is an MCP config document.
+func (cfg *pendingConfig) documentKind() string {
+	if cfg.wholeFile {
+		return artifactPatchDocument
+	}
+
+	return artifactMCP
+}
+
+// appendRecordArtifacts records one receipt artifact per owned record of a
+// whole-file document, each backed by a record op carrying that record's own
+// digest, so the next delivery can prove the record still holds the value verger
+// wrote and a hand edit is hands-off instead of a silent overwrite. The op has
+// no inverse of its own: the document's file op is what a removal reverses. A
+// surface without per-record ownership records none.
+func (p *loosePlanner) appendRecordArtifacts(cfg *pendingConfig, edits []render.Edit) {
+	if cfg.records == nil {
+		return
+	}
+
+	artifacts := cfg.records(edits)
+
+	ops := make([]receipt.Op, 0, len(artifacts))
+
+	for _, artifact := range artifacts {
+		// The op claims the artifact's own identity, so every artifact is
+		// backed by an op on its path; Note names the document the record
+		// lives in, which is what a removal restores.
+		ops = append(ops, receipt.Op{
+			Kind: receipt.OpRecord, Path: artifact.Path, Note: cfg.file, Digest: artifact.Digest,
+		})
+	}
+
+	p.plan.artifacts = append(p.plan.artifacts, artifacts...)
+	p.plan.ops = append(p.plan.ops, ops...)
+}
+
 // recordUnchanged keeps a document's keys as owned when the delivery writes
 // nothing: the values already match what the package wants, so the receipt must
 // still record them, or a later update reconciles the ownership away and an
 // inverse restores a value that predates the delivery.
-func (p *loosePlanner) recordUnchanged(file string, tomlDoc bool, edits []pendingEdit, existing []byte) {
+func (p *loosePlanner) recordUnchanged(cfg *pendingConfig, edits []pendingEdit, existing []byte) {
 	ops := make([]receipt.Op, 0, len(edits))
 
 	var (
@@ -1185,7 +1437,7 @@ func (p *loosePlanner) recordUnchanged(file string, tomlDoc bool, edits []pendin
 	)
 
 	for _, candidate := range edits {
-		current, exists, err := configMember(existing, candidate.edit.Path, tomlDoc)
+		current, exists, err := cfg.readMember(existing, candidate.edit.Path)
 		if err != nil || !exists {
 			continue
 		}
@@ -1196,7 +1448,7 @@ func (p *loosePlanner) recordUnchanged(file string, tomlDoc bool, edits []pendin
 		}
 
 		ops = append(ops, receipt.Op{
-			Kind: receipt.OpConfigKey, Path: file, KeyPath: candidate.edit.Path, Digest: sum, Existed: true,
+			Kind: receipt.OpConfigKey, Path: cfg.file, KeyPath: candidate.edit.Path, Digest: sum, Existed: true,
 		})
 	}
 
@@ -1204,7 +1456,7 @@ func (p *loosePlanner) recordUnchanged(file string, tomlDoc bool, edits []pendin
 		return
 	}
 
-	p.plan.recordConfig(documentArtifact(file, pe, first), ops)
+	p.plan.recordConfig(documentArtifact(cfg.file, pe, first), ops)
 }
 
 // documentArtifact is the one artifact a shared config document records: its
@@ -1444,7 +1696,7 @@ func (p *loosePlanner) planMCPConfig() error {
 		return nil
 	}
 
-	edits, err := render.MCPEdits(cfg.format, servers)
+	edits, err := cfg.configEditsUnder(servers)
 	if err != nil {
 		return p.deliveryError(stepPlan, err)
 	}
@@ -1454,12 +1706,12 @@ func (p *loosePlanner) planMCPConfig() error {
 		return p.deliveryError(stepPlan, err)
 	}
 
-	pending, err := mcpPendingEdits(existing, edits, cfg.toml)
+	pending, err := mcpPendingEdits(existing, edits, cfg)
 	if err != nil {
 		return p.deliveryError(stepPlan, err)
 	}
 
-	prefix := mcpConfigPrefix(cfg.format)
+	prefix := mcpContainerPrefix(cfg)
 
 	// Every server is this package's, whether or not this delivery has to write
 	// it: the ones already configured exactly as wanted are recorded without a
@@ -1471,9 +1723,18 @@ func (p *loosePlanner) planMCPConfig() error {
 	}
 
 	document := p.configFor(cfg.path, cfg.toml, cfg.edit)
+	document.setMember(cfg.member)
+	document.setWholeFile(cfg.wholeFile, cfg.recordArtifacts)
 
 	for _, edit := range edits {
 		pe := pendingEdit{edit: edit, kind: artifactMCP, name: strings.TrimPrefix(edit.Path, prefix)}
+
+		// A record the previous receipt recorded is verger's: the editor
+		// updates it, and a record whose value no longer matches that digest
+		// is hands-off rather than silently overwritten.
+		if cfg.recordPath != nil {
+			pe.owned = p.recordedDigest(cfg.recordPath(pe.name))
+		}
 
 		if pendingPaths[edit.Path] {
 			p.queueConfigEdit(cfg.path, cfg.toml, cfg.edit, pe)
@@ -1527,11 +1788,11 @@ func (p *loosePlanner) resolvedMCPServers() ([]manifest.MCPServer, bool, error) 
 // mcpPendingEdits drops the edits whose value already matches the document and
 // keeps the rest; a differing existing key stays unowned, so the editor
 // reports hands-off instead of overwriting it.
-func mcpPendingEdits(existing []byte, edits []render.Edit, tomlDoc bool) ([]render.Edit, error) {
+func mcpPendingEdits(existing []byte, edits []render.Edit, cfg *mcpConfigSpec) ([]render.Edit, error) {
 	pending := make([]render.Edit, 0, len(edits))
 
 	for _, edit := range edits {
-		current, exists, err := configMember(existing, edit.Path, tomlDoc)
+		current, exists, err := cfg.readMember(existing, edit.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -1546,16 +1807,11 @@ func mcpPendingEdits(existing []byte, edits []render.Edit, tomlDoc bool) ([]rend
 	return pending, nil
 }
 
-// mcpConfigPrefix returns the config key prefix of one MCP dialect.
-func mcpConfigPrefix(format manifest.Format) string {
-	switch format {
-	case manifest.FormatCodex:
-		return "mcp_servers."
-	case manifest.FormatClaude, manifest.FormatGemini:
-		return "mcpServers."
-	default:
-		return ""
-	}
+// mcpContainerPrefix returns the config key prefix of one MCP surface: the
+// adapter's override when it declares one (the OpenCode v1/v2 containers),
+// else the dialect's own.
+func mcpContainerPrefix(cfg *mcpConfigSpec) string {
+	return cmp.Or(cfg.prefix, render.MCPPrefix(cfg.format))
 }
 
 // serverHasSecretRef reports whether a server still carries a `{secret:NAME}`
@@ -1707,6 +1963,25 @@ func resolveSecrets(secrets *secret.Store, server manifest.MCPServer) (manifest.
 	}
 
 	return out, missing
+}
+
+// deliverSurface plans and executes one loose surface: the shared shell of
+// every loose-only adapter (plan, dry-run short circuit, execute, result).
+// The caller owns the surface — its directories, its MCP container and its
+// hook reason — and any lock that must cover the read and the write.
+func deliverSurface(ctx context.Context, base *Base, spec looseSpec, d Delivery) (Result, error) {
+	plan, err := planLoose(ctx, base, spec, d)
+	if err != nil {
+		return Result{}, err
+	}
+
+	if d.DryRun {
+		return plan.result(d.Strategy, true), nil
+	}
+
+	err = base.executeLoose(ctx, spec, d.Package, plan)
+
+	return plan.result(d.Strategy, false), err
 }
 
 // executeLoose runs a planned delivery; the plan is already collision-free.
@@ -2203,4 +2478,34 @@ func scanHookModules(root, hostID string) ([]hookModule, error) {
 	}
 
 	return modules, nil
+}
+
+// hookRecordOwnership collects the digest this package's previous receipt
+// recorded for each hook record verger owns, keyed the way the renderer keys
+// it. A record with a recorded digest is verger's; without one it is the user's
+// and is never rewritten. The whole-document digest the config edit carries
+// stays the coarse backstop for a host that declares no per-record identity.
+func (p *loosePlanner) hookRecordOwnership() render.Owned {
+	if p.spec.hookRecordPath == nil {
+		return nil
+	}
+
+	owned := render.Owned{}
+
+	for _, hook := range p.pkg.Hooks {
+		event, ok := render.HookEventName(p.spec.hooksDialect(), hook.Event)
+		if !ok {
+			continue
+		}
+
+		if sum := p.recordedDigest(p.spec.hookRecordPath(event, hook.Command)); sum != "" {
+			owned["hooks/"+event+"/"+hook.Command] = sum
+		}
+	}
+
+	if len(owned) == 0 {
+		return nil
+	}
+
+	return owned
 }

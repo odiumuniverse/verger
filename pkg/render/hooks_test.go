@@ -45,7 +45,7 @@ func TestPlanHooksClaude(t *testing.T) {
 		}
 
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatClaude, existing, hooks)
+			plan, err := render.PlanHooks(manifest.FormatClaude, existing, hooks, nil)
 
 			Convey("Then our entries are re-rendered, foreign ones kept", func() {
 				So(err, ShouldBeNil)
@@ -84,7 +84,7 @@ func TestPlanHooksClaude(t *testing.T) {
 			})
 
 			Convey("Then planning again is a no-op", func() {
-				second, secondErr := render.PlanHooks(manifest.FormatClaude, plan.File, hooks)
+				second, secondErr := render.PlanHooks(manifest.FormatClaude, plan.File, hooks, nil)
 
 				So(secondErr, ShouldBeNil)
 				So(second.File, ShouldBeNil)
@@ -99,7 +99,7 @@ func TestPlanHooksClaudeEdges(t *testing.T) {
 		hooks := []manifest.Hook{{Event: manifest.EventPreTool, Matcher: "Bash", Command: "run.sh"}}
 
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatClaude, nil, hooks)
+			plan, err := render.PlanHooks(manifest.FormatClaude, nil, hooks, nil)
 
 			Convey("Then the hooks object is created", func() {
 				So(err, ShouldBeNil)
@@ -119,7 +119,7 @@ func TestPlanHooksClaudeEdges(t *testing.T) {
 		}
 
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatClaude, nil, hooks)
+			plan, err := render.PlanHooks(manifest.FormatClaude, nil, hooks, nil)
 
 			Convey("Then the variable is preserved verbatim, never expanded or refused", func() {
 				So(err, ShouldBeNil)
@@ -145,7 +145,7 @@ func TestPlanHooksClaudeEdges(t *testing.T) {
 
 	Convey("Given an empty hooks list and no existing document", t, func() {
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatClaude, nil, nil)
+			plan, err := render.PlanHooks(manifest.FormatClaude, nil, nil, nil)
 
 			Convey("Then nothing is written", func() {
 				So(err, ShouldBeNil)
@@ -162,7 +162,7 @@ func TestPlanHooksClaudeEdges(t *testing.T) {
 		Convey("When the same hook is planned without the timeout", func() {
 			plan, err := render.PlanHooks(manifest.FormatClaude, existing, []manifest.Hook{
 				{Event: manifest.EventPreTool, Matcher: "Write", Command: "ours.sh"},
-			})
+			}, nil)
 
 			Convey("Then the entry is replaced in place, never duplicated", func() {
 				So(err, ShouldBeNil)
@@ -182,7 +182,7 @@ func TestPlanHooksClaudeEdges(t *testing.T) {
 		Convey("When the same hook is planned again", func() {
 			plan, err := render.PlanHooks(manifest.FormatClaude, existing, []manifest.Hook{
 				{Event: manifest.EventPreTool, Matcher: "Write", Command: "ours.sh"},
-			})
+			}, nil)
 
 			Convey("Then nothing is rewritten", func() {
 				So(err, ShouldBeNil)
@@ -203,7 +203,7 @@ func TestPlanHooksClaudeMixed(t *testing.T) {
 		Convey("When the hooks are planned", func() {
 			plan, err := render.PlanHooks(manifest.FormatClaude, existing, []manifest.Hook{
 				{Event: manifest.EventPreTool, Matcher: "Bash", Command: "ours.sh", Timeout: 5},
-			})
+			}, nil)
 
 			Convey("Then the foreign handler stays and the canon one is re-rendered", func() {
 				So(err, ShouldBeNil)
@@ -236,7 +236,7 @@ func TestPlanHooksClaudeMalformed(t *testing.T) {
 			plan, err := render.PlanHooks(manifest.FormatClaude, existing, []manifest.Hook{
 				{Event: manifest.EventPreTool, Matcher: "Bash", Command: "run.sh"},
 				{Event: manifest.EventSessionStart, Command: "start.sh"},
-			})
+			}, nil)
 
 			Convey("Then the malformed event is left untouched and the change is only the healthy event", func() {
 				So(err, ShouldBeNil)
@@ -268,7 +268,7 @@ func TestPlanHooksClaudeMalformed(t *testing.T) {
 		Convey("When only the malformed event is planned", func() {
 			plan, err := render.PlanHooks(manifest.FormatClaude, existing, []manifest.Hook{
 				{Event: manifest.EventPreTool, Command: "run.sh"},
-			})
+			}, nil)
 
 			Convey("Then nothing changes and the file stays absent", func() {
 				So(err, ShouldBeNil)
@@ -282,7 +282,7 @@ func TestPlanHooksClaudeMalformed(t *testing.T) {
 			plan, err := render.PlanHooks(manifest.FormatClaude, nil, []manifest.Hook{
 				{Event: manifest.EventSessionStart, Matcher: "Bash", Command: "start.sh"},
 				{Event: manifest.EventStop, Matcher: "Bash", Command: "stop.sh"},
-			})
+			}, nil)
 
 			Convey("Then the matchers are dropped with warnings", func() {
 				So(err, ShouldBeNil)
@@ -303,7 +303,7 @@ func TestPlanHooksClaudeMalformed(t *testing.T) {
 func TestPlanHooksClaudeErrors(t *testing.T) {
 	Convey("Given a broken JSON document", t, func() {
 		Convey("When the hooks are planned", func() {
-			_, err := render.PlanHooks(manifest.FormatClaude, []byte("{nope"), nil)
+			_, err := render.PlanHooks(manifest.FormatClaude, []byte("{nope"), nil, nil)
 
 			_, ok := errors.AsType[*render.ConfigParseError](err)
 
@@ -322,7 +322,7 @@ func TestPlanHooksGemini(t *testing.T) {
 		}
 
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatGemini, nil, hooks)
+			plan, err := render.PlanHooks(manifest.FormatGemini, nil, hooks, nil)
 
 			Convey("Then Gemini event names are used and Stop is skipped", func() {
 				So(err, ShouldBeNil)
@@ -356,7 +356,7 @@ func TestPlanHooksGemini(t *testing.T) {
 		Convey("When an unrelated hook is planned", func() {
 			plan, err := render.PlanHooks(manifest.FormatGemini, existing, []manifest.Hook{
 				{Event: manifest.EventSessionStart, Command: "start.sh"},
-			})
+			}, nil)
 
 			Convey("Then the bare shape is understood and the foreign entry kept", func() {
 				So(err, ShouldBeNil)
@@ -376,7 +376,7 @@ func TestPlanHooksCodex(t *testing.T) {
 		}
 
 		Convey("When the hooks are planned", func() {
-			plan, err := render.PlanHooks(manifest.FormatCodex, nil, hooks)
+			plan, err := render.PlanHooks(manifest.FormatCodex, nil, hooks, nil)
 
 			Convey("Then Codex event names are used and the wildcard matcher omitted", func() {
 				So(err, ShouldBeNil)
@@ -393,10 +393,55 @@ func TestPlanHooksCodex(t *testing.T) {
 func TestPlanHooksUnsupportedFormat(t *testing.T) {
 	Convey("Given the Agent Plugins format", t, func() {
 		Convey("When hooks are planned", func() {
-			_, err := render.PlanHooks(manifest.FormatAgentPlugins, nil, nil)
+			_, err := render.PlanHooks(manifest.FormatAgentPlugins, nil, nil, nil)
 
 			Convey("Then the format is rejected", func() {
 				So(err, ShouldBeError)
+			})
+		})
+	})
+}
+
+// TestCursorHookPerRecordOwnership exercises the per-record rule directly,
+// because the adapter path cannot: pkg/apply checks a config-key op before the
+// per-record guard, so a whole-document drift is caught first and this rule is
+// the second line of defence rather than the first.
+func TestCursorHookPerRecordOwnership(t *testing.T) {
+	Convey("Given a rendered cursor pre-tool hook", t, func() {
+		hook := manifest.Hook{Event: manifest.EventPreTool, Command: "node guard.js", Timeout: 5, Matcher: "Bash"}
+
+		plan, err := render.PlanHooks(manifest.FormatCursor, nil, []manifest.Hook{hook}, nil)
+		So(err, ShouldBeNil)
+		So(len(plan.Events), ShouldEqual, 1)
+		So(plan.Events[0].Name, ShouldEqual, "preToolUse")
+		So(plan.Events[0].Records[0].Name, ShouldEqual, "node guard.js")
+
+		owned := render.Owned{"hooks/preToolUse/" + hook.Command: plan.Events[0].Records[0].Digest}
+
+		Convey("When it is merged again over the document it wrote", func() {
+			Convey("Then identical bytes are recognised as ours and re-rendered", func() {
+				second, err := render.PlanHooks(manifest.FormatCursor, plan.File, []manifest.Hook{hook}, owned)
+				So(err, ShouldBeNil)
+				So(strings.Join(second.Warnings, "\n"), ShouldNotContainSubstring, "changed outside verger")
+			})
+
+			Convey("Then a hand edit inside it is reported and the record left in place", func() {
+				edited := []byte(strings.Replace(string(plan.File), `"timeout": 5`, `"timeout": 99`, 1))
+				So(string(edited), ShouldNotEqual, string(plan.File))
+
+				second, err := render.PlanHooks(manifest.FormatCursor, edited, []manifest.Hook{hook}, owned)
+				So(err, ShouldBeNil)
+				So(strings.Join(second.Warnings, "\n"), ShouldContainSubstring, "changed outside verger")
+				So(string(second.File), ShouldContainSubstring, `"timeout": 99`)
+			})
+
+			Convey("Then a record with no recorded digest is never claimed as ours", func() {
+				foreign := []byte(`{"hooks":{"preToolUse":[{"command":"echo theirs"}]}}`)
+
+				second, err := render.PlanHooks(manifest.FormatCursor, foreign, []manifest.Hook{hook}, nil)
+				So(err, ShouldBeNil)
+				So(string(second.File), ShouldContainSubstring, "echo theirs")
+				So(string(second.File), ShouldContainSubstring, "node guard.js")
 			})
 		})
 	})

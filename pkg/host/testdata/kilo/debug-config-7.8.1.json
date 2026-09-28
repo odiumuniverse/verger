@@ -1,0 +1,181 @@
+{
+  "instruction_origins": {},
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "probe": {
+      "type": "local",
+      "command": [
+        "echo",
+        "hi"
+      ]
+    }
+  },
+  "permission": {
+    "bash": "allow"
+  },
+  "plugin": [
+    "opencode-poe-auth",
+    "@kilocode/kilo-indexing",
+    "@kilocode/plugin-atomic-chat"
+  ],
+  "permission_origins": {
+    "bash": {
+      "*": "global"
+    }
+  },
+  "plugin_origins": [
+    {
+      "spec": "opencode-poe-auth",
+      "source": "/tmp/kprobe/home/.config/kilo",
+      "scope": "global"
+    }
+  ],
+  "agent": {
+    "v-mcptool": {
+      "name": "v-mcptool",
+      "description": "mcp tools.",
+      "tools": {
+        "mcp__probe__do": true
+      },
+      "prompt": "Body.",
+      "options": {},
+      "permission": {
+        "mcp__probe__do": "allow"
+      }
+    },
+    "v-namekey": {
+      "name": "v-namekey",
+      "description": "With name key.",
+      "mode": "subagent",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-permissionMode": {
+      "name": "v-permissionMode",
+      "description": "bisect permissionMode.",
+      "permissionMode": "acceptEdits",
+      "prompt": "Body.",
+      "options": {
+        "permissionMode": "acceptEdits"
+      },
+      "permission": {}
+    },
+    "v-model": {
+      "name": "v-model",
+      "description": "bisect model.",
+      "model": "sonnet",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-toolsmap": {
+      "name": "v-toolsmap",
+      "description": "Tools as map.",
+      "mode": "subagent",
+      "tools": {
+        "read": true,
+        "write": false
+      },
+      "prompt": "Body.",
+      "options": {},
+      "permission": {
+        "read": "allow",
+        "edit": "deny"
+      }
+    },
+    "v-hexcolor": {
+      "name": "v-hexcolor",
+      "description": "hex color.",
+      "color": "#FF5733",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-bogusmodel": {
+      "name": "v-bogusmodel",
+      "description": "bogus model.",
+      "model": "not a model",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "probe-oc": {
+      "name": "probe-oc",
+      "description": "Probe agent opencode style.",
+      "mode": "subagent",
+      "steps": 5,
+      "prompt": "Probe body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-model2": {
+      "name": "v-model2",
+      "description": "bisect model2.",
+      "model": "anthropic/claude-sonnet",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-nodesc": {
+      "name": "v-nodesc",
+      "mode": "subagent",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-skills": {
+      "name": "v-skills",
+      "description": "bisect skills.",
+      "skills": "alpha",
+      "prompt": "Body.",
+      "options": {
+        "skills": "alpha"
+      },
+      "permission": {}
+    },
+    "v-nokey": {
+      "name": "v-nokey",
+      "description": "Only description.",
+      "prompt": "Body.",
+      "options": {},
+      "permission": {}
+    },
+    "v-maxTurns": {
+      "name": "v-maxTurns",
+      "description": "bisect maxTurns.",
+      "maxTurns": 12,
+      "prompt": "Body.",
+      "options": {
+        "maxTurns": 12
+      },
+      "permission": {}
+    },
+    "render-canon": {
+      "name": "render-canon",
+      "description": "Reviews diffs.",
+      "mode": "subagent",
+      "model": "anthropic/claude-sonnet",
+      "steps": 12,
+      "color": "#FF5733",
+      "hidden": false,
+      "tools": {
+        "bash": true,
+        "grep": true,
+        "read": true,
+        "write": false
+      },
+      "prompt": "Review the diff.",
+      "options": {},
+      "permission": {
+        "bash": "allow",
+        "grep": "allow",
+        "read": "allow",
+        "edit": "deny"
+      }
+    }
+  },
+  "mode": {},
+  "command": {},
+  "username": "universe"
+}

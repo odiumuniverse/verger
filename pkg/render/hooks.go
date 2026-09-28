@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/manifest"
 )
 
@@ -18,7 +19,31 @@ type HookPlan struct {
 	File     []byte // new hooks object (nil when unchanged)
 	Rendered int
 	Owned    []string // commands rendered by this plan (RMA/ownership)
+	// Events lists the records this plan wrote, event by event, so the
+	// caller can claim one receipt artifact per record instead of one for
+	// the whole document.
+	Events   []HookEventPlan
 	Warnings []string
+}
+
+// HookEventPlan is one event's records as this plan wrote them.
+type HookEventPlan struct {
+	// Name is the host's own event name.
+	Name string
+
+	// Records are the entries appended for it.
+	Records []HookRecordPlan
+}
+
+// HookRecordPlan is one record as this plan wrote it.
+type HookRecordPlan struct {
+	// Name is the command, which is the record's identity.
+	Name string
+
+	// Digest is the canonical JSON of the record as it appears in the
+	// document: what a receipt stores so a later delivery can tell a hand
+	// edit from its own bytes.
+	Digest digest.Hash
 }
 
 // PlanHooks renders canonical hooks into the hooks object of a host dialect.
@@ -28,7 +53,7 @@ type HookPlan struct {
 // when the file does not exist. `existing` must be strict JSON: a JSONC caller
 // (a settings.json with comments or trailing commas) standardizes the document
 // first (hujson) and passes the `hooks` member.
-func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook) (HookPlan, error) {
+func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook, owned Owned) (HookPlan, error) {
 	events, ok := hookEventsFor(format)
 	if !ok {
 		return HookPlan{}, &RenderError{Kind: string(format), Name: "hooks", Cause: errors.New("the format has no hook dialect")}
@@ -54,7 +79,7 @@ func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook) (
 			continue
 		}
 
-		entry, dropped := hookEntry(hook, manifest.MatcherEvent(format, hook.Event))
+		entry, dropped := hookEntry(hook, format, manifest.MatcherEvent(format, hook.Event))
 		if dropped {
 			plan.Warnings = append(plan.Warnings,
 				fmt.Sprintf("%s hooks: matcher %q is not expressible on %s; dropped", format, hook.Matcher, event))
@@ -63,6 +88,14 @@ func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook) (
 		rendered[event] = append(rendered[event], entry)
 		plan.Rendered++
 
+		plan.Events = append(plan.Events, HookEventPlan{Name: event})
+		last := len(plan.Events) - 1
+
+		plan.Events[last].Records = append(plan.Events[last].Records, HookRecordPlan{
+			Name:   hook.Command,
+			Digest: HookRecordDigest(entry),
+		})
+
 		if !ownedSeen[hook.Command] {
 			ownedSeen[hook.Command] = true
 
@@ -70,7 +103,7 @@ func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook) (
 		}
 	}
 
-	merged, warns := mergeHooksObject(existingHooks, rendered, format)
+	merged, warns := mergeHooksObject(existingHooks, rendered, format, owned)
 
 	plan.Warnings = append(plan.Warnings, warns...)
 
@@ -106,6 +139,20 @@ func hookEventsFor(format manifest.Format) (map[string]string, bool) {
 			manifest.EventPostTool:     "AfterTool",
 			manifest.EventSessionStart: "SessionStart",
 			manifest.EventNotification: "Notification",
+		}, true
+	case manifest.FormatCursor:
+		// The event names are quoted from the live cursor-agent bundle
+		// 2026.06.15-18-00-12-6f5a2cf (chunk 2097.index.js, its own event
+		// enum). Every canonical event has an equivalent, so nothing is
+		// silenced for a missing one; `beforeSubmitPrompt` is the closest
+		// Cursor has to a notification and is a chosen mapping, not a
+		// semantic identity.
+		return map[string]string{
+			manifest.EventPreTool:      "preToolUse",
+			manifest.EventPostTool:     "postToolUse",
+			manifest.EventSessionStart: "sessionStart",
+			manifest.EventStop:         "stop",
+			manifest.EventNotification: "beforeSubmitPrompt",
 		}, true
 	default:
 		return nil, false
@@ -150,7 +197,7 @@ func existingHooksObject(existing []byte) (map[string]any, error) {
 
 // mergeHooksObject rebuilds the hooks object: our entries are replaced by the
 // fresh render, foreign entries and foreign handlers stay.
-func mergeHooksObject(existing map[string]any, rendered map[string][]any, format manifest.Format) (map[string]any, []string) {
+func mergeHooksObject(existing map[string]any, rendered map[string][]any, format manifest.Format, owned Owned) (map[string]any, []string) {
 	renderedCommands := hookCommandSet(rendered)
 
 	events := map[string]bool{}
@@ -168,7 +215,7 @@ func mergeHooksObject(existing map[string]any, rendered map[string][]any, format
 	out := map[string]any{}
 
 	for _, event := range sortedKeys(events) {
-		value, eventWarns := mergeHookEvent(event, existing[event], rendered[event], renderedCommands, format)
+		value, eventWarns := mergeHookEvent(event, existing[event], rendered[event], renderedCommands, format, owned)
 
 		warns = append(warns, eventWarns...)
 
@@ -202,7 +249,7 @@ func hookCommandSet(rendered map[string][]any) map[string]bool {
 
 // mergeHookEvent merges one event: a malformed value stays untouched, entries
 // ours are replaced, mixed and foreign entries are preserved.
-func mergeHookEvent(event string, existing any, fresh []any, renderedCommands map[string]bool, format manifest.Format) (any, []string) {
+func mergeHookEvent(event string, existing any, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned) (any, []string) {
 	if existing != nil {
 		if _, isList := existing.([]any); !isList {
 			if len(fresh) == 0 {
@@ -216,11 +263,11 @@ func mergeHookEvent(event string, existing any, fresh []any, renderedCommands ma
 
 	list, _ := existing.([]any)
 
-	return mergeHookEntries(event, list, fresh, renderedCommands, format)
+	return mergeHookEntries(event, list, fresh, renderedCommands, format, owned)
 }
 
 // mergeHookEntries rebuilds one event's array.
-func mergeHookEntries(event string, list, fresh []any, renderedCommands map[string]bool, format manifest.Format) (any, []string) {
+func mergeHookEntries(event string, list, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned) (any, []string) {
 	var (
 		next  []any
 		warns []string
@@ -243,6 +290,12 @@ func mergeHookEntries(event string, list, fresh []any, renderedCommands map[stri
 		}
 
 		switch {
+		case ours == len(commands) && handEditedHookEntry(event, entry, commands, owned):
+			// Ours by command, but the bytes on disk are not the bytes the
+			// receipt recorded: the user edited this record, so it stays.
+			next = append(next, entry)
+			warns = append(warns, fmt.Sprintf(
+				"%s hooks: %s: the record changed outside verger; left in place", format, hookRecordLabel(commands)))
 		case ours == len(commands):
 			// Ours: the fresh render replaces it.
 		case ours > 0:
@@ -263,8 +316,14 @@ func mergeHookEntries(event string, list, fresh []any, renderedCommands map[stri
 	return next, warns
 }
 
-// hookEntry renders one canonical hook as a nested matcher group.
-func hookEntry(hook manifest.Hook, matcherEvent bool) (any, bool) {
+// hookEntry renders one canonical hook in the host's own dialect. Cursor is
+// flat: a `{command, timeout?, matcher?}` record with no `type` and no nested
+// handler group, read from the live cursor-agent bundle
+// 2026.06.15-18-00-12-6f5a2cf (chunk 2097.index.js: the loader reads
+// `command`, a numeric `timeout` and a `matcher`; it also reads `failClosed`,
+// which a foreign record keeps and we never write because the canonical hook
+// has no field for it).
+func hookEntry(hook manifest.Hook, format manifest.Format, matcherEvent bool) (any, bool) {
 	matcher := hook.Matcher
 	if matcher == "*" {
 		matcher = ""
@@ -273,6 +332,19 @@ func hookEntry(hook manifest.Hook, matcherEvent bool) (any, bool) {
 	dropped := matcher != "" && !matcherEvent
 	if dropped {
 		matcher = ""
+	}
+
+	if format == manifest.FormatCursor {
+		record := map[string]any{keyCommand: hook.Command}
+		if hook.Timeout > 0 {
+			record["timeout"] = hook.Timeout
+		}
+
+		if matcher != "" {
+			record["matcher"] = matcher
+		}
+
+		return record, dropped
 	}
 
 	handler := map[string]any{keyType: kindCommand, keyCommand: hook.Command}
@@ -288,11 +360,17 @@ func hookEntry(hook manifest.Hook, matcherEvent bool) (any, bool) {
 	return group, dropped
 }
 
-// hookEntryCommands lists the commands one hooks entry carries.
+// hookEntryCommands lists the commands one hooks entry carries. It reads both
+// shapes: the nested `{hooks:[…]}` group of the Claude/Codex/Gemini dialects,
+// and Cursor's flat record, which carries the command itself.
 func hookEntryCommands(entry any) ([]string, bool) {
 	object, ok := entry.(map[string]any)
 	if !ok {
 		return nil, false
+	}
+
+	if command, ok := object[keyCommand].(string); ok {
+		return []string{command}, true
 	}
 
 	handlers, ok := object["hooks"].([]any)
@@ -371,4 +449,71 @@ func sortHooks(hooks []manifest.Hook) []manifest.Hook {
 	})
 
 	return out
+}
+
+// hookRecordKey is the ownership key of one hook record: the host event and the
+// command that identifies it, which is what the receipt records a digest for.
+// A record's `matcher` and `timeout` are fields *of* that record, not part of
+// its identity — an edit to either is exactly the hand edit the digest catches.
+func hookRecordKey(event, command string) string {
+	return "hooks/" + event + "/" + command
+}
+
+// handEditedHookEntry reports whether a record verger owns by command was
+// changed outside verger: the receipt holds a digest for it and the record on
+// disk no longer hashes to it. With no recorded digest the record is treated as
+// the user's, never as ours, so a first delivery over a pre-existing document
+// cannot claim a record verger did not write.
+func handEditedHookEntry(event string, entry any, commands []string, owned Owned) bool {
+	if len(owned) == 0 || len(commands) != 1 {
+		return false
+	}
+
+	recorded, ok := owned[hookRecordKey(event, commands[0])]
+	if !ok || recorded == "" {
+		return false
+	}
+
+	return recorded != HookRecordDigest(entry)
+}
+
+// hookRecordLabel names a record in a note: the command, which is its identity.
+func hookRecordLabel(commands []string) string {
+	if len(commands) == 0 {
+		return "a hook record"
+	}
+
+	return commands[0]
+}
+
+// HookRecordDigest is the digest a receipt stores for one rendered hook record,
+// so a later delivery can tell "the user edited this" from "this is what I
+// wrote". It is the canonical JSON of the record as it appears in the document.
+func HookRecordDigest(entry any) digest.Hash {
+	object, ok := entry.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	data, err := json.Marshal(object)
+	if err != nil {
+		return ""
+	}
+
+	return digest.Bytes(data)
+}
+
+// HookEventName returns the host event name a canonical event renders to in a
+// dialect, and whether the dialect has one at all. It is the single table the
+// renderer and a delivery planner share, so a receipt key can never be built
+// from a different spelling than the document uses.
+func HookEventName(format manifest.Format, canonEvent string) (string, bool) {
+	events, ok := hookEventsFor(format)
+	if !ok {
+		return "", false
+	}
+
+	name, ok := events[canonEvent]
+
+	return name, ok
 }

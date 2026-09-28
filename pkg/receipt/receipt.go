@@ -71,6 +71,7 @@ const (
 	OpHardlink    OpKind = "hardlink"     // undo: delete
 	OpConfigKey   OpKind = "config-key"   // undo: restore prior value or unset
 	OpHostInstall OpKind = "host-install" // undo: host CLI remove command
+	OpRecord      OpKind = "record"       // undo: none; a claim on a value inside a document this package owns
 )
 
 // Op is one reverse operation recorded at install time.
@@ -83,6 +84,11 @@ type Op struct {
 	Existed bool        `json:"existed,omitempty"` // target existed before install
 	Backup  string      `json:"backup,omitempty"`  // trash bucket or state backup holding prior bytes
 	Command []string    `json:"command,omitempty"` // inverse host CLI argv for host-install
+
+	// Note, for a record op, names the value inside the document this op claims
+	// (a dotted key path or a loader record id); it is bookkeeping, not a
+	// filesystem target, so Path holds the document the record lives in.
+	Note string `json:"note,omitempty"`
 }
 
 // Receipt is the recorded state of one package in one host and scope.
@@ -187,6 +193,11 @@ func (o Op) validate() error {
 		return fmt.Errorf("invalid digest %q", o.Digest)
 	}
 
+	return o.validateShape()
+}
+
+// validateShape checks the fields one operation kind needs beyond its digest.
+func (o Op) validateShape() error {
 	switch o.Kind {
 	case OpWriteFile, OpCopyTree, OpSymlink, OpHardlink:
 		if !filepath.IsAbs(o.Path) {
@@ -200,15 +211,19 @@ func (o Op) validate() error {
 		if len(o.Command) == 0 {
 			return errors.New("host-install needs a command")
 		}
+	case OpRecord:
+		if o.Path == "" || o.Note == "" {
+			return errors.New("record needs path and note")
+		}
 	}
 
 	return nil
 }
 
-// validOpKind reports whether kind is one of the six RMA operations.
+// validOpKind reports whether kind is one of the seven RMA operations.
 func validOpKind(kind OpKind) bool {
 	switch kind {
-	case OpWriteFile, OpCopyTree, OpSymlink, OpHardlink, OpConfigKey, OpHostInstall:
+	case OpWriteFile, OpCopyTree, OpSymlink, OpHardlink, OpConfigKey, OpHostInstall, OpRecord:
 		return true
 	default:
 		return false

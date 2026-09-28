@@ -79,7 +79,7 @@ func HostEvent(format Format, canonEvent string) (string, bool) {
 // dialect: only pre-tool and post-tool do.
 func MatcherEvent(format Format, canonEvent string) bool {
 	switch format {
-	case FormatClaude, FormatCodex, FormatGemini:
+	case FormatClaude, FormatCodex, FormatGemini, FormatCursor:
 		return canonEvent == EventPreTool || canonEvent == EventPostTool
 	default:
 		return false

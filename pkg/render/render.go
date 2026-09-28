@@ -27,6 +27,7 @@ const (
 	keyType        = "type"
 	keyName        = "name"
 	keyDescription = "description"
+	keyModel       = "model"
 )
 
 // RenderError reports malformed canonical input a renderer cannot express.

@@ -3,6 +3,7 @@ package render
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -14,7 +15,7 @@ import (
 // stay verbatim.
 func EncodeMCP(format manifest.Format, server manifest.MCPServer) (any, error) {
 	switch format {
-	case manifest.FormatClaude, manifest.FormatCodex, manifest.FormatGemini:
+	case manifest.FormatClaude, manifest.FormatCodex, manifest.FormatGemini, manifest.FormatOpenCode:
 	default:
 		return nil, &RenderError{
 			Kind:  kindMCP,
@@ -32,23 +33,47 @@ func EncodeMCP(format manifest.Format, server manifest.MCPServer) (any, error) {
 		return claudeMCPValue(server), nil
 	case manifest.FormatCodex:
 		return codexMCPValue(server), nil
+	case manifest.FormatOpenCode:
+		return openCodeMCPValue(server), nil
 	default:
 		return geminiMCPValue(server), nil
 	}
 }
 
-// MCPEdits returns one key-path edit per server for the shared config of a
-// dialect: `mcpServers.<name>` (JSONC) or `mcp_servers.<name>` (TOML).
-func MCPEdits(format manifest.Format, servers []manifest.MCPServer) ([]Edit, error) {
-	prefix := ""
-
+// MCPPrefix returns the key path a dialect puts its servers under: the shared
+// document key of the format, without the server name.
+func MCPPrefix(format manifest.Format) string {
 	switch format {
-	case manifest.FormatClaude, manifest.FormatGemini:
-		prefix = "mcpServers."
 	case manifest.FormatCodex:
-		prefix = "mcp_servers."
+		return "mcp_servers."
+	case manifest.FormatOpenCode:
+		return "mcp."
+	case manifest.FormatClaude, manifest.FormatGemini:
+		return "mcpServers."
+	default:
+		return ""
+	}
+}
+
+// MCPEdits returns one key-path edit per server for the shared config of a
+// dialect, under the dialect's own container key.
+func MCPEdits(format manifest.Format, servers []manifest.MCPServer) ([]Edit, error) {
+	return MCPEditsUnder(format, MCPPrefix(format), servers)
+}
+
+// MCPEditsUnder returns one key-path edit per server below an explicit key
+// prefix: OpenCode carries the same values under `mcp.servers.` (v2) and
+// `mcp.` (v1), and the adapter picks the container the config already
+// declares.
+func MCPEditsUnder(format manifest.Format, prefix string, servers []manifest.MCPServer) ([]Edit, error) {
+	switch format {
+	case manifest.FormatClaude, manifest.FormatGemini, manifest.FormatCodex, manifest.FormatOpenCode:
 	default:
 		return nil, &RenderError{Kind: kindMCP, Cause: fmt.Errorf("format %s has no MCP config dialect", format)}
+	}
+
+	if prefix == "" {
+		return nil, &RenderError{Kind: kindMCP, Cause: fmt.Errorf("format %s has no MCP container key", format)}
 	}
 
 	ordered := slices.Clone(servers)
@@ -189,6 +214,30 @@ func geminiMCPValue(server manifest.MCPServer) map[string]any {
 
 	if env := convertedStrings(server.Env, hostEnvRefs); len(env) > 0 {
 		entry["env"] = env
+	}
+
+	return entry
+}
+
+// openCodeMCPValue renders the OpenCode/Kilo `mcp.<name>` entry: a `local`
+// server with the command as one array and the environment map spelled
+// `environment`, or a `remote` server with its url and headers. References
+// stay verbatim (the host expands nothing).
+func openCodeMCPValue(server manifest.MCPServer) map[string]any {
+	if server.URL != "" {
+		entry := map[string]any{"type": "remote", "url": server.URL}
+
+		if len(server.Headers) > 0 {
+			entry["headers"] = maps.Clone(server.Headers)
+		}
+
+		return entry
+	}
+
+	entry := map[string]any{"type": "local", "command": slices.Clone(server.Command)}
+
+	if len(server.Env) > 0 {
+		entry["environment"] = maps.Clone(server.Env)
 	}
 
 	return entry

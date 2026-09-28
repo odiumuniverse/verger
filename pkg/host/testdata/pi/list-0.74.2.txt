@@ -1,0 +1,7 @@
+User packages:
+  ../../../../../../store/synth/acme/caveman
+    /Users/u/.verger/store/synth/acme/caveman
+
+Project packages:
+  ../../../pkg
+    /tmp/pkg

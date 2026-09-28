@@ -1,0 +1,3 @@
+ID            VERSION  SOURCE
+probe-plugin  becf70d  git+file:///tmp/ocprobe/pkg
+probe-plugin  31a358f  git+file:///tmp/ocprobe/pkg3

@@ -103,7 +103,11 @@ type Installed struct {
 	Marketplace string
 	Version     string
 	Path        string // install dir (Claude `installPath`)
-	Scope       string // host install scope (user|project|local), when reported
+	// Source is the install source the host reports for an entry that has no
+	// marketplace concept: the specifier OpenCode's `plugin list` prints in
+	// its SOURCE column.
+	Source string
+	Scope  string // host install scope (user|project|local), when reported
 	// Enabled is false only when the host reports the plugin disabled (D27):
 	// hosts that list no state list enabled plugins.
 	Enabled bool
@@ -239,6 +243,13 @@ type ArtifactDigests interface {
 	ArtifactDigest(path string) (digest.Hash, bool)
 }
 
+// DefaultOracleWait bounds one service-backed oracle call: the OpenCode
+// plugin verbs talk to the host's background service, which the CLI starts
+// itself and retries forever when the port belongs to another instance, so the
+// wait turns a hang into a note. It is the doctor's worst case, and a test
+// pins it.
+const DefaultOracleWait = 15 * time.Second
+
 // DefaultLockWait is how long a host write waits for another writer's lock
 // before backing off: the same 30s a sibling tool uses on the shared omp lock,
 // so neither side can starve the other and the next run retries.
@@ -246,15 +257,16 @@ const DefaultLockWait = 30 * time.Second
 
 // Base holds the shared adapter dependencies; adapters embed it read-only.
 type Base struct {
-	home      string
-	lockWait  time.Duration
-	runner    hostcli.Runner
-	logger    embedlog.Logger
-	secrets   *secret.Store
-	store     *store.Store
-	trash     *store.Trash
-	ownership PathOwner
-	resolver  *hostcli.Resolver
+	home       string
+	lockWait   time.Duration
+	oracleWait time.Duration
+	runner     hostcli.Runner
+	logger     embedlog.Logger
+	secrets    *secret.Store
+	store      *store.Store
+	trash      *store.Trash
+	ownership  PathOwner
+	resolver   *hostcli.Resolver
 }
 
 // Option configures a Base.
@@ -264,6 +276,13 @@ type Option func(*Base)
 // zero value keeps DefaultLockWait.
 func WithLockWait(wait time.Duration) Option {
 	return func(b *Base) { b.lockWait = wait }
+}
+
+// WithOracleWait sets how long a service-backed oracle call waits before it
+// reports the note; the zero value keeps DefaultOracleWait. A test injects a
+// short wait instead of sitting through the real bound.
+func WithOracleWait(wait time.Duration) Option {
+	return func(b *Base) { b.oracleWait = wait }
 }
 
 // WithHome sets the fallback user home used for config paths.
@@ -322,6 +341,15 @@ func newBase(opts []Option) *Base {
 	}
 
 	return b
+}
+
+// effectiveOracleWait is the oracle wait of this adapter.
+func (b *Base) effectiveOracleWait() time.Duration {
+	if b.oracleWait > 0 {
+		return b.oracleWait
+	}
+
+	return DefaultOracleWait
 }
 
 // effectiveLockWait is the lock wait of this adapter.

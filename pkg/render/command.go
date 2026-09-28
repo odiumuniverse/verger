@@ -66,6 +66,53 @@ func (c Command) CodexPrompt() []byte {
 	return []byte(normalizeBody(c.Body))
 }
 
+// OpenCodeMarkdown encodes the command in the OpenCode/Kilo command dialect:
+// the `description` and `model` keys the host reads. The Claude-only keys
+// (argument-hint, arguments, disable-model-invocation) come back as joined
+// *InexpressibleError values next to the rendered bytes instead of being
+// written into a document the host parses with its own schema.
+func (c Command) OpenCodeMarkdown() ([]byte, error) {
+	var (
+		fields  []field
+		dropped []string
+	)
+
+	if c.Description != "" {
+		fields = append(fields, field{Key: keyDescription, Value: c.Description})
+	}
+
+	if c.Model != "" {
+		fields = append(fields, field{Key: keyModel, Value: c.Model})
+	}
+
+	for _, candidate := range []struct {
+		key     string
+		dropped bool
+	}{
+		{"argument-hint", c.ArgumentHint != ""},
+		{"arguments", len(c.Arguments) > 0},
+		{"disable-model-invocation", c.DisableModelInvocation != nil},
+	} {
+		if candidate.dropped {
+			dropped = append(dropped, candidate.key)
+		}
+	}
+
+	doc := composeFrontmatter(fields, c.Body)
+
+	if len(dropped) == 0 {
+		return doc, nil
+	}
+
+	errs := make([]error, 0, len(dropped))
+
+	for _, name := range dropped {
+		errs = append(errs, &InexpressibleError{Kind: kindCommand, Name: c.Name, Field: name})
+	}
+
+	return doc, errors.Join(errs...)
+}
+
 // GeminiTOML encodes the command as a Gemini command document: a required
 // prompt and an optional description. A body-less command is inexpressible for
 // Gemini.

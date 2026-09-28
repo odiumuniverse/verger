@@ -47,6 +47,20 @@ const (
 	FormatCodex        Format = "codex"
 	FormatGemini       Format = "gemini"
 	FormatAgentPlugins Format = "agent-plugins"
+	// FormatOpenCode is the OpenCode/Kilo MCP and agent dialect: the host
+	// writes `mcp.<name>` (v1) or `mcp.servers.<name>` (v2) entries of the
+	// `{type: local|remote, command|url}` shape and agent documents of the
+	// `mode`/`steps`/`tools`-map schema. It is a dialect tag for the
+	// renderers, not a payload layout pkg/manifest parses yet.
+	FormatOpenCode Format = "opencode"
+
+	// FormatCursor is Cursor's hooks dialect, read from the live
+	// cursor-agent bundle 2026.06.15-18-00-12-6f5a2cf (chunk 2097.index.js):
+	// a `hooks` object mapping a flat camelCase event name to an array of
+	// `{command, timeout?, matcher?}` records, with no nested handler group
+	// and no `type` field. It is a dialect tag for the renderer, not a
+	// payload layout pkg/manifest parses.
+	FormatCursor Format = "cursor"
 )
 
 // Component is one payload item: a skill tree, an agent file, a command file.
