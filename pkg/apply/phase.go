@@ -1017,7 +1017,9 @@ func (r *runner) dropOld(action Action, result host.Result) []string {
 	return outcome.notes
 }
 
-// opIdentity compares one RMA operation across receipts.
+// opIdentity compares one RMA operation across receipts. File-like ops (file,
+// tree, symlink, hardlink) are keyed by path alone: a target that switches kind
+// between versions is still the same target (N-3).
 func opIdentity(op receipt.Op) string {
 	switch op.Kind {
 	case receipt.OpConfigKey:
@@ -1025,7 +1027,7 @@ func opIdentity(op receipt.Op) string {
 	case receipt.OpHostInstall:
 		return "host:" + strings.Join(op.Command, "\x00")
 	default:
-		return string(op.Kind) + ":" + op.Path
+		return "entry:" + op.Path
 	}
 }
 
@@ -1148,11 +1150,35 @@ func (r *runner) undoMissing(op receipt.Op) (string, string, bool, error) {
 		return "", "", false, nil
 	}
 
+	if gone, err := r.backupGone(op); gone || err != nil {
+		return backupGoneNote(op), "", false, err
+	}
+
 	if _, err := r.deps.Store.Trash().Restore(r.ctx, op.Backup); err != nil {
 		return "", "", false, fmt.Errorf("restore %s: %w", op.Path, err)
 	}
 
 	return fmt.Sprintf("restored %s from the trash", op.Path), "", false, nil
+}
+
+// backupGone reports whether the bucket holding an op's pre-install bytes no
+// longer exists (reaped by a trash GC) — the restore can never succeed (N-1).
+func (r *runner) backupGone(op receipt.Op) (bool, error) {
+	_, err := r.deps.Store.Trash().Get(op.Backup)
+	if _, missing := errors.AsType[*store.NotFoundError](err); missing {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("backup %s of %s: %w", op.Backup, op.Path, err)
+	}
+
+	return false, nil
+}
+
+// backupGoneNote explains a restore that cannot happen.
+func backupGoneNote(op receipt.Op) string {
+	return op.Path + ": the pre-install backup " + op.Backup + " is gone from the trash; left in place"
 }
 
 // undoMismatch interprets a digest mismatch for one file operation.
@@ -1166,6 +1192,12 @@ func (r *runner) undoMismatch(op receipt.Op, mode rmaMode) (string, string, bool
 
 // undoRestore replaces verger's artifact with the trashed previous bytes.
 func (r *runner) undoRestore(ref rmaRef, op receipt.Op, cause string, current digest.Hash) (string, string, bool, error) {
+	// Never trash verger's artifact when the bytes it replaced are gone: the
+	// path would end up empty and the removal could never converge (N-1).
+	if gone, err := r.backupGone(op); gone || err != nil {
+		return backupGoneNote(op), "", false, err
+	}
+
 	trashID, err := r.trash(ref, op.Path, cause, current)
 	if err != nil {
 		return "", "", false, err

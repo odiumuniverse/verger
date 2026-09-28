@@ -66,6 +66,71 @@ func (h *rollbackResidueHost) Deliver(_ context.Context, _ string, d host.Delive
 	}
 }
 
+// N-1 (NF batch verify): a removal whose pre-install backup is gone (reaped by
+// a trash GC) leaves the artifact in place and converges instead of trashing
+// it and failing forever.
+func TestRunRemoveWithReapedBackupConverges(t *testing.T) {
+	Convey("Given a package installed over a user file whose backup bucket was reaped", t, func() {
+		w := newWorld(t)
+		f := w.fake(t, fxClaude)
+		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
+		ctx := context.Background()
+
+		writeFixture(t, path, "# user\n")
+		f.write(fxPkg, fakeFile{Path: path, Data: "# v1\n"})
+
+		_, err := w.run(t, ctx, Plan{Actions: []Action{installAction(fxClaude, ActionInstall, fxVersion, nil)}}, Options{})
+		So(err, ShouldBeNil)
+
+		stored := w.storedReceipt(t)
+		So(stored.RMA[0].Backup, ShouldNotBeEmpty)
+		So(w.store.Trash().Remove(stored.RMA[0].Backup), ShouldBeNil)
+
+		Convey("When the package is removed", func() {
+			report, err := w.run(t, ctx, Plan{Actions: []Action{removeAction(fxClaude, stored, string(receipt.CauseUser), string(fxClaude))}}, Options{})
+
+			Convey("Then nothing is moved, the removal converges and the note explains why", func() {
+				So(err, ShouldBeNil)
+				So(report.Cells[0].Status, ShouldNotEqual, StatusFailed)
+				So(readFixture(t, path), ShouldEqual, "# v1\n")
+
+				_, ok, err := w.deps.Receipts.Get(fxPkg, string(fxClaude), fxUser)
+				So(err, ShouldBeNil)
+				So(ok, ShouldBeFalse)
+				So(slices.ContainsFunc(report.Cells[0].Notes, func(n string) bool { return strings.Contains(n, "backup") }), ShouldBeTrue)
+			})
+		})
+	})
+}
+
+// N-3 (NF batch verify): a path that switches kind between versions (file →
+// symlink) is still the same target; it keeps the user's pre-install backup.
+func TestInheritPreInstallAcrossKinds(t *testing.T) {
+	Convey("Given a previous receipt that replaced a user file", t, func() {
+		prev := &receipt.Receipt{RMA: []receipt.Op{
+			{Kind: receipt.OpWriteFile, Path: "/x/SKILL.md", Existed: true, Backup: "user-bucket"},
+			{Kind: receipt.OpConfigKey, Path: "/x/settings.json", KeyPath: "hooks", Existed: true, Backup: "cfg-bucket"},
+		}}
+
+		Convey("When the new version delivers the same path as a symlink", func() {
+			ops, stale := inheritPreInstall([]receipt.Op{
+				{Kind: receipt.OpSymlink, Path: "/x/SKILL.md", Existed: true, Backup: "v1-bucket"},
+				{Kind: receipt.OpConfigKey, Path: "/x/settings.json", KeyPath: "model", Existed: true, Backup: "other"},
+			}, prev)
+
+			Convey("Then the symlink inherits the user's backup and v1's bucket is stale", func() {
+				So(ops[0].Existed, ShouldBeTrue)
+				So(ops[0].Backup, ShouldEqual, "user-bucket")
+				So(stale, ShouldResemble, []string{"v1-bucket"})
+			})
+
+			Convey("Then a different config key is not the same target", func() {
+				So(ops[1].Backup, ShouldEqual, "other")
+			})
+		})
+	})
+}
+
 // N-2 (NF batch verify): a failed, rolled-back install closes its journal
 // intent, so the next run does not replay it as a crash and commit the
 // version that failed.
