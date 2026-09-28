@@ -74,7 +74,7 @@ func TestRunRemoveWithReapedBackupConverges(t *testing.T) {
 		w := newWorld(t)
 		f := w.fake(t, fxClaude)
 		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
-		ctx := context.Background()
+		ctx := t.Context()
 
 		writeFixture(t, path, "# user\n")
 		f.write(fxPkg, fakeFile{Path: path, Data: "# v1\n"})
@@ -139,7 +139,7 @@ func TestRunFailedUpdateIsNotReplayed(t *testing.T) {
 		w := newWorld(t)
 		f := w.fake(t, fxClaude)
 		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
-		ctx := context.Background()
+		ctx := t.Context()
 
 		// Same bytes in v1 and v2: a replay would find the artifacts "verified".
 		f.write(fxPkg, fakeFile{Path: path, Data: "# same\n"})
@@ -179,7 +179,7 @@ func TestRunRollbackContinuesPastFailedOp(t *testing.T) {
 		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
 		w.deps.Hosts[fxClaude] = &rollbackResidueHost{path: path}
 
-		report, err := w.run(t, context.Background(), Plan{Actions: []Action{installAction(fxClaude, ActionInstall, fxVersion, nil)}}, Options{})
+		report, err := w.run(t, t.Context(), Plan{Actions: []Action{installAction(fxClaude, ActionInstall, fxVersion, nil)}}, Options{})
 
 		Convey("When the install is rolled back", func() {
 			Convey("Then the file is removed and the failed host undo is reported", func() {
@@ -214,7 +214,7 @@ func TestRunRedeliveryKeepsPreInstallState(t *testing.T) {
 		w := newWorld(t)
 		f := w.fake(t, fxClaude)
 		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
-		ctx := context.Background()
+		ctx := t.Context()
 
 		f.write(fxPkg, fakeFile{Path: path, Data: "# v1\n"})
 
@@ -280,7 +280,7 @@ func TestRunRedeliveryKeepsPreInstallState(t *testing.T) {
 		w := newWorld(t)
 		f := w.fake(t, fxClaude)
 		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
-		ctx := context.Background()
+		ctx := t.Context()
 
 		writeFixture(t, path, "# user\n")
 		f.write(fxPkg, fakeFile{Path: path, Data: "# v1\n"})
