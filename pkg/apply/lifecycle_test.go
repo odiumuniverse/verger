@@ -66,6 +66,46 @@ func (h *rollbackResidueHost) Deliver(_ context.Context, _ string, d host.Delive
 	}
 }
 
+// N-2 (NF batch verify): a failed, rolled-back install closes its journal
+// intent, so the next run does not replay it as a crash and commit the
+// version that failed.
+func TestRunFailedUpdateIsNotReplayed(t *testing.T) {
+	Convey("Given an installed v1 whose update to v2 fails and is rolled back", t, func() {
+		w := newWorld(t)
+		f := w.fake(t, fxClaude)
+		path := filepath.Join(w.root, "skills", "tool", "SKILL.md")
+		ctx := context.Background()
+
+		// Same bytes in v1 and v2: a replay would find the artifacts "verified".
+		f.write(fxPkg, fakeFile{Path: path, Data: "# same\n"})
+
+		_, err := w.run(t, ctx, Plan{Actions: []Action{installAction(fxClaude, ActionInstall, fxVersion, nil)}}, Options{})
+		So(err, ShouldBeNil)
+
+		prev := w.storedReceipt(t)
+
+		f.failVerify(fxPkg)
+
+		failed, err := w.run(t, ctx, Plan{Actions: []Action{installAction(fxClaude, ActionUpdate, fxNext, &prev)}}, Options{})
+		So(err, ShouldBeNil)
+		So(failed.Cells[0].Status, ShouldNotEqual, StatusCurrent)
+		So(w.storedReceipt(t).Version, ShouldEqual, fxVersion)
+
+		Convey("When an unrelated run follows", func() {
+			f.write("acme/other", fakeFile{Path: filepath.Join(w.root, "skills", "other", "SKILL.md"), Data: "# other\n"})
+
+			report, err := w.run(t, ctx, Plan{Actions: []Action{installActionPkg("acme/other", fxClaude, ActionInstall, fxVersion, nil)}}, Options{})
+
+			Convey("Then the failed update is not committed and the cell stays at v1", func() {
+				So(err, ShouldBeNil)
+				So(slices.ContainsFunc(report.Notes, func(n string) bool { return strings.Contains(n, "recovered") }), ShouldBeFalse)
+				So(w.storedReceipt(t).Version, ShouldEqual, fxVersion)
+				So(readFixture(t, path), ShouldEqual, "# same\n")
+			})
+		})
+	})
+}
+
 // NF-3 (T1.6/T1.7 verify): a rollback continues past a failing reverse op, so
 // one stale host resource cannot leave every file of the failed delivery.
 func TestRunRollbackContinuesPastFailedOp(t *testing.T) {

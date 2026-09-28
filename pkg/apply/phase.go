@@ -218,12 +218,21 @@ func (r *runner) trackGenerations(events []receipt.Event) int64 {
 	return lastCommit
 }
 
-// pendingIntents lists intent events after the last lock commit.
+// pendingIntents lists intent events after the last lock commit; a rollback
+// event closes the earlier intents of its cell.
 func pendingIntents(events []receipt.Event, after int64) []receipt.Event {
 	pending := make([]receipt.Event, 0, len(events))
 
 	for _, event := range events {
 		if event.Seq <= after {
+			continue
+		}
+
+		if event.Kind == receipt.EventRollback {
+			pending = slices.DeleteFunc(pending, func(intent receipt.Event) bool {
+				return intent.Package == event.Package && intent.Host == event.Host && intent.Scope == event.Scope
+			})
+
 			continue
 		}
 
@@ -736,6 +745,14 @@ func (r *runner) installFailed(action Action, cell CellResult, planned, result h
 	notes := outcome.notes
 	if outcome.err != nil {
 		notes = append(notes, "rollback: "+outcome.err.Error())
+	}
+
+	// Close the intent: a failed action is not an interrupted one (N-2).
+	if err := r.deps.Journal.Append(receipt.Event{
+		Kind: receipt.EventRollback, Package: pkg.ID, Host: string(action.Host),
+		Scope: intentScope(action), Version: pkg.Version, Cause: causeRollback,
+	}); err != nil {
+		notes = append(notes, "journal: rollback event: "+err.Error())
 	}
 
 	r.emit(action, stepRollback, fmt.Sprintf("rolled back %s: %v", pkg.ID, failure))

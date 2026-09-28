@@ -29,6 +29,9 @@ const (
 	EventRestore EventKind = "restore"
 	EventPin     EventKind = "pin"
 	EventLock    EventKind = "lock" // lock generation for `verger rollback`
+	// EventRollback closes the intent of a failed, rolled-back action of the
+	// same cell, so recovery never replays it as a crash.
+	EventRollback EventKind = "rollback"
 )
 
 // Event is one append-only journal record.
@@ -76,7 +79,7 @@ func (e Event) Validate() error {
 func validEventKind(kind EventKind) bool {
 	switch kind {
 	case EventInstall, EventRemove, EventUpdate, EventDisable, EventEnable,
-		EventAdopt, EventRestore, EventPin, EventLock:
+		EventAdopt, EventRestore, EventPin, EventLock, EventRollback:
 		return true
 	default:
 		return false
