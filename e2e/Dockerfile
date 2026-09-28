@@ -9,6 +9,9 @@ FROM node:22-bookworm
 ARG CLAUDE_VERSION=2.1.283
 ARG CODEX_VERSION=0.157.1
 ARG GEMINI_VERSION=0.61.0
+ARG OMP_VERSION=18.4.1
+# omp's launcher is `#!/usr/bin/env bun`; the runtime is its own npm package.
+ARG BUN_VERSION=latest
 
 # Go for building/driving the repo; node:22-bookworm has everything else.
 COPY --from=golang:1.27-bookworm /usr/local/go /usr/local/go
@@ -24,6 +27,8 @@ RUN apt-get update \
 RUN npm install -g \
       "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
-      "@google/gemini-cli@${GEMINI_VERSION}"
+      "@google/gemini-cli@${GEMINI_VERSION}" \
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+      "bun@${BUN_VERSION}"
 
 WORKDIR /src

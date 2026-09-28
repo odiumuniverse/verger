@@ -14,17 +14,27 @@ const (
 	claudeVersionPin = "2.1.283"
 	codexVersionPin  = "0.157.1"
 	geminiVersionPin = "0.61.0"
+	// omp publishes @oh-my-pi/pi-coding-agent on npm; the binary is a Bun
+	// program and its launcher needs the bun runtime (npmExtra).
+	ompVersionPin = "18.4.1"
 )
 
 // hostSpec describes one host CLI the matrix exercises.
 type hostSpec struct {
-	id     string // verger host id: claude|codex|gemini
+	id     string // verger host id: claude|codex|gemini|omp
 	binary string // host CLI executable name on PATH
 	npm    string // npm package the job installs
-	pin    string // fallback version when no E2E_*_VERSION is set
+	// npmExtra lists npm packages the host CLI needs beside its own: the omp
+	// launcher starts with `#!/usr/bin/env bun`.
+	npmExtra []string
+	pin      string // fallback version when no E2E_*_VERSION is set
 	// configDirs are host-owned directories below HOME: residue scan and
 	// failure listings.
 	configDirs []string
+	// residueSkip are subtrees below a config dir the residue scan leaves
+	// alone: host-owned runtime state that may legitimately mention a plugin
+	// (omp's own logs and its prebuilt native module do).
+	residueSkip []string
 	// listArgs is the host's own JSON list oracle (never an LLM call).
 	listArgs []string
 	// hooksFile is the host's shared hooks document below HOME; the adopt leg
@@ -37,7 +47,8 @@ type hostSpec struct {
 	adoptReason string
 }
 
-// hostSpecs is the Ф1 e2e matrix (DESIGN §10.3, D21): three real CLIs.
+// hostSpecs is the Ф1 e2e matrix (DESIGN §10.3, D21): three real CLIs, plus
+// omp (Ф2).
 func hostSpecs() []hostSpec {
 	return []hostSpec{
 		{
@@ -73,6 +84,21 @@ func hostSpecs() []hostSpec {
 			hooksFile:       ".gemini/settings.json",
 			fixtureManifest: "gemini-extension.json",
 		},
+		{
+			id:              "omp",
+			binary:          "omp",
+			npm:             "@oh-my-pi/pi-coding-agent",
+			npmExtra:        []string{"bun"},
+			pin:             ompVersionPin,
+			configDirs:      []string{".omp", ".agents"},
+			residueSkip:     []string{".omp/logs", ".omp/natives"},
+			listArgs:        []string{"plugin", "list", "--json"},
+			hooksFile:       ".omp/agent/hooks",
+			fixtureManifest: ".claude-plugin/plugin.json",
+			// The manual local install is the adapter's verified grammar
+			// (omp 18.4.1): `plugin marketplace add <dir>` then
+			// `plugin install <plugin>@<marketplace> --force`.
+		},
 	}
 }
 
@@ -104,4 +130,10 @@ func (h hostSpec) version() string {
 // moduleRef is the npm install ref, e.g. @openai/codex@0.157.1.
 func (h hostSpec) moduleRef() string {
 	return h.npm + "@" + h.version()
+}
+
+// installRefs is the npm install argument list of one host: its own package at
+// the pinned version plus the runtime packages it needs (omp's launcher).
+func (h hostSpec) installRefs() []string {
+	return append([]string{h.moduleRef()}, h.npmExtra...)
 }

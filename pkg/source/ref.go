@@ -415,7 +415,7 @@ func validNPMName(name string) bool {
 // (T1.6 will own the registry).
 func knownHost(prefix string) bool {
 	switch prefix {
-	case "claude", "codex", "gemini", "agy", "cursor", "opencode", "kilo", "pi", "dsh":
+	case "claude", "codex", "gemini", "agy", "cursor", "opencode", "kilo", "pi", "dsh", "omp":
 		return true
 	default:
 		return false

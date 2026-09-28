@@ -354,11 +354,11 @@ func ensureHost(t *testing.T, env Env, spec hostSpec) {
 	}
 
 	if os.Getenv("E2E_NPM_INSTALL") == "1" {
-		t.Logf("e2e: installing %s from npm", spec.moduleRef())
+		t.Logf("e2e: installing %s from npm", strings.Join(spec.installRefs(), " "))
 
-		out, code := runHost(t, env, "npm", "install", "-g", spec.moduleRef())
+		out, code := runHost(t, env, "npm", append([]string{"install", "-g"}, spec.installRefs()...)...)
 		if code != 0 {
-			t.Fatalf("e2e: npm install -g %s -> %d\n%s", spec.moduleRef(), code, out)
+			t.Fatalf("e2e: npm install -g %s -> %d\n%s", strings.Join(spec.installRefs(), " "), code, out)
 		}
 
 		if _, err := exec.LookPath(spec.binary); err == nil {
@@ -366,7 +366,7 @@ func ensureHost(t *testing.T, env Env, spec hostSpec) {
 		}
 	}
 
-	t.Skipf("e2e: %s CLI is not installed for E2E_HOST=%s (npm install -g %s)", spec.binary, spec.id, spec.moduleRef())
+	t.Skipf("e2e: %s CLI is not installed for E2E_HOST=%s (npm install -g %s)", spec.binary, spec.id, strings.Join(spec.installRefs(), " "))
 }
 
 // makeFixture writes the host's fixture package below the work dir.
@@ -477,6 +477,21 @@ var hostOwnedFiles = map[string]string{
 	"extension_integrity.json": "gemini-cli owns this signed store; verger never writes or deletes it",
 }
 
+// insideHostRuntime reports whether path is below one of the host-owned runtime
+// subtrees a spec lists (hostSpec.residueSkip): state the host writes about its
+// own operations, where a plugin name is the host's record, not verger residue.
+func insideHostRuntime(home, path string, skip []string) bool {
+	for _, rel := range skip {
+		root := filepath.Join(home, filepath.FromSlash(rel))
+
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // assertNoResidue scans the host's own directories for surviving mentions of
 // the fixture after remove.
 func assertNoResidue(t *testing.T, env Env, spec hostSpec) {
@@ -495,6 +510,12 @@ func assertNoResidue(t *testing.T, env Env, spec hostSpec) {
 			}
 
 			if entry.IsDir() {
+				if insideHostRuntime(env.Home, path, spec.residueSkip) {
+					t.Logf("e2e: residue scan skips host-owned %s", path)
+
+					return fs.SkipDir
+				}
+
 				return nil
 			}
 
@@ -589,8 +610,46 @@ func manualInstall(t *testing.T, env Env, spec hostSpec) {
 		manualInstallCodex(t, env)
 	case "gemini":
 		manualInstallGemini(t, env)
+	case "omp":
+		manualInstallOmp(t, env)
 	default:
 		t.Fatalf("e2e: no manual install for %s", spec.id)
+	}
+}
+
+// manualInstallOmp registers a local marketplace with omp and installs the
+// fixture from it (omp 18.4.1). The catalog uses the Claude-compatible
+// fallback path omp accepts, and the marketplace document names the
+// marketplace omp registers.
+func manualInstallOmp(t *testing.T, env Env) {
+	t.Helper()
+
+	const marketplace = "e2e-market"
+
+	root := filepath.Join(env.Work, "marketplace")
+	if err := os.CopyFS(filepath.Join(root, "fixture"), os.DirFS(filepath.Join(env.Work, "fixture"))); err != nil {
+		t.Fatalf("e2e: copy fixture under the marketplace root: %v", err)
+	}
+
+	writeFile(t, filepath.Join(root, ".claude-plugin", "marketplace.json"), fmt.Sprintf(`{
+  "name": %q,
+  "owner": {"name": "e2e"},
+  "plugins": [
+    {"name": %q, "source": "./fixture", "description": "verger e2e fixture"}
+  ]
+}
+`, marketplace, fixtureName))
+
+	out, code := runHost(t, env, "omp", "plugin", "marketplace", "add", root)
+	if code != 0 {
+		t.Fatalf("e2e: omp plugin marketplace add -> %d\n%s", code, out)
+	}
+
+	ref := fixtureName + "@" + marketplace
+
+	out, code = runHost(t, env, "omp", "plugin", "install", ref)
+	if code != 0 {
+		t.Fatalf("e2e: omp plugin install %s -> %d\n%s", ref, code, out)
 	}
 }
 
@@ -1004,6 +1063,9 @@ func looseSkillMarker(home, host string) string {
 		"claude": ".claude/skills/e2e-skill/SKILL.md",
 		"codex":  ".agents/skills/e2e-skill/SKILL.md",
 		"gemini": ".gemini/skills/e2e-skill/SKILL.md",
+		// omp reads the shared ~/.agents root through its ungated agents
+		// provider, so its loose skills land beside Codex's.
+		"omp": ".agents/skills/e2e-skill/SKILL.md",
 	}[host]
 
 	if rel == "" {
@@ -1194,11 +1256,11 @@ func TestUnitOracleHasName(t *testing.T) {
 	}
 }
 
-// TestUnitHostSpecs pins the matrix shape: three hosts, npm pins, oracles.
+// TestUnitHostSpecs pins the matrix shape: four hosts, npm pins, oracles.
 func TestUnitHostSpecs(t *testing.T) {
 	specs := hostSpecs()
-	if len(specs) != 3 {
-		t.Fatalf("hostSpecs length = %d, want 3", len(specs))
+	if len(specs) != 4 {
+		t.Fatalf("hostSpecs length = %d, want 4", len(specs))
 	}
 
 	for _, spec := range specs {
@@ -1209,6 +1271,37 @@ func TestUnitHostSpecs(t *testing.T) {
 		if len(spec.listArgs) == 0 || len(spec.configDirs) == 0 || spec.fixtureManifest == "" {
 			t.Fatalf("host spec %s lacks oracle/config/fixture data", spec.id)
 		}
+
+		refs := spec.installRefs()
+		if len(refs) == 0 || refs[0] != spec.npm+"@"+spec.pin {
+			t.Fatalf("host spec %s install refs = %v, want the pinned npm package first", spec.id, refs)
+		}
+	}
+}
+
+// TestUnitOmpSpec pins the omp matrix entry: the host has no binary
+// distribution named after it, so the package and its bun runtime are pinned
+// together, and the shared ~/.agents root is scanned beside ~/.omp.
+func TestUnitOmpSpec(t *testing.T) {
+	spec, ok := hostSpecByID("omp")
+	if !ok {
+		t.Fatal("the matrix has no omp entry")
+	}
+
+	if spec.npm != "@oh-my-pi/pi-coding-agent" || spec.pin != "18.4.1" {
+		t.Fatalf("omp spec pins %s@%s, want @oh-my-pi/pi-coding-agent@18.4.1", spec.npm, spec.pin)
+	}
+
+	if !slices.Contains(spec.installRefs(), "bun") {
+		t.Fatalf("omp install refs = %v, want the bun launcher", spec.installRefs())
+	}
+
+	if !slices.Contains(spec.configDirs, ".agents") {
+		t.Fatalf("omp config dirs = %v, want the shared ~/.agents root", spec.configDirs)
+	}
+
+	if marker := filepath.ToSlash(looseSkillMarker("/home", "omp")); !strings.HasSuffix(marker, "/.agents/skills/e2e-skill/SKILL.md") {
+		t.Fatalf("omp loose marker = %q, want the shared ~/.agents skill tree", marker)
 	}
 }
 
