@@ -1242,6 +1242,9 @@ func TestOmpNullableMarketplaceShadow(t *testing.T) {
 
 				_, fromMarketplace := cli.Installed("caveman@beta")
 				So(fromMarketplace, ShouldBeFalse)
+
+				So(failure.Error(), ShouldContainSubstring, "from the npm registry instead")
+				So(failure.Error(), ShouldContainSubstring, "caveman@2.0.0-beta.137.1")
 			})
 		})
 	})

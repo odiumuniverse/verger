@@ -342,7 +342,7 @@ func (h *omp) verify(ctx context.Context, pkg Package, plan *ompInstall) (Oracle
 			Host:    string(Omp),
 			Package: pkg.ID,
 			Step:    stepVerify,
-			Cause:   fmt.Errorf("%s %s is not listed by the oracle", plan.installID(), pkg.Version),
+			Cause:   fmt.Errorf("%s %s is not listed by the oracle%s", plan.installID(), pkg.Version, registryNote(listed, plan.plugin)),
 		}
 	}
 
@@ -423,6 +423,22 @@ func (h *omp) resolveMarketplace(after, before []registeredMarketplace, pkg Pack
 	}
 
 	return "", false
+}
+
+// registryNote names a package the host installed from the npm registry under
+// the plugin's name instead of from the marketplace: a selector that is also a
+// dist-tag resolves there, and the operator has to remove it by hand, because
+// the recorded inverse names the marketplace selector, not the registry id.
+// A registry entry is the one shape the oracle reports without a marketplace.
+func registryNote(listed []Installed, plugin string) string {
+	for _, entry := range listed {
+		if entry.Name == plugin && entry.Marketplace == "" {
+			return fmt.Sprintf("; omp installed %s@%s from the npm registry instead — remove it by hand, a dist-tag selector resolves there",
+				plugin, entry.Version)
+		}
+	}
+
+	return ""
 }
 
 // installedFromMarketplace finds the plugin the host lists as installed from
