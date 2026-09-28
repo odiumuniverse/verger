@@ -10,7 +10,7 @@ LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 SIGN_IDENTITY?=odiumuniverse code signing
 SIGN_ID?=com.odiumuniverse.$(BINARY_NAME)
 
-.PHONY: all build sign clean test test-short lint lint-fix fmt vet run mod audit pre-commit help
+.PHONY: all build sign clean test test-short test-runtime runtime lint lint-fix fmt vet run mod audit pre-commit help
 
 all: fmt lint test build
 
@@ -37,6 +37,15 @@ test:
 
 test-short:
 	$(GO) test -short ./...
+
+## rebuild the host runtime bundle (runtime/ -> pkg/runtime/bundle, table)
+## the bundle is committed: `go build` and `go test` never need node
+runtime:
+	cd runtime && npm ci --no-audit --no-fund && npm run build
+
+## the runtime bundle's own tests: they run the built artifact under node
+test-runtime:
+	cd runtime && npm ci --no-audit --no-fund && npm test
 
 fmt:
 	golangci-lint fmt ./cmd/... ./pkg/...
@@ -69,6 +78,8 @@ help:
 		clean 'Clean build artifacts' \
 		test 'Run all tests with race detector' \
 		test-short 'Run tests without long-running ones' \
+		test-runtime 'Test the host runtime bundle under node' \
+		runtime 'Rebuild the host runtime bundle and table' \
 		lint 'Run linter' \
 		lint-fix 'Run linter and auto-fix issues' \
 		fmt 'Format code' \

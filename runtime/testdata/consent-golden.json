@@ -1,0 +1,25 @@
+{
+  "package": "acme/caveman",
+  "version": "1.2.3",
+  "hooks": [
+    {
+      "event": "pre-tool",
+      "matcher": "Bash",
+      "command": "node \"${PLUGIN_ROOT}/hooks/guard.js\"",
+      "timeout": 5
+    },
+    {
+      "event": "post-tool",
+      "matcher": "Edit|Write",
+      "command": "node \"${PLUGIN_ROOT}/hooks/format.js\"",
+      "timeout": 10
+    },
+    {
+      "event": "stop",
+      "matcher": "",
+      "command": "node \"${PLUGIN_ROOT}/hooks/bye.js\"",
+      "timeout": 0
+    }
+  ],
+  "hash": "847d9c6cfb2e80d63e2c637ceb761500367b3087d924fa3835b54d5d5d0d461b"
+}

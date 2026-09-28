@@ -31,6 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# Node dependencies of the host runtime build (the bundle itself is committed)
+/runtime/node_modules/
+
 # Build output
 /bin/
 

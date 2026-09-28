@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "comment": "Hook event mapping, one row per canonical event. A dialect value names the hook key the runtime registers; null means the dialect has no verified event for it and the hook is not registered (never guessed). Verified live: opencode 2.0.18 triggers 'tool/execute.before' and 'tool/execute.after' and publishes 'session.idle'; kilo 7.8.1 is the v1 dialect. v1 and pi names come from DESIGN 4.6 and beadle's research.",
+  "dialects": ["v1", "v2", "pi"],
+  "events": {
+    "pre-tool": {
+      "v1": "tool.execute.before",
+      "v2": "execute.before",
+      "pi": "tool_call",
+      "blocking": true
+    },
+    "post-tool": {
+      "v1": "tool.execute.after",
+      "v2": "execute.after",
+      "pi": "tool_result",
+      "blocking": false
+    },
+    "stop": {
+      "v1": "session.idle",
+      "v2": "session.idle",
+      "pi": "turn_end",
+      "blocking": false
+    },
+    "session-start": {
+      "v1": null,
+      "v2": null,
+      "pi": "session_start",
+      "blocking": false
+    },
+    "notification": {
+      "v1": null,
+      "v2": null,
+      "pi": null,
+      "blocking": false
+    }
+  },
+  "v2Namespaces": {
+    "execute.before": "tool",
+    "execute.after": "tool",
+    "session.idle": "event"
+  },
+  "tools": {
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "NotebookEdit": "edit",
+    "Bash": "bash",
+    "Grep": "grep",
+    "Glob": "glob",
+    "WebFetch": "webfetch",
+    "WebSearch": "websearch",
+    "Task": "task",
+    "Skill": "skill"
+  },
+  "aliases": {
+    "patch": "Edit",
+    "multiedit": "Edit",
+    "edit": "Edit",
+    "write": "Write",
+    "read": "Read",
+    "bash": "Bash",
+    "shell": "Bash",
+    "grep": "Grep",
+    "glob": "Glob",
+    "webfetch": "WebFetch",
+    "websearch": "WebSearch",
+    "task": "Task",
+    "subagent": "Task",
+    "skill": "Skill"
+  },
+  "uncategorised": "deny-under-blocking-matcher"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@verger/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "verger's host runtime: one ESM bundle that carries a package's Claude-dialect hooks into OpenCode v1/v2, Kilo and Pi.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}
