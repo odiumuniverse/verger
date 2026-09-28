@@ -1,16 +1,21 @@
 # e2e — container end-to-end driver (T1.13)
 
-Oracle-based e2e for the three Ф1 hosts (Claude, Codex, Gemini): the real CLIs
-are installed from npm in a `node:22-bookworm` container, the driver builds
+Oracle-based e2e for the adapters the driver knows: five legs (`claude`,
+`codex`, `gemini`, `omp`, `cursor`), of which the CI matrix runs the three
+that npm ships (`e2e/hosts.go`, `.github/workflows/e2e.yml`). The real CLIs are
+installed from npm in a `node:22-bookworm` container, the driver builds
 `verger`, runs install → status → host list → remove → status on a temp HOME,
 and asserts the host's own JSON output. **No LLM calls** — only
-`plugin/extensions list --json` oracles and file assertions.
+`plugin/extensions list --json` oracles and file assertions. `omp` and `cursor`
+run locally: omp needs the `bun` runtime beside it, and `cursor-agent` ships
+from cursor.com/install rather than npm, so no CI matrix entry would prove
+anything for it.
 
 ## Run locally (Docker)
 
 ```sh
 ./e2e/run.sh                # claude leg (builds the image once)
-./e2e/run.sh gemini         # claude|codex|gemini
+./e2e/run.sh gemini         # claude|codex|gemini|omp|cursor
 ./e2e/run.sh claude noimage # reuse an existing verger-e2e:local image
 ./e2e/run.sh claude negative # negative leg: no host CLI on PATH
 ./e2e/run.sh claude check   # preflight only: assert the scenario tests exist
