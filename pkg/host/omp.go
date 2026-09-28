@@ -52,6 +52,8 @@ const (
 	// (hookModulesDir).
 	ompHooksBlocked = "omp hooks are TS/JS modules under hooks/{pre,post}/ and have no declarative surface"
 	ompHooksDir     = "hooks" // hook modules, below the agent dir: hooks/{pre,post}/<name>.{ts,js}
+	// ompDefaultProfile is the profile name the host treats as "no profile".
+	ompDefaultProfile = "default"
 	// ompHookProbePrompt and ompHookProbeTime bound the only load check omp
 	// offers: a headless session start. Hook modules are compiled and imported
 	// before omp needs a model, so the probe works without credentials, and
@@ -958,15 +960,30 @@ func ompAgentDir(home string) string {
 	return filepath.Join(ompBase(home), ompAgentName)
 }
 
-// ompProfile is the active profile name, if any.
+// ompProfile is the active profile name, if any. The rules are the host's own,
+// measured against omp 18.4.1 with `omp config path` in an isolated HOME:
+// OMP_PROFILE decides whenever it is SET — an explicitly empty value means the
+// default profile and hides PI_PROFILE — the name `default` means the default
+// profile too, and PI_PROFILE is consulted only while OMP_PROFILE is unset.
+// Getting this wrong puts the lock, and every path derived from it, in a tree
+// the host does not read.
 func ompProfile() string {
-	for _, name := range []string{"OMP_PROFILE", "PI_PROFILE"} {
-		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			return value
-		}
+	if value, set := os.LookupEnv("OMP_PROFILE"); set {
+		return namedProfile(value)
 	}
 
-	return ""
+	return namedProfile(os.Getenv("PI_PROFILE"))
+}
+
+// namedProfile maps one profile variable onto a profile directory name; an empty
+// value or `default` selects the default profile, which has no directory.
+func namedProfile(value string) string {
+	name := strings.TrimSpace(value)
+	if name == "" || name == ompDefaultProfile {
+		return ""
+	}
+
+	return name
 }
 
 // absolutePath makes a path absolute, keeping it verbatim when that fails.

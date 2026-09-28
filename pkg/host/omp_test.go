@@ -96,6 +96,36 @@ func ompSecrets(t *testing.T) *secret.Store {
 	return secretStore(t, map[string]string{"MCP_TOKEN": "s3cr3t-token", "WEB_TOKEN": "web-token"})
 }
 
+// unsetEnv removes one variable for the duration of a test: `t.Setenv` can only
+// set a value, and the host distinguishes "unset" from "set but empty" for
+// OMP_PROFILE.
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+
+	previous, had := os.LookupEnv(name)
+
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("unset %s: %v", name, err)
+	}
+
+	t.Cleanup(func() {
+		if had {
+			//nolint:usetesting // restoring a value the test removed, not a variable the test owns
+			_ = os.Setenv(name, previous)
+		}
+	})
+}
+
+// newCursorlessOmp builds the omp adapter with the store and secrets the
+// fixture needs, for tests that do not care about the CLI.
+func newCursorlessOmp(t *testing.T, home string) (host.Host, *hostcli.ScriptRunner) {
+	t.Helper()
+
+	st := openStore(t)
+
+	return newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+}
+
 // ompPackage parses the omp fixture and adds the rule component the manifest
 // format does not carry.
 func ompPackage(t *testing.T) host.Package {
@@ -1405,13 +1435,23 @@ func TestOmpUninstallKeepsMarketplaceWhenListingUnclear(t *testing.T) {
 // root; PI_CONFIG_DIR moves the same state below <home>/<dir>).
 func TestOmpLockFollowsTheStateRoot(t *testing.T) {
 	cases := []struct {
-		name string
-		env  map[string]string
-		want string
+		name  string
+		env   map[string]string
+		unset []string
+		want  string
 	}{
-		{"default root", nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
-		{"named profile", map[string]string{"OMP_PROFILE": "work"}, filepath.Join(".omp", "profiles", "work", ".omp-plugin.verger.lock")},
-		{"pi config dir", map[string]string{"PI_CONFIG_DIR": "cfg"}, filepath.Join("cfg", ".omp-plugin.verger.lock")},
+		{"default root", nil, nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"named profile", map[string]string{"OMP_PROFILE": "work"}, nil, filepath.Join(".omp", "profiles", "work", ".omp-plugin.verger.lock")},
+		{"pi config dir", map[string]string{"PI_CONFIG_DIR": "cfg"}, nil, filepath.Join("cfg", ".omp-plugin.verger.lock")},
+		// The host's own profile rules, live-measured with `omp config path` on
+		// 18.4.1: `default` is no profile, an explicitly empty OMP_PROFILE hides
+		// PI_PROFILE, and PI_PROFILE only counts while OMP_PROFILE is unset.
+		{"OMP_PROFILE=default is the default root", map[string]string{"OMP_PROFILE": "default"}, nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"an empty OMP_PROFILE hides PI_PROFILE", map[string]string{"OMP_PROFILE": "", "PI_PROFILE": "work"}, nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"OMP_PROFILE=default hides PI_PROFILE", map[string]string{"OMP_PROFILE": "default", "PI_PROFILE": "work"}, nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"PI_PROFILE alone names the profile", map[string]string{"PI_PROFILE": "work"}, []string{"OMP_PROFILE"}, filepath.Join(".omp", "profiles", "work", ".omp-plugin.verger.lock")},
+		{"PI_PROFILE=default is the default root", map[string]string{"PI_PROFILE": "default"}, []string{"OMP_PROFILE"}, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"OMP_PROFILE wins over PI_PROFILE", map[string]string{"OMP_PROFILE": "work", "PI_PROFILE": "other"}, nil, filepath.Join(".omp", "profiles", "work", ".omp-plugin.verger.lock")},
 	}
 
 	for _, item := range cases {
@@ -1420,6 +1460,10 @@ func TestOmpLockFollowsTheStateRoot(t *testing.T) {
 
 			for name, value := range item.env {
 				t.Setenv(name, value)
+			}
+
+			for _, name := range item.unset {
+				unsetEnv(t, name)
 			}
 
 			ref := ompMarketplace(t, "acme-tools", "caveman", "1.2.3")
@@ -1437,6 +1481,62 @@ func TestOmpLockFollowsTheStateRoot(t *testing.T) {
 					So(fileExists(filepath.Join(home, item.want)), ShouldBeTrue)
 					So(fileExists(filepath.Join(home, ".omp", ".omp-plugin.verger.lock")), ShouldEqual, item.want == filepath.Join(".omp", ".omp-plugin.verger.lock"))
 				})
+			})
+		})
+	}
+}
+
+// TestOmpProfileMatchesTheHost pins the profile matrix against what the host
+// itself reports: the same table was measured with `omp config path` on
+// omp 18.4.1 in an isolated HOME, and the loose agent dir must follow it too.
+func TestOmpProfileMatchesTheHost(t *testing.T) {
+	cases := []struct {
+		name     string
+		env      map[string]string
+		unset    []string // variables that must be ABSENT, which t.Setenv cannot express
+		profiles string   // "" for the default root
+	}{
+		{"no variables", nil, nil, ""},
+		{"OMP_PROFILE=default", map[string]string{"OMP_PROFILE": "default"}, nil, ""},
+		{"empty OMP_PROFILE with PI_PROFILE=work", map[string]string{"OMP_PROFILE": "", "PI_PROFILE": "work"}, nil, ""},
+		{"OMP_PROFILE=work", map[string]string{"OMP_PROFILE": "work"}, nil, "work"},
+		{"PI_PROFILE=work with OMP_PROFILE unset", map[string]string{"PI_PROFILE": "work"}, []string{"OMP_PROFILE"}, "work"},
+		{"PI_PROFILE=default with OMP_PROFILE unset", map[string]string{"PI_PROFILE": "default"}, []string{"OMP_PROFILE"}, ""},
+		{"OMP_PROFILE=work over PI_PROFILE=other", map[string]string{"OMP_PROFILE": "work", "PI_PROFILE": "other"}, nil, "work"},
+		{"OMP_PROFILE=default over PI_PROFILE=work", map[string]string{"OMP_PROFILE": "default", "PI_PROFILE": "work"}, nil, ""},
+	}
+
+	for _, item := range cases {
+		Convey("Given "+item.name, t, func() {
+			fakeOmp(t)
+			clearOmpEnv(t)
+
+			for name, value := range item.env {
+				t.Setenv(name, value)
+			}
+
+			// "Not set" is a case of its own: the host ignores PI_PROFILE while
+			// OMP_PROFILE is set, an empty value included.
+			for _, name := range item.unset {
+				unsetEnv(t, name)
+			}
+
+			home := t.TempDir()
+
+			h, _ := newCursorlessOmp(t, home)
+
+			_, err := h.Deliver(t.Context(), home, host.Delivery{Package: ompPackage(t), Strategy: host.Loose})
+
+			Convey("Then the agent dir lands where the host reads it", func() {
+				So(err, ShouldBeNil)
+
+				want := filepath.Join(home, ".omp", "agent")
+				if item.profiles != "" {
+					want = filepath.Join(home, ".omp", "profiles", item.profiles, "agent")
+				}
+
+				So(fileExists(filepath.Join(want, "agents", "reviewer.md")), ShouldBeTrue)
+				So(fileExists(filepath.Join(home, ".omp", "agent", "agents", "reviewer.md")), ShouldEqual, item.profiles == "")
 			})
 		})
 	}
