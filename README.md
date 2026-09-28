@@ -12,7 +12,7 @@ without an adapter is accepted by `--hosts` and refused with
 | omp | native/synth/loose | green on omp 18.4.1 |
 | Codex | native/synth/loose | e2e leg exists; the last local run on this machine had no codex binary, so only unit tests and captured CLI output pin it |
 | Gemini CLI | native/synth/loose | e2e leg exists; same — unit tests and captured CLI output only |
-| Cursor | loose only (native/synth refused: `cursor-agent` has no plugin, extension or marketplace command; hooks and commands silenced with the reason) | live-verified on cursor-agent 2026.06.15 (skills → `~/.cursor/skills`, agents → `~/.cursor/agents`, MCP → `~/.cursor/mcp.json`); no CI leg — the CLI ships from cursor.com/install, not npm |
+| Cursor | loose only (native/synth refused: no `cursor-agent` subcommand registers a package, and verger does not deliver the documented `~/.cursor/plugins/local/<name>` form yet; hooks silenced — a flat camelCase dialect verger does not render) | live-verified on cursor-agent 2026.06.15: skills → `~/.cursor/skills`, agents → `~/.cursor/agents`, slash commands → `~/.cursor/commands`, MCP → `~/.cursor/mcp.json`, rules as the D23 skill wrapper (the delivery says so); no CI leg — the CLI ships from cursor.com/install, not npm |
 | Antigravity, OpenCode, Kilo, Pi, DeepSeek Harness | not implemented (Ф2, `docs/TASKS.md` T2.2) | — |
 
 - Desired state in `verger.toml`, exact versions and hashes in `verger.lock`,
@@ -35,8 +35,9 @@ without an adapter is accepted by `--hosts` and refused with
 
 Ф0 done; Ф1 (Claude/Codex/Gemini adapters, apply, CLI, e2e) — in review. The
 `omp` and `cursor` adapters landed after Ф1: the `omp` e2e leg is green on
-omp 18.4.1, `cursor` is live-verified on cursor-agent 2026.06.15 (loose only —
-the CLI has no plugin, extension or marketplace command). Ф2 — the remaining
+omp 18.4.1, `cursor` is live-verified on cursor-agent 2026.06.15 (loose only: no
+`cursor-agent` subcommand registers a package, so the CLI strata are refused with
+that reason). Ф2 — the remaining
 five adapters (Antigravity, OpenCode, Kilo, Pi, DeepSeek Harness), `pkg/caps` /
 `pkg/plan`, watcher, TUI — has not started (`docs/TASKS.md`), and the hosts it
 covers are not claimed above.
