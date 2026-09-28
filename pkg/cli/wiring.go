@@ -204,7 +204,7 @@ func (a *app) hosts(client *verger.Client) []host.Host {
 
 // targets filters detected hosts by --hosts/--except. Unknown names are
 // rejected by hostSet; a known name without a registered adapter is reported
-// as unavailable (not as an unknown host).
+// as unavailable, with the reason per host (unavailableHostsError).
 func (a *app) targets(client *verger.Client, adapters []host.Host) ([]host.Host, error) {
 	userHome, err := os.UserHomeDir()
 	if err != nil {
@@ -238,11 +238,49 @@ func (a *app) targets(client *verger.Client, adapters []host.Host) ([]host.Host,
 	}
 
 	if len(out) == 0 && len(only) > 0 {
-		return nil, fmt.Errorf("--hosts: no available adapter for %s (not registered or not detected)",
-			strings.Join(slices.Sorted(maps.Keys(only)), ", "))
+		return nil, unavailableHostsError(only, adapterIDs(adapters), except)
 	}
 
 	return out, nil
+}
+
+// adapterIDs indexes the registered adapters by host id: an id in this map is
+// one this build can deliver to, whether or not the machine was detected.
+func adapterIDs(adapters []host.Host) map[string]bool {
+	out := make(map[string]bool, len(adapters))
+
+	for _, adapter := range adapters {
+		out[string(adapter.ID())] = true
+	}
+
+	return out
+}
+
+// unavailableHostsError names why every requested host produced no adapter.
+// Three different problems share this path and must not share one message: a
+// host this build ships no adapter for (Ф2 work, not a machine problem), a
+// host the user excluded through --except, and a registered adapter the
+// machine does not detect (no CLI on PATH and no config under HOME — the
+// contract every adapter's Detect implements).
+func unavailableHostsError(only, registered, except map[string]bool) error {
+	parts := make([]string, 0, len(only))
+
+	for _, id := range slices.Sorted(maps.Keys(only)) {
+		switch {
+		case !registered[id]:
+			parts = append(parts, id+" (no adapter in this build; planned for Ф2)")
+		case except[id]:
+			parts = append(parts, id+" (excluded by --except)")
+		default:
+			parts = append(parts, id+" (adapter registered, but not detected: no CLI on PATH and no config under HOME)")
+		}
+	}
+
+	if len(parts) == 0 {
+		return fmt.Errorf("--hosts: no available adapter for %s", strings.Join(slices.Sorted(maps.Keys(only)), ", "))
+	}
+
+	return fmt.Errorf("--hosts: no available adapter for %s", strings.Join(parts, "; "))
 }
 
 // hostSet parses one comma-separated host list.
