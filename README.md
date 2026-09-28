@@ -12,12 +12,17 @@ without an adapter is accepted by `--hosts` and refused with
 | omp | native/synth/loose | green on omp 18.4.1 |
 | Codex | native/synth/loose | e2e leg exists; the last local run on this machine had no codex binary, so only unit tests and captured CLI output pin it |
 | Gemini CLI | native/synth/loose | e2e leg exists; same — unit tests and captured CLI output only |
-| Antigravity, Cursor, OpenCode, Kilo, Pi, DeepSeek Harness | not implemented (Ф2, `docs/TASKS.md` T2.2) | — |
+| Cursor | loose only (native/synth refused: `cursor-agent` has no plugin, extension or marketplace command; hooks and commands silenced with the reason) | live-verified on cursor-agent 2026.06.15 (skills → `~/.cursor/skills`, agents → `~/.cursor/agents`, MCP → `~/.cursor/mcp.json`); no CI leg — the CLI ships from cursor.com/install, not npm |
+| Antigravity, OpenCode, Kilo, Pi, DeepSeek Harness | not implemented (Ф2, `docs/TASKS.md` T2.2) | — |
 
 - Desired state in `verger.toml`, exact versions and hashes in `verger.lock`,
   what actually landed on disk in receipts.
 - Delivery per host is a pure function of the host's capabilities:
   `native → synth → loose → silenced(reason)`.
+- `verger status` prints the maturity of each host next to its cells
+  (`experimental` → `beta` after a green e2e run → `stable` after a full cycle
+  on a live machine): the evidence table is `pkg/cli/maturity.go` and its
+  default is `experimental`, so landing an adapter promotes nothing by itself.
 - A package installed by hand in an agent is adopted with `verger adopt
   <host:ref>`; the automatic spread to the other hosts (`verger watch`,
   guarded auto-remove) arrives in Ф2 — `watch` is a stub that says so today.
@@ -29,9 +34,12 @@ without an adapter is accepted by `--hosts` and refused with
 ## Status
 
 Ф0 done; Ф1 (Claude/Codex/Gemini adapters, apply, CLI, e2e) — in review. The
-`omp` adapter landed after Ф1 and its e2e leg is green on omp 18.4.1. Ф2 — the
-remaining six adapters, `pkg/caps`/`pkg/plan`, watcher, TUI — has not started
-(`docs/TASKS.md`), and the hosts it covers are not claimed above.
+`omp` and `cursor` adapters landed after Ф1: the `omp` e2e leg is green on
+omp 18.4.1, `cursor` is live-verified on cursor-agent 2026.06.15 (loose only —
+the CLI has no plugin, extension or marketplace command). Ф2 — the remaining
+five adapters (Antigravity, OpenCode, Kilo, Pi, DeepSeek Harness), `pkg/caps` /
+`pkg/plan`, watcher, TUI — has not started (`docs/TASKS.md`), and the hosts it
+covers are not claimed above.
 
 ## Development
 

@@ -57,7 +57,7 @@ active (pattern: beadle `pkg/cli/home_isolation_test.go`). A test that forgets i
 - `pkg/manifest` — format parsers → normalized Package
 - `pkg/pack` — chimera render (synth + `verger pack`)
 - `pkg/render` — hooks/agents/commands/mcp/rules→skill per dialect
-- `pkg/host` — Host interface + claude, codex, gemini, omp (landed; agy, cursor, opencode, kilo, pi, dsh arrive with Ф2/T2.2 — their ids exist, no adapter yet)
+- `pkg/host` — Host interface + claude, codex, gemini, omp, cursor (landed; agy, opencode, kilo, pi, dsh arrive with Ф2/T2.2 — their ids exist, no adapter yet)
 - `pkg/hostcli` — host CLI runner, probe, typed errors
 - `pkg/caps` — HostCaps, probe, capsHash
 - `pkg/plan` — pure plan function
