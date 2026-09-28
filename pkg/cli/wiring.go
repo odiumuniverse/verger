@@ -285,20 +285,35 @@ type receiptOwner struct {
 
 // Owner implements host.PathOwner.
 func (o receiptOwner) Owner(path string) (string, bool) {
+	record, _, ok := o.artifact(path)
+
+	return record.Package, ok
+}
+
+// ArtifactDigest implements host.ArtifactDigests: an unchanged MCP server is
+// re-delivered without a host call (NF-2).
+func (o receiptOwner) ArtifactDigest(path string) (digest.Hash, bool) {
+	_, artifact, ok := o.artifact(path)
+
+	return artifact.Digest, ok
+}
+
+// artifact finds the receipt and artifact recorded for one path.
+func (o receiptOwner) artifact(path string) (receipt.Receipt, receipt.Artifact, bool) {
 	list, err := o.receipts.List()
 	if err != nil {
-		return "", false
+		return receipt.Receipt{}, receipt.Artifact{}, false
 	}
 
 	for _, record := range list {
 		for _, artifact := range record.Artifacts {
 			if artifact.Path == path {
-				return record.Package, true
+				return record, artifact, true
 			}
 		}
 	}
 
-	return "", false
+	return receipt.Receipt{}, receipt.Artifact{}, false
 }
 
 // applyDeps assembles the executor dependencies of one scope.
