@@ -705,10 +705,16 @@ func parseOmpMarketplaces(out []byte) []registeredMarketplace {
 	return listed
 }
 
-// withPluginLock runs one omp plugin/marketplace mutation under a
-// process-exclusive advisory lock on the base root: omp's manager has no
-// cross-process locking of its own, so two verger runs (hosts are delivered in
-// parallel, pkg/apply) must not interleave their plugin writes.
+// withPluginLock runs one write to omp's state under a process-exclusive
+// advisory lock on the base root: omp's manager has no cross-process locking of
+// its own, so neither two verger runs (hosts are delivered in parallel,
+// pkg/apply) nor verger and another tool writing the same document may
+// interleave. The same file, <state root>/.omp-plugin.verger.lock, guards both
+// the plugin/marketplace mutations and the shared <agentDir>/mcp.json, which is
+// what makes the other writer's compare-and-swap meaningful. The wait is
+// bounded by Base.effectiveLockWait (DefaultLockWait, the same bound a sibling
+// tool uses on this file): a writer that cannot get in backs off with a clear
+// error instead of waiting for the user, and the next run retries.
 func (h *omp) withPluginLock(ctx context.Context, userHome string, run func() error) error {
 	dir := ompStateRoot(userHome)
 
@@ -718,10 +724,16 @@ func (h *omp) withPluginLock(ctx context.Context, userHome string, run func() er
 
 	fileLock := flock.New(filepath.Join(dir, ompPluginLock))
 
-	if _, err := fileLock.TryLockContext(ctx, lockRetryDelay); err != nil {
+	wait := h.base.effectiveLockWait()
+
+	lockCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+
+	if _, err := fileLock.TryLockContext(lockCtx, lockRetryDelay); err != nil {
 		return &DeliveryError{
 			Host: string(Omp), Step: stepInstall,
-			Cause: fmt.Errorf("another writer holds %s: %w", fileLock.Path(), err),
+			Cause: fmt.Errorf("another writer holds %s for more than %s; backing off, the file is theirs and the next run retries: %w",
+				fileLock.Path(), wait, err),
 		}
 	}
 

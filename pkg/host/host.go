@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/vmkteam/embedlog"
 
@@ -238,9 +239,15 @@ type ArtifactDigests interface {
 	ArtifactDigest(path string) (digest.Hash, bool)
 }
 
+// DefaultLockWait is how long a host write waits for another writer's lock
+// before backing off: the same 30s a sibling tool uses on the shared omp lock,
+// so neither side can starve the other and the next run retries.
+const DefaultLockWait = 30 * time.Second
+
 // Base holds the shared adapter dependencies; adapters embed it read-only.
 type Base struct {
 	home      string
+	lockWait  time.Duration
 	runner    hostcli.Runner
 	logger    embedlog.Logger
 	secrets   *secret.Store
@@ -252,6 +259,12 @@ type Base struct {
 
 // Option configures a Base.
 type Option func(*Base)
+
+// WithLockWait sets how long a host write waits for another writer's lock; the
+// zero value keeps DefaultLockWait.
+func WithLockWait(wait time.Duration) Option {
+	return func(b *Base) { b.lockWait = wait }
+}
 
 // WithHome sets the fallback user home used for config paths.
 func WithHome(home string) Option {
@@ -309,6 +322,15 @@ func newBase(opts []Option) *Base {
 	}
 
 	return b
+}
+
+// effectiveLockWait is the lock wait of this adapter.
+func (b *Base) effectiveLockWait() time.Duration {
+	if b.lockWait > 0 {
+		return b.lockWait
+	}
+
+	return DefaultLockWait
 }
 
 // effectiveHome returns the delivery home, falling back to Base.home.
