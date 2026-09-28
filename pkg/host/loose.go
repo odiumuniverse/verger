@@ -673,7 +673,7 @@ func (p *loosePlanner) command(component manifest.Component) error {
 	// A surface without a commands directory skips the component: joining an
 	// empty dir would plan a path relative to the process, not to the home.
 	if p.spec.commandsDir == "" {
-		p.note("%s: command %q has no directory on %s; skipped", component.Kind, component.Name, p.spec.host)
+		p.note("%s: command %q skipped: no commands directory is configured on this surface", component.Kind, component.Name)
 
 		return nil
 	}

@@ -130,6 +130,7 @@ func TestCursorLooseGolden(t *testing.T) {
 				So(err, ShouldBeNil)
 				So(homeFiles(t, home), ShouldResemble, []string{
 					".cursor/agents/reviewer.md",
+					".cursor/commands/dev.md",
 					".cursor/mcp.json",
 					".cursor/skills/alpha/SKILL.md",
 					".cursor/skills/alpha/scripts/run.sh",
@@ -139,12 +140,13 @@ func TestCursorLooseGolden(t *testing.T) {
 				So(runner.Calls(), ShouldBeEmpty)
 			})
 
-			Convey("Then the surfaces the host does not have are skipped with their reason", func() {
+			Convey("Then commands are delivered and the surfaces without a document say so", func() {
+				So(readTestFile(t, filepath.Join(cursorHome(home), "commands", "dev.md")), ShouldContainSubstring, "Run the dev loop.")
+
 				notes := strings.Join(res.Notes, "\n")
-				So(notes, ShouldContainSubstring, "command")
-				So(notes, ShouldContainSubstring, "has no directory on cursor; skipped")
 				So(notes, ShouldContainSubstring, "1 hook(s) skipped")
 				So(notes, ShouldContainSubstring, "camelCase events in hooks.json")
+				So(notes, ShouldContainSubstring, "rule is delivered as a skill wrapper")
 			})
 
 			Convey("Then the MCP servers land in mcp.json and the approval gate is named", func() {
@@ -190,7 +192,8 @@ func TestCursorNoInstaller(t *testing.T) {
 				Convey("Then it is refused with the missing installer named", func() {
 					unsupported, ok := errors.AsType[*host.NotSupportedError](err)
 					So(ok, ShouldBeTrue)
-					So(unsupported.Operation, ShouldContainSubstring, "no plugin, extension or marketplace command")
+					So(unsupported.Operation, ShouldContainSubstring, "no cursor-agent subcommand registers a package")
+					So(unsupported.Operation, ShouldContainSubstring, "plugins/local")
 					So(runner.Calls(), ShouldBeEmpty)
 				})
 			})
@@ -327,6 +330,102 @@ func TestCursorDigestOfFixture(t *testing.T) {
 		Convey("Then its skill tree digests", func() {
 			So(err, ShouldBeNil)
 			So(sum.Valid(), ShouldBeTrue)
+		})
+	})
+}
+
+// TestCursorCommandsSurface pins the surface the host documents itself:
+// "~/.cursor/commands/*.md" (its own migrate-to-skills skill, User row), so a
+// command component must be delivered there rather than skipped.
+func TestCursorCommandsSurface(t *testing.T) {
+	Convey("Given the Cursor fixture with its command", t, func() {
+		fakeCursor(t)
+
+		home := t.TempDir()
+		h, _ := newCursor(t, home, nil, host.WithStore(openStore(t)), host.WithSecrets(cursorSecrets(t)))
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: cursorPackage(t), Strategy: host.Loose})
+
+		Convey("When it is delivered", func() {
+			Convey("Then the command lands in the host's own commands directory", func() {
+				So(err, ShouldBeNil)
+				So(fileExists(filepath.Join(cursorHome(home), "commands", "dev.md")), ShouldBeTrue)
+			})
+		})
+	})
+}
+
+// TestCursorReDelivery pins the idempotent re-install: with a receipt that owns
+// the paths, the same delivery rewrites them and marks them pre-existing.
+func TestCursorReDelivery(t *testing.T) {
+	Convey("Given a delivered Cursor package", t, func() {
+		fakeCursor(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()),
+			host.WithSecrets(cursorSecrets(t)), host.WithOwnership(ownerExisting("acme/caveman")))
+
+		pkg := cursorPackage(t)
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose})
+		So(err, ShouldBeNil)
+
+		Convey("When it is delivered again", func() {
+			again, againErr := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose})
+
+			Convey("Then every artifact is rewritten and marked as pre-existing", func() {
+				So(againErr, ShouldBeNil)
+				So(again.Artifacts, ShouldNotBeEmpty)
+
+				for _, artifact := range again.Artifacts {
+					So(fileExists(artifact.Path), ShouldBeTrue)
+				}
+
+				ops := map[string]receipt.Op{}
+				for _, op := range again.RMA {
+					ops[op.Path] = op
+				}
+
+				So(ops[filepath.Join(cursorHome(home), "commands", "dev.md")].Existed, ShouldBeTrue)
+				So(ops[filepath.Join(cursorHome(home), "commands", "dev.md")].Backup, ShouldNotBeEmpty)
+			})
+		})
+	})
+}
+
+// TestCursorVersionFixture pins the captured CLI version the e2e pin and the
+// adapter's comments refer to.
+func TestCursorVersionFixture(t *testing.T) {
+	Convey("Given the captured cursor-agent version", t, func() {
+		version := strings.TrimSpace(cursorFixture(t, "version-2026.06.15.txt"))
+
+		Convey("Then it is the pinned release", func() {
+			So(version, ShouldEqual, "2026.06.15-18-00-12-6f5a2cf")
+		})
+	})
+}
+
+// TestCursorMCPProseSkipped pins the line-shape filter: a prose line is not a
+// server, even when it carries a colon.
+func TestCursorMCPProseSkipped(t *testing.T) {
+	Convey("Given a listing mixing servers and prose", t, func() {
+		fakeCursor(t)
+
+		h, _ := newCursor(t, t.TempDir(), map[string]hostcli.Response{
+			"cursor-agent mcp list": response("Note: no MCP servers configured\nfs: disabled\n"),
+		})
+
+		listed, err := h.Oracle().List(t.Context())
+
+		Convey("When it is read", func() {
+			Convey("Then only the server line becomes an entry", func() {
+				So(err, ShouldBeNil)
+				So(listed, ShouldHaveLength, 1)
+				So(listed[0].Name, ShouldEqual, "fs")
+				So(listed[0].Enabled, ShouldBeFalse)
+			})
 		})
 	})
 }

@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/manifest"
@@ -18,7 +19,10 @@ const (
 	cursorDirName   = ".cursor"
 	cursorSkillsDir = "skills"
 	cursorAgentsDir = "agents"
-	cursorMCPDoc    = "mcp.json"
+	// cursorCommandsDir is the user slash-command directory: "~/.cursor/commands/*.md"
+	// is the surface the host's own migrate-to-skills skill documents (User row).
+	cursorCommandsDir = "commands"
+	cursorMCPDoc      = "mcp.json"
 	// cursorMCPListArgs is the host's own MCP listing: the CLI prints one
 	// `<identifier>: <status>` line per configured server and has no JSON mode.
 	cursorMCPListArgs = "list"
@@ -32,9 +36,12 @@ const (
 )
 
 // cursor is the Cursor agent adapter. It is loose-only on purpose: cursor-agent
-// is a real CLI (the Ф1 design assumed a GUI-only host), but it has no package
-// manager at all — no plugin, extension or marketplace command — so there is no
-// native or synth rung to ride.
+// is a real CLI (the Ф1 design assumed a GUI-only host), but it exposes no
+// subcommand that registers a package with the host — only mcp, worker, models
+// and chat verbs — and the file-level plugin form the host documents
+// (`<home>/.cursor/plugins/local/<name>`) is not something verger delivers yet.
+// A GUI-side marketplace exists, so this is a gap in verger and in the CLI's
+// scriptable surface, not a claim that the host cannot have plugins.
 type cursor struct {
 	base *Base
 }
@@ -74,8 +81,10 @@ func (h *cursor) Deliver(ctx context.Context, home string, d Delivery) (Result, 
 	return deliverByStrategy(ctx, h.base, Cursor, home, d, h.deliverInstall, h.deliverLoose)
 }
 
-// deliverInstall refuses the CLI-driven strata: cursor-agent 2026.06 exposes
-// mcp/worker/models/chat commands only, with no way to register a package.
+// deliverInstall refuses the CLI-driven strata: cursor-agent 2026.06.15 exposes
+// mcp/worker/models/chat subcommands only, so verger has no scripted way to
+// register a package; the host's documented file-level form
+// (`<home>/.cursor/plugins/local/<name>`) is not implemented in this adapter yet.
 func (h *cursor) deliverInstall(_ context.Context, _ string, _ Delivery, synth bool) (Result, error) {
 	strategy := "native"
 	if synth {
@@ -84,14 +93,15 @@ func (h *cursor) deliverInstall(_ context.Context, _ string, _ Delivery, synth b
 
 	return Result{}, &NotSupportedError{
 		Host:      Cursor,
-		Operation: strategy + " delivery (cursor-agent has no plugin, extension or marketplace command)",
+		Operation: strategy + " delivery (no cursor-agent subcommand registers a package, and the host's file-level plugins/local form is not delivered by verger yet)",
 	}
 }
 
-// cursorSpec is the loose surface of the Cursor adapter: skills and agents
-// below the agent home, MCP servers in its mcp.json. Cursor has no commands
-// directory and its hook document is a dialect verger does not render, so both
-// components are skipped with a note rather than written somewhere invented.
+// cursorSpec is the loose surface of the Cursor adapter: skills, agents and
+// slash commands below the agent home, MCP servers in its mcp.json. Its hook
+// document is a dialect verger does not render yet, so hooks are skipped with a
+// note rather than written somewhere invented; a rule component keeps the D23
+// skill wrapper, which the delivery says out loud.
 func cursorSpec(userHome string) looseSpec {
 	dir := cursorConfigDir(userHome)
 
@@ -101,6 +111,7 @@ func cursorSpec(userHome string) looseSpec {
 		home:         userHome,
 		skillsDir:    filepath.Join(dir, cursorSkillsDir),
 		agentsDir:    filepath.Join(dir, cursorAgentsDir),
+		commandsDir:  filepath.Join(dir, cursorCommandsDir),
 		settingsPath: filepath.Join(dir, "hooks.json"),
 		hooksBlocked: cursorHooksBlocked,
 		mcpConfig: &mcpConfigSpec{
@@ -132,6 +143,16 @@ func (h *cursor) deliverLoose(ctx context.Context, home string, d Delivery) (Res
 	// list, so the delivery says so instead of leaving the user guessing.
 	if len(d.Package.MCP) > 0 && !d.DryRun {
 		result.Notes = append(result.Notes, cursorApprovalNote)
+	}
+
+	// Cursor rules (.cursor/rules/*.mdc) are a project-scoped surface with no
+	// user-level document this adapter verified, so a rule travels as the D23
+	// skill wrapper instead of a guessed rule file.
+	if slices.ContainsFunc(d.Package.Components, func(component manifest.Component) bool {
+		return component.Kind == manifest.KindRule
+	}) {
+		result.Notes = append(result.Notes, "a rule is delivered as a skill wrapper (rule-<name> below "+
+			filepath.Join(cursorDirName, cursorSkillsDir)+"); cursor's own rules surface is project-scoped and has no user document this adapter verified")
 	}
 
 	return result, err
@@ -183,17 +204,25 @@ func (o *cursorOracle) Validate(context.Context, string) ([]string, error) {
 // text, and the only administrative state the host reports is `disabled`:
 // a configured server answers "not loaded (needs approval)" whether or not it
 // has been approved, because this listing never starts a server (live-observed
-// for 2026.06.15), so only `disabled` makes an entry not enabled.
+// for 2026.06.15), so only `disabled` makes an entry not enabled. Two shapes are
+// prose rather than a server and are skipped: an identifier carrying whitespace,
+// and the host's informational line, which is worded "... configured ..."
+// (live-captured: "No MCP servers configured (expected in .cursor/mcp.json or
+// ~/.cursor/mcp.json)").
 func parseCursorMCP(out []byte) []Installed {
 	var listed []Installed
 
 	for line := range strings.SplitSeq(string(out), "\n") {
 		name, status, found := strings.Cut(strings.TrimSpace(line), ":")
-		if !found || strings.TrimSpace(name) == "" {
+		if !found || strings.TrimSpace(name) == "" || strings.ContainsAny(strings.TrimSpace(name), " \t") {
 			continue
 		}
 
 		state := strings.ToLower(strings.TrimSpace(status))
+
+		if strings.Contains(state, "configured") {
+			continue
+		}
 
 		listed = append(listed, Installed{
 			Name:    strings.TrimSpace(name),

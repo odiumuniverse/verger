@@ -1337,6 +1337,15 @@ func TestUnitCursorSpec(t *testing.T) {
 		t.Fatalf("cursor list args = %v, want the mcp listing", spec.listArgs)
 	}
 
+	captured, err := os.ReadFile(filepath.Join("..", "pkg", "host", "testdata", "cursor", "version-2026.06.15.txt"))
+	if err != nil {
+		t.Fatalf("read the captured cursor-agent version: %v", err)
+	}
+
+	if pin := strings.TrimSpace(string(captured)); pin != spec.pin {
+		t.Fatalf("cursor pin = %q, want the live-captured %q", spec.pin, pin)
+	}
+
 	if marker := filepath.ToSlash(looseSkillMarker("/home", "cursor")); !strings.HasSuffix(marker, "/.cursor/skills/e2e-skill/SKILL.md") {
 		t.Fatalf("cursor loose marker = %q", marker)
 	}

@@ -104,10 +104,11 @@ func hostSpecs() []hostSpec {
 			configDirs:  []string{".cursor"},
 			listArgs:    []string{"mcp", "list"},
 			hooksFile:   ".cursor/hooks.json",
-			// cursor-agent has no plugin, extension or marketplace command, so
-			// the fixture cannot be installed with the host itself.
-			adoptReason:      "cursor-agent has no plugin, extension or marketplace command",
-			noRegisterReason: "cursor-agent has no plugin, extension or marketplace command, so no stratum registers a package with the host",
+			// No cursor-agent subcommand registers a package with the host, and
+			// verger does not deliver the host's file-level plugins/local form
+			// yet, so the fixture cannot be installed with the host itself.
+			adoptReason:      "no cursor-agent subcommand registers a package; verger does not deliver ~/.cursor/plugins/local yet",
+			noRegisterReason: "no cursor-agent subcommand registers a package, so no stratum registers one with the host",
 			fixtureManifest:  ".claude-plugin/plugin.json",
 		},
 		{
