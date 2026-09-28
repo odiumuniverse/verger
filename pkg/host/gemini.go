@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,8 @@ import (
 	"github.com/odiumuniverse/verger/pkg/render"
 )
 
-// Gemini CLI argv words and surface names.
+// Gemini CLI argv words and surface names (Gemini CLI 0.61.0, verified live:
+// docs/reviews/T1.7-T1.8-grammar.probe.log).
 const (
 	wordGemini       = "gemini"
 	wordExtensions   = "extensions"
@@ -26,6 +28,9 @@ const (
 	flagOutputFormat = "--output-format"
 	wordJSON         = "json"
 	geminiDirName    = ".gemini"
+	// flagConsent acknowledges the install risk without a prompt; without it
+	// link/install ask for workspace trust and hang a non-interactive run.
+	flagConsent = "--consent"
 )
 
 // gemini is the Gemini CLI adapter.
@@ -114,10 +119,12 @@ func (h *gemini) deliverLoose(ctx context.Context, home string, d Delivery) (Res
 
 // geminiInstall is one native or synth extension install.
 type geminiInstall struct {
-	argv    []string
-	name    string // the extension name the host lists
-	source  string // synth: the dir the host links
-	overlay string // synth: a renamed copy of the synth dir (<owner>-<name>)
+	argv    []string // install or link argv; nil when the host already links the source
+	replace bool     // synth: uninstall the version the host links now, first
+	existed bool     // the extension existed before this delivery
+	name    string   // the extension name the host lists
+	source  string   // synth: the dir the host links
+	overlay string   // synth: a renamed copy of the synth dir (<owner>-<name>)
 	rma     []receipt.Op
 }
 
@@ -146,43 +153,61 @@ func (h *gemini) deliverInstall(ctx context.Context, home string, d Delivery, sy
 		return Result{Strategy: d.Strategy, RMA: slices.Clone(plan.rma), Notes: []string{"dry-run"}}, nil
 	}
 
+	artifacts, observed, err := h.install(ctx, d.Package, plan)
+
+	// The result is what execution produced even on error (NF-5).
+	return Result{Strategy: d.Strategy, Artifacts: artifacts, RMA: slices.Clone(plan.rma), Observed: observed}, err
+}
+
+// install stages the renamed copy, replaces a previously linked version,
+// links or installs, and verifies through the oracle; a synth extension is
+// recorded as an artifact that proves its name on the next delivery.
+func (h *gemini) install(ctx context.Context, pkg Package, plan geminiInstall) ([]receipt.Artifact, OracleResult, error) {
 	if plan.overlay != "" {
-		if err := stageRenamedExtension(ctx, d.Package.SynthDir, plan.overlay, plan.name); err != nil {
-			return Result{}, &DeliveryError{Host: string(Gemini), Package: d.Package.ID, Step: stepInstall, Cause: err}
+		if err := stageRenamedExtension(ctx, pkg.SynthDir, plan.overlay, plan.name); err != nil {
+			return nil, OracleResult{}, &DeliveryError{Host: string(Gemini), Package: pkg.ID, Step: stepInstall, Cause: err}
 		}
 	}
 
-	if _, err := h.base.run(ctx, wordGemini, plan.argv); err != nil {
-		return Result{}, err
+	// gemini refuses to link over an installed name ("already installed").
+	if plan.replace {
+		if _, err := h.base.run(ctx, wordGemini, []string{wordExtensions, wordUninstall, plan.name}); err != nil {
+			return nil, OracleResult{}, err
+		}
+	}
+
+	if plan.argv != nil {
+		if _, err := h.base.run(ctx, wordGemini, plan.argv); err != nil {
+			return nil, OracleResult{}, err
+		}
 	}
 
 	listed, err := h.Oracle().List(ctx)
 	if err != nil {
-		return Result{}, err
+		return nil, OracleResult{}, err
 	}
 
-	observed := OracleResult{Listed: listed, Verified: listedContains(listed, []string{plan.name})}
-	if !observed.Verified {
-		return Result{}, &DeliveryError{
+	if !listedContains(listed, []string{plan.name}) {
+		return nil, OracleResult{}, &DeliveryError{
 			Host:    string(Gemini),
-			Package: d.Package.ID,
+			Package: pkg.ID,
 			Step:    stepVerify,
 			Cause:   fmt.Errorf("%s is not listed by the oracle", plan.name),
 		}
 	}
 
-	var artifacts []receipt.Artifact
+	observed := OracleResult{Listed: listed, Verified: true}
 
-	if plan.source != "" {
-		sum, err := digest.Tree(plan.source)
-		if err != nil {
-			return Result{}, &DeliveryError{Host: string(Gemini), Package: d.Package.ID, Step: stepVerify, Cause: err}
-		}
-
-		artifacts = []receipt.Artifact{{Kind: "extension", Name: plan.name, Path: geminiExtensionPath(plan.name), Digest: sum}}
+	if plan.source == "" {
+		return nil, observed, nil
 	}
 
-	return Result{Strategy: d.Strategy, Artifacts: artifacts, RMA: plan.rma, Observed: observed}, nil
+	sum, err := digest.Tree(plan.source)
+	if err != nil {
+		return nil, observed, &DeliveryError{Host: string(Gemini), Package: pkg.ID, Step: stepVerify, Cause: err}
+	}
+
+	return []receipt.Artifact{{Kind: "extension", Name: plan.name, Path: geminiExtensionPath(plan.name), Digest: sum}}, observed, nil
 }
 
 // installPlan resolves the install argv of one delivery; synth links the
@@ -207,11 +232,11 @@ func (h *gemini) installPlan(ctx context.Context, d Delivery, synth bool) (gemin
 		}
 
 		plan.name = name
-		plan.argv = []string{wordExtensions, wordInstallCLI, d.Package.Marketplace}
+		plan.argv = []string{wordExtensions, wordInstallCLI, d.Package.Marketplace, flagConsent}
 	}
 
 	plan.rma = []receipt.Op{
-		{Kind: receipt.OpHostInstall, Command: []string{wordExtensions, wordUninstall, plan.name}},
+		{Kind: receipt.OpHostInstall, Command: []string{wordExtensions, wordUninstall, plan.name}, Existed: plan.existed},
 	}
 
 	return plan, nil
@@ -254,7 +279,16 @@ func (h *gemini) synthPlan(ctx context.Context, pkg Package) (geminiInstall, err
 		}
 	}
 
-	plan.argv = []string{wordExtensions, wordLink, plan.source}
+	// An extension of this name is verger's here (not foreign): the same dir
+	// linked again is a no-op, another version is replaced.
+	if index := slices.IndexFunc(listed, func(entry Installed) bool { return entry.Name == plan.name }); index >= 0 {
+		plan.existed = true
+		plan.replace = !samePath(listed[index].Path, plan.source)
+	}
+
+	if !plan.existed || plan.replace {
+		plan.argv = []string{wordExtensions, wordLink, plan.source, flagConsent}
+	}
 
 	return plan, nil
 }
@@ -317,23 +351,45 @@ func stageRenamedExtension(ctx context.Context, synthDir, overlay, name string) 
 }
 
 // Uninstall runs the host-install RMA ops in reverse order; file/tree ops are
-// executed by pkg/apply.
-func (h *gemini) Uninstall(ctx context.Context, home string, r receipt.Receipt) (Result, error) {
+// executed by pkg/apply. An extension that existed before the delivery (a
+// re-delivered own extension) is never removed by its inverse, and one the
+// host no longer knows is already removed.
+func (h *gemini) Uninstall(ctx context.Context, _ string, r receipt.Receipt) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 
-	for _, op := range slices.Backward(r.RMA) {
-		if op.Kind != receipt.OpHostInstall {
-			continue
-		}
-
-		if _, err := h.base.run(ctx, wordGemini, op.Command); err != nil {
-			return Result{}, err
-		}
+	notes, err := hostInverses(ctx, r, h.uninstallOp)
+	if err != nil {
+		return Result{}, err
 	}
 
-	return Result{Strategy: Strategy(r.Strategy)}, nil
+	return Result{Strategy: Strategy(r.Strategy), Notes: notes}, nil
+}
+
+// uninstallOp runs one host-install inverse. A malformed op (no argv) is a
+// receipt defect, reported rather than indexed into a panic.
+func (h *gemini) uninstallOp(ctx context.Context, op receipt.Op) (string, error) {
+	if len(op.Command) == 0 {
+		return "", fmt.Errorf("gemini: host-install op carries no argv (%+v)", op)
+	}
+
+	name := op.Command[len(op.Command)-1]
+
+	if op.Existed {
+		return "extension " + name + " existed before this delivery; kept", nil
+	}
+
+	_, err := h.base.run(ctx, wordGemini, op.Command)
+	if err == nil {
+		return "", nil
+	}
+
+	if exit, refused := errors.AsType[*hostcli.ExitError](err); refused && strings.Contains(exit.Stderr, "Extension not found") {
+		return "extension " + name + " was not installed; nothing to uninstall", nil
+	}
+
+	return "", err
 }
 
 // geminiOracle is the Gemini CLI oracle: list/validate JSON, never an LLM.
@@ -341,12 +397,16 @@ type geminiOracle struct {
 	base *Base
 }
 
-// List implements Oracle.
+// List implements Oracle. Gemini CLI 0.61.0 prints `extensions list`, JSON
+// included, to stderr and nothing to stdout (live-verified), so stderr is read
+// when stdout is empty.
 func (o *geminiOracle) List(ctx context.Context) ([]Installed, error) {
-	out, err := o.base.run(ctx, wordGemini, []string{wordExtensions, wordList, flagOutputFormat, wordJSON})
+	stdout, stderr, err := o.base.runStreams(ctx, wordGemini, []string{wordExtensions, wordList, flagOutputFormat, wordJSON})
 	if err != nil {
 		return nil, err
 	}
+
+	out := streamOutput(stdout, stderr)
 
 	listed, parseErr := parseInstalled(out)
 	if parseErr != nil {
@@ -356,17 +416,29 @@ func (o *geminiOracle) List(ctx context.Context) ([]Installed, error) {
 	return listed, nil
 }
 
+// streamOutput is what one host call reported: stdout, or stderr when the CLI
+// prints its result there (Gemini CLI 0.61.0 prints every `extensions` result,
+// JSON included, to stderr and leaves stdout empty).
+func streamOutput(stdout, stderr []byte) []byte {
+	if len(bytes.TrimSpace(stdout)) == 0 {
+		return stderr
+	}
+
+	return stdout
+}
+
 // Validate implements Oracle: the CLI subcommand when the host supports it,
 // else the manifest parser fallback (the CLI surface is unverified —
-// OQ-T1.8.1).
+// OQ-T1.8.1). Gemini CLI 0.61.0 prints the validate result to stderr, like
+// `extensions list`, so stderr is read when stdout is empty.
 func (o *geminiOracle) Validate(ctx context.Context, dir string) ([]string, error) {
-	out, err := o.base.run(ctx, wordGemini, []string{wordExtensions, wordValidate, dir})
+	stdout, stderr, err := o.base.runStreams(ctx, wordGemini, []string{wordExtensions, wordValidate, dir})
 	if err != nil {
 		if errors.Is(err, hostcli.ErrNotFound) || isUnknownSubcommand(err) {
 			return validateManifest(dir)
 		}
 
-		output := strings.TrimSpace(string(out))
+		output := strings.TrimSpace(string(streamOutput(stdout, stderr)))
 
 		if exit, ok := errors.AsType[*hostcli.ExitError](err); ok && output == "" {
 			output = exit.Stderr
@@ -375,7 +447,7 @@ func (o *geminiOracle) Validate(ctx context.Context, dir string) ([]string, erro
 		return nil, &OracleError{Host: string(Gemini), Output: output, Cause: err}
 	}
 
-	return warningLines(out), nil
+	return warningLines(streamOutput(stdout, stderr)), nil
 }
 
 // validateManifest is the offline validate fallback: parse the extension

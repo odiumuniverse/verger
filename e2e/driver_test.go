@@ -462,6 +462,21 @@ func assertStatus(t *testing.T, env Env, host, want string) cellDoc {
 	return cell
 }
 
+// hostOwnedFiles are files a host CLI owns outright inside the scanned config
+// dirs (matched by base name). verger never writes them, so a fixture mention
+// in them is the host's saved state, not residue of a verger delivery:
+//
+//   - gemini-cli 0.61.0's ~/.gemini/extension_integrity.json: an HMAC-SHA256
+//     store signed with a key in the macOS Keychain, exposed without a delete
+//     API (ExtensionIntegrityManager has only verify/store). Editing it
+//     surgically would invalidate the signature for every installed extension
+//     and deleting it would drop other tools' records, so verger must leave it
+//     alone — including on remove (pkg/host,
+//     TestGeminiUninstallLeavesHostOwnedIntegrityStore).
+var hostOwnedFiles = map[string]string{
+	"extension_integrity.json": "gemini-cli owns this signed store; verger never writes or deletes it",
+}
+
 // assertNoResidue scans the host's own directories for surviving mentions of
 // the fixture after remove.
 func assertNoResidue(t *testing.T, env Env, spec hostSpec) {
@@ -480,6 +495,12 @@ func assertNoResidue(t *testing.T, env Env, spec hostSpec) {
 			}
 
 			if entry.IsDir() {
+				return nil
+			}
+
+			if reason, owned := hostOwnedFiles[entry.Name()]; owned {
+				t.Logf("e2e: residue scan skips host-owned %s (%s)", path, reason)
+
 				return nil
 			}
 
@@ -564,6 +585,8 @@ func manualInstall(t *testing.T, env Env, spec hostSpec) {
 	switch spec.id {
 	case "claude":
 		manualInstallClaude(t, env)
+	case "codex":
+		manualInstallCodex(t, env)
 	case "gemini":
 		manualInstallGemini(t, env)
 	default:
@@ -606,11 +629,51 @@ func manualInstallClaude(t *testing.T, env Env) {
 	}
 }
 
-// manualInstallGemini links the fixture as an extension.
+// manualInstallCodex registers a local marketplace and adds the fixture from
+// it, the grammar the adapter runs for codex-cli 0.157.1: `plugin marketplace
+// add <dir> --json` (Codex reads the marketplace document at
+// .claude-plugin/marketplace.json, like Claude) then `plugin add
+// <plugin>@<marketplace>`. The fixture is copied under the marketplace root
+// because a plugin source must be a dir inside it.
+func manualInstallCodex(t *testing.T, env Env) {
+	t.Helper()
+
+	const marketplace = "e2e-market"
+
+	root := filepath.Join(env.Work, "marketplace")
+	if err := os.CopyFS(filepath.Join(root, "fixture"), os.DirFS(filepath.Join(env.Work, "fixture"))); err != nil {
+		t.Fatalf("e2e: copy fixture under the marketplace root: %v", err)
+	}
+
+	writeFile(t, filepath.Join(root, ".claude-plugin", "marketplace.json"), fmt.Sprintf(`{
+  "name": %q,
+  "owner": {"name": "e2e"},
+  "plugins": [
+    {"name": %q, "source": "./fixture", "description": "verger e2e fixture"}
+  ]
+}
+`, marketplace, fixtureName))
+
+	out, code := runHost(t, env, "codex", "plugin", "marketplace", "add", root, "--json")
+	if code != 0 {
+		t.Fatalf("e2e: codex plugin marketplace add -> %d\n%s", code, out)
+	}
+
+	ref := fixtureName + "@" + marketplace
+
+	out, code = runHost(t, env, "codex", "plugin", "add", ref)
+	if code != 0 {
+		t.Fatalf("e2e: codex plugin add %s -> %d\n%s", ref, code, out)
+	}
+}
+
+// manualInstallGemini links the fixture as an extension. --consent mirrors
+// the adapter's flagConsent: without it gemini-cli asks for workspace trust
+// and hangs a non-interactive run.
 func manualInstallGemini(t *testing.T, env Env) {
 	t.Helper()
 
-	out, code := runHost(t, env, "gemini", "extensions", "link", filepath.Join(env.Work, "fixture"))
+	out, code := runHost(t, env, "gemini", "extensions", "link", filepath.Join(env.Work, "fixture"), "--consent")
 	if code != 0 {
 		t.Fatalf("e2e: gemini extensions link -> %d\n%s", code, out)
 	}

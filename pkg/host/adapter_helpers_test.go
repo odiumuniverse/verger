@@ -333,6 +333,374 @@ func splitTestID(id string) (string, string) {
 	return id[:index], id[index+1:]
 }
 
+// codexCLI is a stateful fake of the codex-cli 0.157.1 plugin grammar with
+// the JSON shapes and refusal texts captured live
+// (docs/reviews/T1.7-T1.8-grammar.probe.log): marketplaces register under the
+// name their document declares, `plugin add` resolves through it (and moves
+// an installed plugin to the marketplace's version), `plugin remove` is
+// idempotent.
+type codexCLI struct {
+	mu           sync.Mutex
+	marketplaces map[string]string // name → root
+	installed    map[string]string // plugin@marketplace → version
+	fail         map[string]hostcli.Response
+	calls        []string
+	stale        bool // a re-add keeps the installed version (a stale host cache)
+}
+
+// newCodexCLI builds an empty fake.
+func newCodexCLI() *codexCLI {
+	return &codexCLI{marketplaces: map[string]string{}, installed: map[string]string{}, fail: map[string]hostcli.Response{}}
+}
+
+// Run implements hostcli.Runner.
+func (c *codexCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, error) {
+	key := strings.Join(args, " ")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.calls = append(c.calls, bin.Name+" "+key)
+
+	if resp, ok := c.fail[key]; ok {
+		return resp.Stdout, &hostcli.ExitError{Name: bin.Name, Code: resp.Code, Stderr: resp.Stderr}
+	}
+
+	return c.dispatch(key, args)
+}
+
+// dispatch routes one recorded call to the fake verb. --json is dropped first:
+// the fake answers the same body for it and does not parse flags.
+func (c *codexCLI) dispatch(key string, args []string) ([]byte, error) {
+	bare := slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == "--json" })
+
+	switch {
+	case len(bare) == 3 && bare[0] == "plugin" && bare[1] == "marketplace" && bare[2] == "list":
+		return c.marketplaceList()
+	case len(bare) == 4 && bare[0] == "plugin" && bare[1] == "marketplace":
+		return c.marketplace(bare[2], bare[3])
+	case len(bare) >= 2 && bare[0] == "plugin":
+		return c.dispatchPlugin(bare, key)
+	default:
+		return nil, codexRefused(2, "error: unrecognized subcommand '%s'", key)
+	}
+}
+
+// dispatchPlugin routes `plugin list` and `plugin <verb> <id>`; the caller has
+// already established the `plugin` root and a second argument.
+func (c *codexCLI) dispatchPlugin(bare []string, key string) ([]byte, error) {
+	switch {
+	case len(bare) == 2 && bare[1] == "list":
+		return c.pluginList()
+	case len(bare) == 3:
+		return c.plugin(bare[1], bare[2])
+	default:
+		return nil, codexRefused(2, "error: unrecognized subcommand '%s'", key)
+	}
+}
+
+// Calls returns the recorded calls as `<name> <joined args>` keys.
+func (c *codexCLI) Calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return slices.Clone(c.calls)
+}
+
+// Registered reports the root of a registered marketplace.
+func (c *codexCLI) Registered(name string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	root, ok := c.marketplaces[name]
+
+	return root, ok
+}
+
+// Installed reports the version of an installed plugin selector.
+func (c *codexCLI) Installed(id string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	version, ok := c.installed[id]
+
+	return version, ok
+}
+
+// codexRefused is a non-zero exit of the fake codex CLI.
+func codexRefused(code int, format string, args ...any) error {
+	return &hostcli.ExitError{Name: "codex", Code: code, Stderr: fmt.Sprintf(format, args...)}
+}
+
+// marketplaceList is `codex plugin marketplace list --json`.
+func (c *codexCLI) marketplaceList() ([]byte, error) {
+	out := []map[string]any{}
+
+	for _, name := range slices.Sorted(maps.Keys(c.marketplaces)) {
+		root := c.marketplaces[name]
+		out = append(out, map[string]any{
+			"name": name, "root": root,
+			"marketplaceSource": map[string]string{"sourceType": "local", "source": root},
+		})
+	}
+
+	return json.Marshal(map[string]any{"marketplaces": out})
+}
+
+// pluginList is `codex plugin list --json`.
+func (c *codexCLI) pluginList() ([]byte, error) {
+	out := []map[string]any{}
+
+	for _, id := range slices.Sorted(maps.Keys(c.installed)) {
+		plugin, marketplace := splitTestID(id)
+		out = append(out, map[string]any{
+			"pluginId": id, "name": plugin, "marketplaceName": marketplace, "version": c.installed[id],
+			"installed": true, "enabled": true, "installPolicy": "AVAILABLE", "authPolicy": "ON_INSTALL",
+		})
+	}
+
+	return json.Marshal(map[string]any{"installed": out, "available": []any{}})
+}
+
+// marketplace runs one `codex plugin marketplace add|remove <arg>`.
+func (c *codexCLI) marketplace(verb, arg string) ([]byte, error) {
+	switch verb {
+	case "add":
+		name, _, err := readTestMarketplace(arg)
+		if err != nil {
+			return nil, codexRefused(1, "Error: %v", err)
+		}
+
+		root, known := c.marketplaces[name]
+		if known && root != arg {
+			return nil, codexRefused(1, "Error: marketplace '%s' is already added from a different source; remove it before adding this source", name)
+		}
+
+		c.marketplaces[name] = arg
+
+		return json.Marshal(map[string]any{"marketplaceName": name, "installedRoot": arg, "alreadyAdded": known})
+	case "remove":
+		if _, ok := c.marketplaces[arg]; !ok {
+			return nil, codexRefused(1, "Error: marketplace `%s` is not configured or installed", arg)
+		}
+
+		delete(c.marketplaces, arg)
+
+		return json.Marshal(map[string]any{"marketplaceName": arg, "installedRoot": nil})
+	default:
+		return nil, codexRefused(2, "error: unrecognized subcommand '%s'", verb)
+	}
+}
+
+// plugin runs one `codex plugin add|remove <selector>`.
+func (c *codexCLI) plugin(verb, id string) ([]byte, error) {
+	switch verb {
+	case "add":
+		plugin, marketplace := splitTestID(id)
+
+		root, ok := c.marketplaces[marketplace]
+		if !ok {
+			return nil, codexRefused(1, "Error: marketplace `%s` is not configured or installed", marketplace)
+		}
+
+		version, err := testPluginVersion(root, plugin)
+		if err != nil {
+			return nil, codexRefused(1, "Error: %v", err)
+		}
+
+		if _, kept := c.installed[id]; !kept || !c.stale {
+			c.installed[id] = version
+		}
+
+		return []byte("Added plugin `" + plugin + "` from marketplace `" + marketplace + "`."), nil
+	case "remove":
+		plugin, marketplace := splitTestID(id)
+		delete(c.installed, id)
+
+		return []byte("Removed plugin `" + plugin + "` from marketplace `" + marketplace + "`."), nil
+	default:
+		return nil, codexRefused(2, "error: unrecognized subcommand '%s'", verb)
+	}
+}
+
+// testPluginVersion resolves a plugin's version through a dir marketplace.
+func testPluginVersion(root, plugin string) (string, error) {
+	_, sources, err := readTestMarketplace(root)
+	if err != nil {
+		return "", err
+	}
+
+	source, ok := sources[plugin]
+	if !ok {
+		return "", fmt.Errorf("plugin %q not found in marketplace %s", plugin, root)
+	}
+
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(source), ".claude-plugin", "plugin.json")) //nolint:gosec // G304: the fake reads its own temp store
+	if err != nil {
+		return "", err
+	}
+
+	var manifest struct {
+		Version string `json:"version"`
+	}
+
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return "", err
+	}
+
+	return manifest.Version, nil
+}
+
+// geminiCLI is a stateful fake of the Gemini CLI 0.61.0 extensions grammar
+// captured live: every `extensions` output goes to stderr (list JSON too),
+// link/install without --consent ask for workspace trust (here: refused), a
+// linked name cannot be linked again, and uninstall of an unknown name fails.
+type geminiCLI struct {
+	mu        sync.Mutex
+	installed map[string]string // extension name → path
+	// installDir is ~/.gemini/extensions when the world sets it: the CLI
+	// materializes a link there and removes it again on uninstall, while
+	// ~/.gemini/extension_integrity.json stays the CLI's alone.
+	installDir string
+	fail       map[string]hostcli.Response
+	calls      []string
+}
+
+// newGeminiCLI builds an empty fake.
+func newGeminiCLI() *geminiCLI {
+	return &geminiCLI{installed: map[string]string{}, fail: map[string]hostcli.Response{}}
+}
+
+// Run implements hostcli.Runner: stdout only, like a CLI printing to stderr.
+func (g *geminiCLI) Run(ctx context.Context, bin hostcli.Binary, args []string, stdin []byte) ([]byte, error) {
+	stdout, _, err := g.RunStreams(ctx, bin, args, stdin)
+
+	return stdout, err
+}
+
+// RunStreams implements hostcli.StreamRunner.
+func (g *geminiCLI) RunStreams(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, []byte, error) {
+	key := strings.Join(args, " ")
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.calls = append(g.calls, bin.Name+" "+key)
+
+	if resp, ok := g.fail[key]; ok {
+		return nil, []byte(resp.Stderr), &hostcli.ExitError{Name: bin.Name, Code: resp.Code, Stderr: resp.Stderr}
+	}
+
+	if len(args) < 2 || args[0] != "extensions" {
+		return nil, nil, &hostcli.ExitError{Name: bin.Name, Code: 1, Stderr: "Unknown arguments"}
+	}
+
+	consented := slices.Contains(args, "--consent")
+
+	switch args[1] {
+	case "list":
+		return nil, g.list(), nil
+	case "link", "install":
+		if !consented {
+			return nil, nil, &hostcli.ExitError{
+				Name: bin.Name, Code: 1,
+				Stderr: "The current workspace is not trusted. Do you want to trust this workspace to install extensions?",
+			}
+		}
+
+		return g.link(bin.Name, args[2])
+	case "uninstall":
+		name := args[2]
+		if _, ok := g.installed[name]; !ok {
+			stderr := `Failed to uninstall "` + name + `": Extension not found.`
+
+			return nil, []byte(stderr), &hostcli.ExitError{Name: bin.Name, Code: 1, Stderr: stderr}
+		}
+
+		delete(g.installed, name)
+
+		if g.installDir != "" {
+			_ = os.Remove(filepath.Join(g.installDir, name))
+		}
+
+		return nil, []byte(`Extension "` + name + `" successfully uninstalled.`), nil
+	default:
+		return nil, nil, &hostcli.ExitError{Name: bin.Name, Code: 1, Stderr: "Unknown arguments"}
+	}
+}
+
+// Calls returns the recorded calls as `<name> <joined args>` keys.
+func (g *geminiCLI) Calls() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return slices.Clone(g.calls)
+}
+
+// Linked reports the path of an installed extension.
+func (g *geminiCLI) Linked(name string) (string, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	path, ok := g.installed[name]
+
+	return path, ok
+}
+
+// list renders `extensions list -o json` (printed to stderr).
+func (g *geminiCLI) list() []byte {
+	out := []map[string]any{}
+
+	for _, name := range slices.Sorted(maps.Keys(g.installed)) {
+		path := g.installed[name]
+		out = append(out, map[string]any{
+			"name": name, "version": "1.0.0", "path": path, "isActive": true,
+			"installMetadata": map[string]string{"source": path, "type": "link"},
+			"skills":          []map[string]string{{"name": "nested", "extensionName": name}},
+		})
+	}
+
+	data, _ := json.MarshalIndent(out, "", "  ")
+
+	return data
+}
+
+// link registers the extension a dir's gemini-extension.json names.
+func (g *geminiCLI) link(bin, dir string) ([]byte, []byte, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "gemini-extension.json")) //nolint:gosec // G304: the fake reads its own temp store
+	if err != nil {
+		return nil, nil, &hostcli.ExitError{Name: bin, Code: 1, Stderr: "Install source not found."}
+	}
+
+	var manifest struct {
+		Name string `json:"name"`
+	}
+
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, nil, err
+	}
+
+	if _, ok := g.installed[manifest.Name]; ok {
+		stderr := `Extension "` + manifest.Name + `" is already installed. Please uninstall it first.`
+
+		return nil, []byte(stderr), &hostcli.ExitError{Name: bin, Code: 1, Stderr: stderr}
+	}
+
+	g.installed[manifest.Name] = dir
+
+	if g.installDir != "" {
+		if err := os.MkdirAll(g.installDir, 0o700); err != nil {
+			return nil, nil, err
+		}
+
+		if err := os.Symlink(dir, filepath.Join(g.installDir, manifest.Name)); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return nil, []byte(`Extension "` + manifest.Name + `" linked successfully and enabled.`), nil
+}
+
 // synthPackage lays out one synth package in the store the way pack.Write
 // does (<store>/synth/<owner>/<name>/<version>) with a Claude manifest named
 // after the plugin identity, and returns the package the CLI would deliver.

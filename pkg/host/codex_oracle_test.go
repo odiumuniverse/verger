@@ -3,6 +3,9 @@ package host_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -10,6 +13,50 @@ import (
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/hostcli"
 )
+
+// codexList is the real `codex plugin list --json` answer (codex-cli 0.157.1
+// shape, T1.7-G) for the installed plugin selectors.
+func codexList(ids ...string) string {
+	entries := make([]string, 0, len(ids))
+
+	for _, id := range ids {
+		plugin, marketplace, _ := strings.Cut(id, "@")
+		entries = append(entries, `{"pluginId":"`+id+`","name":"`+plugin+`","marketplaceName":"`+marketplace+
+			`","version":"1.2.3","installed":true,"enabled":true}`)
+	}
+
+	return `{"installed":[` + strings.Join(entries, ",") + `],"available":[]}`
+}
+
+// TestCodexOracleListRealShape pins the codex-cli 0.157.1 list
+// (testdata/codex/plugin-list-0.157.1.json, captured live; the `available`
+// entry is from `--available`): only installed plugins count, keyed by
+// pluginId/name/marketplaceName.
+func TestCodexOracleListRealShape(t *testing.T) {
+	Convey("Given the real codex plugin list output", t, func() {
+		fakeCodex(t)
+		home := t.TempDir()
+		t.Setenv("CODEX_HOME", "")
+
+		output, err := os.ReadFile(filepath.Join("testdata", "codex", "plugin-list-0.157.1.json"))
+		So(err, ShouldBeNil)
+
+		h, _ := newCodex(t, home, map[string]hostcli.Response{"codex plugin list --json": {Stdout: output}})
+
+		Convey("When the oracle lists it", func() {
+			listed, listErr := h.Oracle().List(t.Context())
+
+			Convey("Then the installed plugin comes back and the available one is not installed", func() {
+				// The list carries no install path; `source.path` is the
+				// marketplace copy, which the parser never takes for one.
+				So(listErr, ShouldBeNil)
+				So(listed, ShouldResemble, []host.Installed{{
+					Name: "foo", Marketplace: "acme", Version: "1.1.0", Enabled: true,
+				}})
+			})
+		})
+	})
+}
 
 func TestCodexOracleList(t *testing.T) {
 	Convey("Given a scripted codex plugin list", t, func() {
@@ -22,11 +69,10 @@ func TestCodexOracleList(t *testing.T) {
 			output string
 			want   int
 		}{
-			{"flat array", `[{"name":"a","version":"1"},{"name":"b"}]`, 2},
-			{"wrapped object", `{"plugins":[{"name":"a","marketplace":"m"}]}`, 1},
-			{"deep nesting", `{"data":{"installed":{"items":[{"name":"a","path":"/p"}]}}}`, 1},
+			{"the real empty list", `{"installed":[],"available":[]}`, 0},
+			{"a bare plugin id", `{"installed":[{"pluginId":"a@m","installed":true}]}`, 1},
+			{"legacy flat array", `[{"name":"a","version":"1"},{"name":"b"}]`, 2},
 			{"noise fields", `[{"foo":1,"name":"a","extra":{"x":true}},{"nope":2}]`, 1},
-			{"empty array", `[]`, 0},
 			{"empty object", `{}`, 0},
 		}
 
@@ -60,19 +106,6 @@ func TestCodexOracleList(t *testing.T) {
 			})
 		})
 
-		Convey("When the output is a non-container scalar", func() {
-			h, _ := newCodex(t, home, map[string]hostcli.Response{
-				"codex plugin list --json": response(`"ok"`),
-			})
-
-			_, err := h.Oracle().List(t.Context())
-
-			Convey("Then it is an *OracleError", func() {
-				_, ok := errors.AsType[*host.OracleError](err)
-				So(ok, ShouldBeTrue)
-			})
-		})
-
 		Convey("When the CLI exits non-zero", func() {
 			h, _ := newCodex(t, home, map[string]hostcli.Response{
 				"codex plugin list --json": {Code: 3, Stderr: "boom"},
@@ -102,62 +135,22 @@ func TestCodexOracleList(t *testing.T) {
 	})
 }
 
+// TestCodexOracleValidate pins that codex-cli 0.157.1 has no plugin validate
+// subcommand: validation is not supported and no call is made.
 func TestCodexOracleValidate(t *testing.T) {
-	Convey("Given a scripted codex plugin validate", t, func() {
+	Convey("Given the Codex oracle", t, func() {
 		fakeCodex(t)
 		home := t.TempDir()
 		t.Setenv("CODEX_HOME", "")
 
-		Convey("When validation succeeds with output", func() {
-			h, runner := newCodex(t, home, map[string]hostcli.Response{
-				"codex plugin validate /tmp/synth": response("warning one\nwarning two\n\n"),
-			})
+		h, runner := newCodex(t, home, nil)
 
-			warnings, err := h.Oracle().Validate(t.Context(), "/tmp/synth")
-
-			Convey("Then every output line is a warning", func() {
-				So(err, ShouldBeNil)
-				So(warnings, ShouldResemble, []string{"warning one", "warning two"})
-				So(callKeys(runner), ShouldResemble, []string{"codex plugin validate /tmp/synth"})
-			})
-		})
-
-		Convey("When validation fails", func() {
-			h, _ := newCodex(t, home, map[string]hostcli.Response{
-				"codex plugin validate /tmp/synth": {Code: 1, Stderr: "plugin.json invalid"},
-			})
-
+		Convey("When a synth dir is validated", func() {
 			_, err := h.Oracle().Validate(t.Context(), "/tmp/synth")
 
-			Convey("Then it is an *OracleError carrying the output", func() {
-				typed, ok := errors.AsType[*host.OracleError](err)
-				So(ok, ShouldBeTrue)
-				So(typed.Host, ShouldEqual, "codex")
-				So(typed.Output, ShouldContainSubstring, "plugin.json invalid")
-			})
-		})
-
-		Convey("When the CLI has no validate subcommand", func() {
-			h, _ := newCodex(t, home, map[string]hostcli.Response{
-				"codex plugin validate /tmp/synth": {Code: 2, Stderr: "error: unrecognized subcommand 'validate'"},
-			})
-
-			_, err := h.Oracle().Validate(t.Context(), "/tmp/synth")
-
-			Convey("Then it reports ErrNotSupported", func() {
+			Convey("Then it reports ErrNotSupported without a call", func() {
 				So(errors.Is(err, host.ErrNotSupported), ShouldBeTrue)
-			})
-		})
-
-		Convey("When the codex binary is missing", func() {
-			t.Setenv("PATH", t.TempDir())
-
-			h, _ := newCodex(t, home, nil)
-
-			_, err := h.Oracle().Validate(t.Context(), "/tmp/synth")
-
-			Convey("Then it reports ErrNotSupported", func() {
-				So(errors.Is(err, host.ErrNotSupported), ShouldBeTrue)
+				So(runner.Calls(), ShouldBeEmpty)
 			})
 		})
 	})

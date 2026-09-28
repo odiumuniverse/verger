@@ -20,6 +20,13 @@ type Runner interface {
 	Run(ctx context.Context, bin Binary, args []string, stdin []byte) (stdout []byte, err error)
 }
 
+// StreamRunner is a Runner that also returns what the child wrote to stderr
+// when it succeeds: some host CLIs print their results there (Gemini CLI 0.61
+// prints `extensions list` output, JSON included, to stderr).
+type StreamRunner interface {
+	RunStreams(ctx context.Context, bin Binary, args []string, stdin []byte) (stdout, stderr []byte, err error)
+}
+
 // ExecRunner runs the resolved binary as a child process, never through a
 // shell: arguments are passed verbatim.
 type ExecRunner struct{}
@@ -27,9 +34,16 @@ type ExecRunner struct{}
 // Run executes bin with args and stdin. A canceled context surfaces ctx.Err();
 // a binary that vanished before it ran is ErrNotFound; one that ran and exited
 // non-zero is an *ExitError carrying its code and stderr.
-func (ExecRunner) Run(ctx context.Context, bin Binary, args []string, stdin []byte) ([]byte, error) {
+func (r ExecRunner) Run(ctx context.Context, bin Binary, args []string, stdin []byte) ([]byte, error) {
+	stdout, _, err := r.RunStreams(ctx, bin, args, stdin)
+
+	return stdout, err
+}
+
+// RunStreams implements StreamRunner with the semantics of Run.
+func (ExecRunner) RunStreams(ctx context.Context, bin Binary, args []string, stdin []byte) ([]byte, []byte, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%s: %w", bin.Name, err)
+		return nil, nil, fmt.Errorf("%s: %w", bin.Name, err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -46,18 +60,18 @@ func (ExecRunner) Run(ctx context.Context, bin Binary, args []string, stdin []by
 	err := cmd.Run()
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return stdout.Bytes(), fmt.Errorf("%s: %w", bin.Name, ctxErr)
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s: %w", bin.Name, ctxErr)
 	}
 
 	switch exitErr, exited := errors.AsType[*exec.ExitError](err); {
 	case err == nil:
-		return stdout.Bytes(), nil
+		return stdout.Bytes(), stderr.Bytes(), nil
 	case exited:
-		return stdout.Bytes(), &ExitError{Name: bin.Name, Code: exitErr.ExitCode(), Stderr: stderr.String(), Err: exitErr}
+		return stdout.Bytes(), stderr.Bytes(), &ExitError{Name: bin.Name, Code: exitErr.ExitCode(), Stderr: stderr.String(), Err: exitErr}
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, exec.ErrNotFound):
-		return stdout.Bytes(), fmt.Errorf("%s: %w: %w", bin.Name, ErrNotFound, err)
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s: %w: %w", bin.Name, ErrNotFound, err)
 	default:
-		return stdout.Bytes(), fmt.Errorf("%s: %w", bin.Name, err)
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s: %w", bin.Name, err)
 	}
 }
 
@@ -73,6 +87,27 @@ func (b Binary) RunWith(ctx context.Context, r Runner, args []string, stdin []by
 	}
 
 	return r.Run(ctx, b, args, stdin)
+}
+
+// RunStreamsWith is RunWith returning stderr as well: through the runner's
+// StreamRunner when it has one, else stderr is nil (the runner cannot report
+// it). A nil runner uses ExecRunner.
+func (b Binary) RunStreamsWith(ctx context.Context, r Runner, args []string, stdin []byte) ([]byte, []byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", b.Name, err)
+	}
+
+	if r == nil {
+		r = ExecRunner{}
+	}
+
+	if streams, ok := r.(StreamRunner); ok {
+		return streams.RunStreams(ctx, b, args, stdin)
+	}
+
+	stdout, err := r.Run(ctx, b, args, stdin)
+
+	return stdout, nil, err
 }
 
 // Run is RunWith with ExecRunner (kept for beadle parity).
@@ -127,8 +162,16 @@ func NewScriptRunner(script map[string]Response) *ScriptRunner {
 
 // Run implements Runner.
 func (s *ScriptRunner) Run(ctx context.Context, bin Binary, args []string, stdin []byte) ([]byte, error) {
+	stdout, _, err := s.RunStreams(ctx, bin, args, stdin)
+
+	return stdout, err
+}
+
+// RunStreams implements StreamRunner: the scripted Stderr is returned on
+// success too, like a CLI that prints its results there.
+func (s *ScriptRunner) RunStreams(ctx context.Context, bin Binary, args []string, stdin []byte) ([]byte, []byte, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%s: %w", bin.Name, err)
+		return nil, nil, fmt.Errorf("%s: %w", bin.Name, err)
 	}
 
 	key := scriptKey(bin.Name, args)
@@ -138,15 +181,17 @@ func (s *ScriptRunner) Run(ctx context.Context, bin Binary, args []string, stdin
 	response, ok := s.responses[key]
 	s.mu.Unlock()
 
+	stderr := []byte(response.Stderr)
+
 	switch {
 	case !ok:
-		return nil, &ExitError{Name: bin.Name, Code: 127, Stderr: "no scripted response"}
+		return nil, nil, &ExitError{Name: bin.Name, Code: 127, Stderr: "no scripted response"}
 	case response.Err != nil:
-		return bytes.Clone(response.Stdout), response.Err
+		return bytes.Clone(response.Stdout), stderr, response.Err
 	case response.Code != 0:
-		return bytes.Clone(response.Stdout), &ExitError{Name: bin.Name, Code: response.Code, Stderr: response.Stderr}
+		return bytes.Clone(response.Stdout), stderr, &ExitError{Name: bin.Name, Code: response.Code, Stderr: response.Stderr}
 	default:
-		return bytes.Clone(response.Stdout), nil
+		return bytes.Clone(response.Stdout), stderr, nil
 	}
 }
 

@@ -1,0 +1,13 @@
+{
+  "store": {
+    "e2e-fixture": {
+      "hash": "48d77f037362a7836e62d03bf3e856c2aae80bb89ceef3faf3182ebd74c6d667",
+      "signature": "feb0a921d9ecc682c375f8036fe8126e0977e02dbbdff2784944123997b64271"
+    },
+    "foreign-tool": {
+      "hash": "c8ba5dc0051c0232b3b5c74e4a52b5f243ae5940de18d7859fdbf91b9df5dd97",
+      "signature": "f7e6a2027b078afca3d21c57c0b5c3c3652fc1cee7404d90cf98d6e637cd8e1a"
+    }
+  },
+  "signature": "96aabc9429c8d22c3e68e9ecb02a4192625d64b71c49a73ea0c49b915a2b2cba"
+}

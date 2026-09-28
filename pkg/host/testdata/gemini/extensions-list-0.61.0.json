@@ -1,0 +1,25 @@
+[
+  {
+    "name": "foo",
+    "version": "1.0.0",
+    "path": "/home/u/ext/foo",
+    "contextFiles": [],
+    "installMetadata": {
+      "source": "/home/u/ext/foo",
+      "type": "link"
+    },
+    "isActive": true,
+    "id": "b1a381feb6c27054fc10a195f76f02dea67500aee223e35d72511fb4cbe80cde",
+    "resolvedSettings": [],
+    "skills": [
+      {
+        "name": "s1",
+        "description": "d",
+        "location": "/home/u/ext/foo/skills/s1/SKILL.md",
+        "body": "x",
+        "extensionName": "foo"
+      }
+    ],
+    "agents": []
+  }
+]

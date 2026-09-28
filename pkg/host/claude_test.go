@@ -73,12 +73,6 @@ func claudeList(ids ...string) string {
 	return "[" + strings.Join(entries, ",") + "]"
 }
 
-// matchingList is the legacy name-shaped oracle answer, kept for the hosts
-// whose real list shape is unverified (Codex OQ-T1.7.1, Gemini OQ-T1.8.1).
-func matchingList(name string) string {
-	return `[{"name":"` + name + `","marketplace":"plugins","version":"1.2.3","path":"/tmp/plugin"}]`
-}
-
 func TestClaudeDetect(t *testing.T) {
 	Convey("Given a home without a Claude config dir", t, func() {
 		home := t.TempDir()

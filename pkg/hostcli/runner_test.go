@@ -325,6 +325,88 @@ func TestRunWith(t *testing.T) {
 	})
 }
 
+// TestRunStreamsWith pins the stderr channel of a successful call: Gemini CLI
+// 0.61 prints `extensions list` (JSON included) to stderr and nothing to
+// stdout, so a caller that reads only stdout sees an empty result.
+func TestRunStreamsWith(t *testing.T) {
+	Convey("Given a CLI that prints its result to stderr and succeeds", t, func() {
+		dir := t.TempDir()
+		path := script(t, dir, "gemini", "#!/bin/sh\nprintf 'on-stdout\\n'\nprintf '[{\"name\":\"foo\"}]\\n' >&2\n", 0o755)
+		bin := hostcli.Binary{Name: "gemini", Path: path}
+
+		Convey("When it runs through ExecRunner streams", func() {
+			stdout, stderr, err := bin.RunStreamsWith(t.Context(), nil, nil, nil)
+
+			Convey("Then both streams come back and Run still returns stdout alone", func() {
+				So(err, ShouldBeNil)
+				So(string(stdout), ShouldEqual, "on-stdout\n")
+				So(string(stderr), ShouldEqual, "[{\"name\":\"foo\"}]\n")
+
+				out, runErr := bin.RunWith(t.Context(), nil, nil, nil)
+				So(runErr, ShouldBeNil)
+				So(string(out), ShouldEqual, "on-stdout\n")
+			})
+		})
+
+		Convey("When it fails", func() {
+			failing := hostcli.Binary{Name: "gemini", Path: fixture(t, "fail.sh")}
+
+			stdout, stderr, err := failing.RunStreamsWith(t.Context(), hostcli.ExecRunner{}, nil, nil)
+
+			Convey("Then the streams and the *ExitError come back", func() {
+				_, ok := errors.AsType[*hostcli.ExitError](err)
+				So(ok, ShouldBeTrue)
+				So(string(stdout), ShouldEqual, "partial-out\n")
+				So(string(stderr), ShouldEqual, "boom on stderr\n")
+			})
+		})
+	})
+
+	Convey("Given a scripted success carrying stderr", t, func() {
+		runner := hostcli.NewScriptRunner(map[string]hostcli.Response{
+			"gemini extensions list -o json": {Stderr: "[]\n"},
+		})
+		bin := hostcli.Binary{Name: "gemini", Path: "/resolved/gemini"}
+
+		Convey("When it runs through the streams", func() {
+			stdout, stderr, err := bin.RunStreamsWith(t.Context(), runner, []string{"extensions", "list", "-o", "json"}, nil)
+
+			Convey("Then the scripted stderr comes back on success", func() {
+				So(err, ShouldBeNil)
+				So(stdout, ShouldBeEmpty)
+				So(string(stderr), ShouldEqual, "[]\n")
+			})
+		})
+	})
+
+	Convey("Given a runner without streams", t, func() {
+		runner := runnerFunc(func(context.Context, hostcli.Binary, []string, []byte) ([]byte, error) {
+			return []byte("only-stdout"), nil
+		})
+
+		Convey("When the streams are asked", func() {
+			stdout, stderr, err := hostcli.Binary{Name: "gemini"}.RunStreamsWith(t.Context(), runner, nil, nil)
+
+			Convey("Then stdout comes back and stderr is unknown", func() {
+				So(err, ShouldBeNil)
+				So(string(stdout), ShouldEqual, "only-stdout")
+				So(stderr, ShouldBeNil)
+			})
+		})
+
+		Convey("When the context is canceled", func() {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			_, _, err := hostcli.Binary{Name: "gemini"}.RunStreamsWith(ctx, runner, nil, nil)
+
+			Convey("Then the cancellation surfaces before the runner runs", func() {
+				So(errors.Is(err, context.Canceled), ShouldBeTrue)
+			})
+		})
+	})
+}
+
 func TestScriptRunner(t *testing.T) {
 	bin := hostcli.Binary{Name: "claude", Path: "/resolved/claude"}
 

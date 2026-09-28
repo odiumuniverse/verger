@@ -27,6 +27,7 @@ const (
 	wordUninstall   = "uninstall"
 	wordUpdate      = "update"
 	wordMCP         = "mcp"
+	wordRemove      = "remove"
 	wordRm          = "rm"
 	wordAdd         = "add"
 	wordList        = "list"
@@ -232,37 +233,9 @@ func (h *claude) installPlan(ctx context.Context, d Delivery, synth bool) (insta
 // foreign marketplace of that name — then <owner>-verger; a plugin name
 // another package of the owner holds is refused. Only read-only host calls.
 func (h *claude) synthPlan(ctx context.Context, pkg Package) (installPlan, error) {
-	layout, err := newSynthLayout(Claude, pkg)
+	layout, name, isRegistered, err := ownerMarketplacePlan(ctx, Claude, pkg, h.marketplaces)
 	if err != nil {
 		return installPlan{}, err
-	}
-
-	current, entries, ok, err := layout.readDoc()
-	if err != nil {
-		return installPlan{}, &DeliveryError{Host: string(Claude), Package: pkg.ID, Step: stepPlan, Cause: err}
-	}
-
-	if err := layout.checkClaim(entries); err != nil {
-		return installPlan{}, &DeliveryError{Host: string(Claude), Package: pkg.ID, Step: stepPlan, Cause: err}
-	}
-
-	preferred := layout.identity.Owner
-	if ok {
-		preferred = current
-	}
-
-	registered, err := h.marketplaces(ctx)
-	if err != nil {
-		return installPlan{}, err
-	}
-
-	name, isRegistered, free := layout.chooseMarketplace(preferred, registered)
-	if !free {
-		return installPlan{}, &render.HandsOffError{
-			Path: "claude://marketplace/" + layout.identity.Owner, KeyPath: layout.identity.Owner,
-			Reason: "the host already has foreign marketplaces named " + layout.identity.Owner +
-				" and " + layout.identity.Owner + collisionSuffix,
-		}
 	}
 
 	plan := newInstallPlan(layout.root, layout.identity.Name, name)
@@ -426,7 +399,12 @@ func (h *claude) removeMCPServer(ctx context.Context, op receipt.Op) (string, er
 
 // isMCPRemove reports whether argv is `mcp remove … <name>`.
 func isMCPRemove(argv []string) bool {
-	return len(argv) >= 3 && argv[0] == wordMCP && argv[1] == "remove"
+	return len(argv) >= 3 && argv[0] == wordMCP && argv[1] == wordRemove
+}
+
+// isUninstallCommand reports whether argv is the Claude `plugin uninstall <id>` op.
+func isUninstallCommand(argv []string) bool {
+	return len(argv) == 3 && argv[0] == wordPlugin && argv[1] == wordUninstall
 }
 
 // uninstallPlugin uninstalls one plugin id; a refusal for a plugin the host
@@ -533,7 +511,7 @@ func removeEmptyDir(dir string) {
 
 // isMarketplaceRemove reports whether argv is `plugin marketplace rm|remove <name>`.
 func isMarketplaceRemove(argv []string) bool {
-	return len(argv) == 4 && argv[0] == wordPlugin && argv[1] == wordMarketplace && (argv[2] == wordRm || argv[2] == "remove")
+	return len(argv) == 4 && argv[0] == wordPlugin && argv[1] == wordMarketplace && (argv[2] == wordRm || argv[2] == wordRemove)
 }
 
 // claudeOracle is the Claude CLI oracle: list/validate JSON, never an LLM.
@@ -594,8 +572,9 @@ func parseInstalled(output []byte) ([]Installed, error) {
 	return listed, nil
 }
 
-// emptyContainer reports whether a parsed JSON value is an empty list, object
-// or null: a valid "nothing installed".
+// emptyContainer reports whether a parsed JSON value is an empty list, null,
+// or an object holding only empty containers (codex-cli 0.157.1 answers
+// `{"installed":[],"available":[]}`): a valid "nothing installed".
 func emptyContainer(value any) bool {
 	switch typed := value.(type) {
 	case nil:
@@ -603,7 +582,13 @@ func emptyContainer(value any) bool {
 	case []any:
 		return len(typed) == 0
 	case map[string]any:
-		return len(typed) == 0
+		for _, item := range typed {
+			if !emptyContainer(item) {
+				return false
+			}
+		}
+
+		return true
 	default:
 		return false
 	}
@@ -631,10 +616,20 @@ func collectInstalled(value any, listed *[]Installed) {
 	}
 }
 
-// installedEntry reads one plugin entry: a `name`, or an `id` of the form
-// "<name>@<marketplace>" (split at the last @). Anything else is not an entry.
+// installedEntry reads one plugin entry of any live shape:
+//   - Claude Code 2.1.283: `id` "<name>@<marketplace>", `installPath`;
+//   - codex-cli 0.157.1: `pluginId`, `name`, `marketplaceName`, `installed`;
+//   - Gemini CLI 0.61.0: `name`, `path`, `isActive` (its `id` is a hash);
+//   - the legacy `{name, marketplace, path}`.
+//
+// An id is split at the last @. An entry reporting `installed: false` (Codex
+// --available) is not installed. Anything without a name is not an entry.
 func installedEntry(object map[string]any) (Installed, bool) {
-	idName, idMarketplace := splitPluginID(stringField(object, "id"))
+	if installed, reported := object["installed"].(bool); reported && !installed {
+		return Installed{}, false
+	}
+
+	idName, idMarketplace := splitPluginID(cmp.Or(stringField(object, "id"), stringField(object, "pluginId")))
 
 	name := cmp.Or(stringField(object, "name"), idName)
 	if name == "" {
@@ -642,10 +637,13 @@ func installedEntry(object map[string]any) (Installed, bool) {
 	}
 
 	enabled, reported := object["enabled"].(bool)
+	if !reported {
+		enabled, reported = object["isActive"].(bool)
+	}
 
 	return Installed{
 		Name:        name,
-		Marketplace: cmp.Or(stringField(object, "marketplace"), idMarketplace),
+		Marketplace: cmp.Or(stringField(object, "marketplace"), stringField(object, "marketplaceName"), idMarketplace),
 		Version:     stringField(object, "version"),
 		Path:        cmp.Or(stringField(object, "installPath"), stringField(object, "path")),
 		Scope:       stringField(object, "scope"),

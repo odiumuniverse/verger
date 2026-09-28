@@ -16,6 +16,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/fsutil"
 	"github.com/odiumuniverse/verger/pkg/pack"
+	"github.com/odiumuniverse/verger/pkg/render"
 	"github.com/odiumuniverse/verger/pkg/store"
 )
 
@@ -172,6 +173,52 @@ func (l synthLayout) writeDoc(ctx context.Context, name string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// ownerMarketplacePlan places a synth package in its owner marketplace
+// (decision F3): the layout, the marketplace name — the one the owner document
+// already carries, else the owner, unless the host lists a foreign marketplace
+// of that name (then <owner>-verger) — and whether the host already has it
+// registered. A plugin name another package of the owner holds is refused
+// before any host call; listing the host's marketplaces is read-only.
+func ownerMarketplacePlan(
+	ctx context.Context, host ID, pkg Package,
+	listed func(context.Context) ([]registeredMarketplace, error),
+) (synthLayout, string, bool, error) {
+	layout, err := newSynthLayout(host, pkg)
+	if err != nil {
+		return synthLayout{}, "", false, err
+	}
+
+	current, entries, ok, err := layout.readDoc()
+	if err != nil {
+		return synthLayout{}, "", false, &DeliveryError{Host: string(host), Package: pkg.ID, Step: stepPlan, Cause: err}
+	}
+
+	if err := layout.checkClaim(entries); err != nil {
+		return synthLayout{}, "", false, &DeliveryError{Host: string(host), Package: pkg.ID, Step: stepPlan, Cause: err}
+	}
+
+	preferred := layout.identity.Owner
+	if ok {
+		preferred = current
+	}
+
+	registered, err := listed(ctx)
+	if err != nil {
+		return synthLayout{}, "", false, err
+	}
+
+	name, isRegistered, free := layout.chooseMarketplace(preferred, registered)
+	if !free {
+		return synthLayout{}, "", false, &render.HandsOffError{
+			Path: string(host) + "://marketplace/" + layout.identity.Owner, KeyPath: layout.identity.Owner,
+			Reason: "the host already has foreign marketplaces named " + layout.identity.Owner +
+				" and " + layout.identity.Owner + collisionSuffix,
+		}
+	}
+
+	return layout, name, isRegistered, nil
 }
 
 // registeredMarketplace is one marketplace a host reports.

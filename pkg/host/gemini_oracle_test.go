@@ -3,6 +3,7 @@ package host_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +12,53 @@ import (
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/hostcli"
 )
+
+// TestGeminiOracleListRealShape pins the Gemini CLI 0.61.0 list
+// (testdata/gemini/extensions-list-0.61.0.json, captured live): the JSON is
+// printed to stderr with nothing on stdout — the CI failure "unexpected end of
+// JSON input" — and a nested skill carrying a name is not an extension.
+func TestGeminiOracleListRealShape(t *testing.T) {
+	Convey("Given the real extensions list printed to stderr", t, func() {
+		fakeGemini(t)
+		home := t.TempDir()
+
+		output, err := os.ReadFile(filepath.Join("testdata", "gemini", "extensions-list-0.61.0.json"))
+		So(err, ShouldBeNil)
+
+		h, _ := newGemini(t, home, map[string]hostcli.Response{
+			"gemini extensions list --output-format json": {Stderr: string(output)},
+		})
+
+		Convey("When the oracle lists it", func() {
+			listed, listErr := h.Oracle().List(t.Context())
+
+			Convey("Then the extension comes back whole from stderr", func() {
+				So(listErr, ShouldBeNil)
+				So(listed, ShouldResemble, []host.Installed{{
+					Name: "foo", Version: "1.0.0", Path: "/home/u/ext/foo", Enabled: true,
+				}})
+			})
+		})
+	})
+
+	Convey("Given no extension installed", t, func() {
+		fakeGemini(t)
+		home := t.TempDir()
+
+		h, _ := newGemini(t, home, map[string]hostcli.Response{
+			"gemini extensions list --output-format json": {Stderr: "[]\n"},
+		})
+
+		Convey("When the oracle lists it", func() {
+			listed, err := h.Oracle().List(t.Context())
+
+			Convey("Then it is an empty list, not a parse failure", func() {
+				So(err, ShouldBeNil)
+				So(listed, ShouldBeEmpty)
+			})
+		})
+	})
+}
 
 func TestGeminiOracleList(t *testing.T) {
 	Convey("Given a scripted gemini extensions list", t, func() {
@@ -108,17 +156,32 @@ func TestGeminiOracleValidate(t *testing.T) {
 		fakeGemini(t)
 		home := t.TempDir()
 
-		Convey("When validation succeeds with output", func() {
+		Convey("When validation succeeds with the output on stderr", func() {
+			// gemini-cli 0.61.0 prints the validate result to stderr, like
+			// `extensions list`; the adapter must read it there.
 			h, runner := newGemini(t, home, map[string]hostcli.Response{
-				"gemini extensions validate /tmp/ext": response("warning one\nwarning two\n\n"),
+				"gemini extensions validate /tmp/ext": {Stderr: "warning one\nwarning two\n\n"},
 			})
 
 			warnings, err := h.Oracle().Validate(t.Context(), "/tmp/ext")
 
-			Convey("Then every output line is a warning", func() {
+			Convey("Then every stderr line is a warning", func() {
 				So(err, ShouldBeNil)
 				So(warnings, ShouldResemble, []string{"warning one", "warning two"})
 				So(callKeys(runner), ShouldResemble, []string{"gemini extensions validate /tmp/ext"})
+			})
+		})
+
+		Convey("When a CLI prints the result to stdout instead", func() {
+			h, _ := newGemini(t, home, map[string]hostcli.Response{
+				"gemini extensions validate /tmp/ext": response("warning one\n"),
+			})
+
+			warnings, err := h.Oracle().Validate(t.Context(), "/tmp/ext")
+
+			Convey("Then stdout is read too", func() {
+				So(err, ShouldBeNil)
+				So(warnings, ShouldResemble, []string{"warning one"})
 			})
 		})
 

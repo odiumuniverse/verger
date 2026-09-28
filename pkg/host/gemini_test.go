@@ -3,10 +3,8 @@ package host_test
 import (
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -545,8 +543,8 @@ func TestGeminiNativeDeliver(t *testing.T) {
 		ref := "https://github.com/acme/plugins.git"
 
 		script := map[string]hostcli.Response{
-			"gemini extensions install " + ref:            response(""),
-			"gemini extensions list --output-format json": response(`[{"name":"caveman","version":"1.2.3","path":"/tmp/ext"}]`),
+			"gemini extensions install " + ref + " --consent": response(""),
+			"gemini extensions list --output-format json":     {Stderr: `[{"name":"caveman","version":"1.2.3","path":"/tmp/ext"}]`},
 		}
 
 		h, runner := newGemini(t, home, script)
@@ -557,10 +555,10 @@ func TestGeminiNativeDeliver(t *testing.T) {
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
 
 		Convey("When it is delivered", func() {
-			Convey("Then the exact argv runs and the oracle verifies", func() {
+			Convey("Then the non-interactive argv runs and the oracle verifies from stderr", func() {
 				So(err, ShouldBeNil)
 				So(callKeys(runner), ShouldResemble, []string{
-					"gemini extensions install " + ref,
+					"gemini extensions install " + ref + " --consent",
 					"gemini extensions list --output-format json",
 				})
 				So(res.Observed.Verified, ShouldBeTrue)
@@ -589,42 +587,50 @@ func geminiSynth(t *testing.T) (*store.Store, host.Package) {
 	return st, pkg
 }
 
-// geminiListed is the Gemini list answer for extensions at paths.
-func geminiListed(pathByName map[string]string) string {
-	entries := make([]string, 0, len(pathByName))
+// geminiSynthWorld is one Gemini home over the stateful fake CLI with
+// acme/caveman laid out in the store.
+func geminiSynthWorld(t *testing.T, opts ...host.Option) (host.Host, *geminiCLI, *store.Store, host.Package, string) {
+	t.Helper()
 
-	for _, name := range slices.Sorted(maps.Keys(pathByName)) {
-		entries = append(entries, `{"name":"`+name+`","version":"1.0.0","path":"`+pathByName[name]+`"}`)
-	}
+	fakeGemini(t)
 
-	return "[" + strings.Join(entries, ",") + "]"
+	home := t.TempDir()
+	st, pkg := geminiSynth(t)
+	cli := newGeminiCLI()
+	cli.installDir = filepath.Join(home, ".gemini", "extensions")
+
+	all := append([]host.Option{host.WithHome(home), host.WithRunner(cli)}, opts...)
+
+	return host.NewGemini(all...), cli, st, pkg, home
 }
 
+// TestGeminiSynthDeliver pins the Gemini CLI 0.61.0 synth grammar (T1.8-G):
+// `extensions link <dir> --consent` (without --consent the CLI asks for
+// workspace trust and a non-interactive run hangs), the list read from stderr,
+// a same-dir re-delivery is a no-op and a new version is uninstalled and
+// relinked (the CLI refuses to link over an installed name).
 func TestGeminiSynthDeliver(t *testing.T) {
 	Convey("Given a synth package in the store", t, func() {
-		fakeGemini(t)
-		home := t.TempDir()
-		_, pkg := geminiSynth(t)
+		h, cli, st, pkg, _ := geminiSynthWorld(t)
 		synthDir := pkg.SynthDir
 
 		// A non-clean spelling must reach the host as the clean absolute path.
 		pkg.SynthDir = filepath.Join(synthDir, "..", filepath.Base(synthDir))
 
-		h, runner := newGemini(t, home, map[string]hostcli.Response{
-			"gemini extensions link " + synthDir:          response(""),
-			"gemini extensions list --output-format json": response(geminiListed(map[string]string{"caveman": synthDir})),
-		})
-
 		Convey("When it is delivered", func() {
-			res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
+			So(err, ShouldBeNil)
 
-			Convey("Then the extension keeps the bare name, link receives the absolute store path and the oracle verifies", func() {
-				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldResemble, []string{
+			Convey("Then the bare name is linked non-interactively from the absolute store path and verified", func() {
+				So(cli.Calls(), ShouldResemble, []string{
 					"gemini extensions list --output-format json",
-					"gemini extensions link " + synthDir,
+					"gemini extensions link " + synthDir + " --consent",
 					"gemini extensions list --output-format json",
 				})
+
+				linked, ok := cli.Linked("caveman")
+				So(ok, ShouldBeTrue)
+				So(linked, ShouldEqual, synthDir)
 				So(res.Observed.Verified, ShouldBeTrue)
 				So(res.RMA, ShouldResemble, []receipt.Op{
 					{Kind: receipt.OpHostInstall, Command: []string{"extensions", "uninstall", "caveman"}},
@@ -638,14 +644,46 @@ func TestGeminiSynthDeliver(t *testing.T) {
 					Kind: "extension", Name: "caveman", Path: "gemini://extension/caveman", Digest: sum,
 				}})
 			})
+
+			Convey("Then delivering the same dir again links nothing and marks the inverse pre-existing", func() {
+				before := len(cli.Calls())
+
+				again, againErr := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
+				So(againErr, ShouldBeNil)
+				So(cli.Calls()[before:], ShouldResemble, []string{
+					"gemini extensions list --output-format json",
+					"gemini extensions list --output-format json",
+				})
+				So(again.RMA[0].Existed, ShouldBeTrue)
+			})
+
+			Convey("Then a new version is uninstalled and relinked", func() {
+				next := synthPackage(t, st, pkg.ID, "9.9.9")
+				writeFixtureFile(t, filepath.Join(next.SynthDir, "gemini-extension.json"), `{"name":"caveman","version":"9.9.9"}`, 0o600)
+
+				before := len(cli.Calls())
+
+				updated, updateErr := h.Deliver(t.Context(), "", host.Delivery{Package: next, Strategy: host.Synth})
+				So(updateErr, ShouldBeNil)
+				So(cli.Calls()[before:], ShouldResemble, []string{
+					"gemini extensions list --output-format json",
+					"gemini extensions uninstall caveman",
+					"gemini extensions link " + next.SynthDir + " --consent",
+					"gemini extensions list --output-format json",
+				})
+
+				linked, _ := cli.Linked("caveman")
+				So(linked, ShouldEqual, next.SynthDir)
+				So(updated.RMA[0].Existed, ShouldBeTrue)
+			})
 		})
 
 		Convey("When it is only planned", func() {
-			res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth, DryRun: true})
+			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth, DryRun: true})
 
 			Convey("Then only the read-only list runs", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldResemble, []string{"gemini extensions list --output-format json"})
+				So(cli.Calls(), ShouldResemble, []string{"gemini extensions list --output-format json"})
 				So(res.RMA, ShouldHaveLength, 1)
 			})
 		})
@@ -657,24 +695,19 @@ func TestGeminiSynthDeliver(t *testing.T) {
 // the package lands as <owner>-<name> from a renamed copy of the synth dir.
 func TestGeminiSynthNameCollision(t *testing.T) {
 	Convey("Given a user's own extension named caveman", t, func() {
-		fakeGemini(t)
-		home := t.TempDir()
-		_, pkg := geminiSynth(t)
+		h, cli, _, pkg, _ := geminiSynthWorld(t)
+		cli.installed["caveman"] = "/elsewhere/caveman"
 		overlay := pkg.SynthDir + "+gemini"
 
-		h, runner := newGemini(t, home, map[string]hostcli.Response{
-			"gemini extensions link " + overlay: response(""),
-			"gemini extensions list --output-format json": response(geminiListed(map[string]string{
-				"caveman": "/elsewhere/caveman", "acme-caveman": overlay,
-			})),
-		})
-
 		Convey("When the synth package is delivered", func() {
-			res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 
 			Convey("Then it links a renamed copy as acme-caveman and the store copy keeps its name", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldContain, "gemini extensions link "+overlay)
+				So(cli.Calls(), ShouldContain, "gemini extensions link "+overlay+" --consent")
+
+				foreign, _ := cli.Linked("caveman")
+				So(foreign, ShouldEqual, "/elsewhere/caveman")
 				So(manifestNameOf(t, filepath.Join(overlay, "gemini-extension.json")), ShouldEqual, "acme-caveman")
 				So(manifestNameOf(t, filepath.Join(pkg.SynthDir, "gemini-extension.json")), ShouldEqual, "caveman")
 				So(fileExists(filepath.Join(overlay, ".claude-plugin", "plugin.json")), ShouldBeTrue)
@@ -687,44 +720,129 @@ func TestGeminiSynthNameCollision(t *testing.T) {
 	})
 
 	Convey("Given foreign extensions named caveman and acme-caveman", t, func() {
-		fakeGemini(t)
-		home := t.TempDir()
-		_, pkg := geminiSynth(t)
+		h, cli, _, pkg, _ := geminiSynthWorld(t)
+		cli.installed["caveman"] = "/elsewhere/a"
+		cli.installed["acme-caveman"] = "/elsewhere/b"
 
-		h, runner := newGemini(t, home, map[string]hostcli.Response{
-			"gemini extensions list --output-format json": response(geminiListed(map[string]string{
-				"caveman": "/elsewhere/a", "acme-caveman": "/elsewhere/b",
-			})),
-		})
-
-		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+		_, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 
 		Convey("When the synth package is delivered", func() {
 			Convey("Then the cell is hands-off after the read-only list alone", func() {
 				_, ok := errors.AsType[*render.HandsOffError](err)
 				So(ok, ShouldBeTrue)
-				So(callKeys(runner), ShouldResemble, []string{"gemini extensions list --output-format json"})
+				So(cli.Calls(), ShouldResemble, []string{"gemini extensions list --output-format json"})
 				So(fileExists(pkg.SynthDir+"+gemini"), ShouldBeFalse)
 			})
 		})
 	})
 
-	Convey("Given a caveman extension this package's receipt records", t, func() {
-		fakeGemini(t)
-		home := t.TempDir()
-		_, pkg := geminiSynth(t)
+	Convey("Given a caveman extension this package's receipt records, linked elsewhere", t, func() {
+		h, cli, _, pkg, _ := geminiSynthWorld(t, host.WithOwnership(ownerMap{"gemini://extension/caveman": "acme/caveman"}))
+		cli.installed["caveman"] = "/old/store/caveman/0.9.0"
 
-		h, runner := newGemini(t, home, map[string]hostcli.Response{
-			"gemini extensions link " + pkg.SynthDir:      response(""),
-			"gemini extensions list --output-format json": response(`[{"name":"caveman"}]`),
-		}, host.WithOwnership(ownerMap{"gemini://extension/caveman": pkg.ID}))
-
-		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+		_, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 
 		Convey("When it is delivered again", func() {
-			Convey("Then the receipt proves the name and it is relinked as caveman", func() {
+			Convey("Then the receipt proves the name: it is uninstalled and relinked as caveman", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldContain, "gemini extensions link "+pkg.SynthDir)
+				So(cli.Calls(), ShouldContain, "gemini extensions uninstall caveman")
+				So(cli.Calls(), ShouldContain, "gemini extensions link "+pkg.SynthDir+" --consent")
+			})
+		})
+	})
+}
+
+// TestGeminiUninstallTolerance pins the Gemini removal contract: an extension
+// the host no longer knows ("Extension not found.") is already removed, and
+// one that existed before the delivery is never removed by its inverse.
+func TestGeminiUninstallTolerance(t *testing.T) {
+	Convey("Given a Gemini host with a kept extension", t, func() {
+		fakeGemini(t)
+		home := t.TempDir()
+		cli := newGeminiCLI()
+		cli.installed["kept"] = "/k"
+
+		h := host.NewGemini(host.WithHome(home), host.WithRunner(cli))
+
+		uninstall := func(op receipt.Op) (host.Result, error) {
+			return h.Uninstall(t.Context(), home, receipt.Receipt{
+				Package: "acme/caveman", Host: "gemini", Scope: receipt.ScopeUser, Strategy: string(host.Synth), RMA: []receipt.Op{op},
+			})
+		}
+
+		Convey("When the inverse of an unknown extension runs", func() {
+			res, err := uninstall(receipt.Op{Kind: receipt.OpHostInstall, Command: []string{"extensions", "uninstall", "gone"}})
+
+			Convey("Then it is already done, with a note", func() {
+				So(err, ShouldBeNil)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "gone")
+			})
+		})
+
+		Convey("When the inverse of a pre-existing extension runs", func() {
+			_, err := uninstall(receipt.Op{Kind: receipt.OpHostInstall, Command: []string{"extensions", "uninstall", "kept"}, Existed: true})
+
+			Convey("Then the extension is kept", func() {
+				So(err, ShouldBeNil)
+
+				_, ok := cli.Linked("kept")
+				So(ok, ShouldBeTrue)
+			})
+		})
+
+		Convey("When the inverse op carries no argv", func() {
+			_, err := uninstall(receipt.Op{Kind: receipt.OpHostInstall})
+
+			Convey("Then it is reported as a receipt defect, never a panic", func() {
+				So(err, ShouldNotBeNil)
+				So(err.Error(), ShouldContainSubstring, "no argv")
+			})
+		})
+	})
+}
+
+// TestGeminiUninstallLeavesHostOwnedIntegrityStore pins the host-owned file
+// policy for gemini-cli 0.61.0: ~/.gemini/extension_integrity.json is an
+// HMAC-SHA256-signed store whose key lives in the macOS Keychain, and
+// ExtensionIntegrityManager exposes only verify/store — no delete. A surgical
+// edit would invalidate the signature and mark every one of the user's
+// extensions invalid; deleting the file would lose the records of other tools.
+// verger's uninstall therefore runs the CLI alone: the extension (and the link
+// the CLI materializes below ~/.gemini/extensions) goes, the integrity store
+// stays byte-identical. The two captured states beside the fixture
+// (extension-integrity-0.61.0.json before, …-after-uninstall-0.61.0.json as
+// the CLI rewrites it — a foreign-tool record appears) show the change only the
+// CLI may make.
+func TestGeminiUninstallLeavesHostOwnedIntegrityStore(t *testing.T) {
+	Convey("Given a Gemini home whose host-owned integrity store precedes the install", t, func() {
+		h, cli, _, pkg, home := geminiSynthWorld(t)
+
+		before := readTestFile(t, filepath.Join("testdata", "gemini", "extension-integrity-0.61.0.json"))
+		after := readTestFile(t, filepath.Join("testdata", "gemini", "extension-integrity-after-uninstall-0.61.0.json"))
+		So(after, ShouldNotEqual, before)
+
+		store := filepath.Join(home, ".gemini", "extension_integrity.json")
+		writeFixtureFile(t, store, before, 0o600)
+
+		delivered, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+		So(err, ShouldBeNil)
+
+		_, err = h.Uninstall(t.Context(), home, receipt.Receipt{
+			Package: pkg.ID, Host: "gemini", Scope: receipt.ScopeUser, Strategy: string(host.Synth), RMA: delivered.RMA,
+		})
+
+		Convey("When the extension is uninstalled", func() {
+			Convey("Then the CLI removed the extension and the link it materialized", func() {
+				So(err, ShouldBeNil)
+
+				_, linked := cli.Linked("caveman")
+				So(linked, ShouldBeFalse)
+				So(fileExists(filepath.Join(home, ".gemini", "extensions", "caveman")), ShouldBeFalse)
+			})
+
+			Convey("Then the host-owned integrity store is byte-identical, never rewritten or deleted", func() {
+				So(readTestFile(t, store), ShouldEqual, before)
+				So(readTestFile(t, store), ShouldNotEqual, after)
 			})
 		})
 	})
@@ -790,8 +908,8 @@ func TestGeminiNativeVerifyFailure(t *testing.T) {
 		ref := "https://github.com/acme/plugins.git"
 
 		h, runner := newGemini(t, home, map[string]hostcli.Response{
-			"gemini extensions install " + ref:            response(""),
-			"gemini extensions list --output-format json": response("[]"),
+			"gemini extensions install " + ref + " --consent": response(""),
+			"gemini extensions list --output-format json":     {Stderr: "[]"},
 		})
 
 		pkg := geminiPackage(t)

@@ -53,11 +53,17 @@ Pins live in `e2e/hosts.go`, `e2e/Dockerfile` and `.github/workflows/e2e.yml`;
 
 ## Known gaps
 
-- **codex adopt leg** is skipped: the `codex plugin` subcommand/JSON grammar is
-  unverified (OQ-T1.7.1). The install/remove/status scenario still runs.
+- **codex adopt leg** runs with the codex-cli 0.157.1 grammar (`plugin
+  marketplace add <dir> --json`, then `plugin add <plugin>@<marketplace>`); the
+  install/remove/status scenario was already green, the first CI run confirms
+  the adopt leg end to end.
 - **gemini `extensions link` semantics** (absolute path vs copy) are confirmed
-  by the CI run (OQ-T1.8.1).
+  by the CI run (OQ-T1.8.1). The manual link passes `--consent`, like the
+  adapter, or a non-interactive run hangs on workspace trust.
 - `claude plugin list --json` output shape is confirmed by the CI run
   (OQ-T1.6.2).
 - The driver's residue check is name-based over the host's config dirs; a
-  byte-exact home diff is a T1.9/T1.12 unit-test concern, not an e2e one.
+  byte-exact home diff is a T1.9/T1.12 unit-test concern, not an e2e one. It
+  skips host-owned files (`hostOwnedFiles`), today gemini's signed
+  `extension_integrity.json`, which verger must never write or delete
+  (`pkg/host.TestGeminiUninstallLeavesHostOwnedIntegrityStore`).

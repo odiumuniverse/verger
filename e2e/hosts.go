@@ -59,9 +59,9 @@ func hostSpecs() []hostSpec {
 			listArgs:        []string{"plugin", "list", "--json"},
 			hooksFile:       ".codex/hooks.json",
 			fixtureManifest: "plugin.json",
-			// OQ-T1.7.1: the codex plugin subcommands/JSON are unverified;
-			// the adopt leg stays skipped until the CI run confirms them.
-			adoptReason: "codex manual local install grammar is unverified (OQ-T1.7.1)",
+			// The manual local install is the adapter's verified grammar
+			// (codex-cli 0.157.1): `plugin marketplace add <dir> --json` then
+			// `plugin add <plugin>@<marketplace>`.
 		},
 		{
 			id:              "gemini",

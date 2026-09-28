@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/vmkteam/embedlog"
@@ -317,8 +318,43 @@ func (b *Base) run(ctx context.Context, name string, args []string) ([]byte, err
 	return bin.RunWith(ctx, b.runner, args, nil)
 }
 
+// runStreams resolves and executes one host CLI, returning stderr too: some
+// host CLIs print their results there (Gemini CLI 0.61).
+func (b *Base) runStreams(ctx context.Context, name string, args []string) ([]byte, []byte, error) {
+	bin, err := b.resolve(name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return bin.RunStreamsWith(ctx, b.runner, args, nil)
+}
+
 // ErrNotSupported reports an operation this host or strategy cannot do.
 var ErrNotSupported = errors.New("not supported by this host")
+
+// hostInverses runs the host-install ops of one RMA in reverse order — the
+// order their forwards ran — and collects the notes of the ones already
+// satisfied. Every adapter's Uninstall is this loop plus its own uninstallOp.
+func hostInverses(ctx context.Context, r receipt.Receipt, run func(context.Context, receipt.Op) (string, error)) ([]string, error) {
+	var notes []string
+
+	for _, op := range slices.Backward(r.RMA) {
+		if op.Kind != receipt.OpHostInstall {
+			continue
+		}
+
+		note, err := run(ctx, op)
+		if err != nil {
+			return nil, err
+		}
+
+		if note != "" {
+			notes = append(notes, note)
+		}
+	}
+
+	return notes, nil
+}
 
 // UnsupportedStrategyError reports a strategy the adapter never delivers.
 type UnsupportedStrategyError struct {

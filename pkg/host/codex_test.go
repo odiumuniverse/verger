@@ -15,7 +15,6 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
-	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/hostcli"
 	"github.com/odiumuniverse/verger/pkg/manifest"
@@ -784,18 +783,20 @@ func TestCodexLooseDryRun(t *testing.T) {
 		home := t.TempDir()
 		st := openStore(t)
 
-		h, runner := newCodex(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()))
+		h, runner := newCodex(t, home, map[string]hostcli.Response{
+			"codex plugin marketplace list --json": response(`{"marketplaces": []}`),
+		}, host.WithStore(st), host.WithTrash(st.Trash()))
 		pkg := codexPackage(t)
 		pkg.SynthDir = synthPackage(t, st, pkg.ID, pkg.Version).SynthDir
 
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth, DryRun: true})
 
 		Convey("When it is delivered", func() {
-			Convey("Then no call happens and the marketplace entry is only planned", func() {
+			Convey("Then only the read-only marketplace listing runs and the inverse is planned", func() {
 				So(err, ShouldBeNil)
-				So(runner.Calls(), ShouldBeEmpty)
-				So(fileExists(filepath.Join(home, ".agents", "plugins", "marketplace.json")), ShouldBeFalse)
-				So(res.RMA, ShouldHaveLength, 3)
+				So(callKeys(runner), ShouldResemble, []string{"codex plugin marketplace list --json"})
+				So(fileExists(filepath.Join(home, ".agents")), ShouldBeFalse)
+				So(res.RMA, ShouldHaveLength, 2)
 				So(res.Notes, ShouldContain, "dry-run")
 			})
 		})
@@ -855,9 +856,9 @@ func TestCodexNativeDeliver(t *testing.T) {
 		ref := "https://github.com/acme/plugins.git"
 
 		script := map[string]hostcli.Response{
-			"codex plugin marketplace add " + ref:  response(""),
-			"codex plugin install caveman@plugins": response(""),
-			"codex plugin list --json":             response(matchingList("caveman")),
+			"codex plugin marketplace add " + ref + " --json": response(`{"marketplaceName":"plugins","installedRoot":"/c/plugins","alreadyAdded":false}`),
+			"codex plugin add caveman@plugins":                response(""),
+			"codex plugin list --json":                        response(codexList("caveman@plugins")),
 		}
 
 		h, runner := newCodex(t, home, script)
@@ -868,11 +869,11 @@ func TestCodexNativeDeliver(t *testing.T) {
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
 
 		Convey("When it is delivered", func() {
-			Convey("Then the exact argv runs and the oracle verifies", func() {
+			Convey("Then the codex-cli 0.157.1 argv runs and the oracle verifies", func() {
 				So(err, ShouldBeNil)
 				So(callKeys(runner), ShouldResemble, []string{
-					"codex plugin marketplace add " + ref,
-					"codex plugin install caveman@plugins",
+					"codex plugin marketplace add " + ref + " --json",
+					"codex plugin add caveman@plugins",
 					"codex plugin list --json",
 				})
 				So(res.Observed.Verified, ShouldBeTrue)
@@ -880,276 +881,280 @@ func TestCodexNativeDeliver(t *testing.T) {
 
 			Convey("Then the RMA carries the inverse argv", func() {
 				So(res.RMA, ShouldResemble, []receipt.Op{
-					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "rm", "plugins"}},
-					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "uninstall", "caveman@plugins"}},
+					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "remove", "plugins"}},
+					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "remove", "caveman@plugins"}},
 				})
 			})
 		})
 	})
-}
 
-func TestCodexSynthDeliver(t *testing.T) {
-	Convey("Given a scripted synth install", t, func() {
+	Convey("Given a marketplace whose document declares another name than the ref's last segment", t, func() {
 		fakeCodex(t)
 		home := t.TempDir()
 		t.Setenv("CODEX_HOME", "")
 
-		st := openStore(t)
+		ref := "https://github.com/acme/plugins.git"
+
+		h, runner := newCodex(t, home, map[string]hostcli.Response{
+			"codex plugin marketplace add " + ref + " --json": response(`{"marketplaceName":"acme-tools","installedRoot":"/c/x","alreadyAdded":false}`),
+			"codex plugin add caveman@acme-tools":             response(""),
+			"codex plugin list --json":                        response(codexList("caveman@acme-tools")),
+		})
+
 		pkg := codexPackage(t)
-		synthDir := synthPackage(t, st, pkg.ID, pkg.Version).SynthDir
-		root := ownerRoot(st, "acme")
+		pkg.Marketplace = ref
 
-		script := map[string]hostcli.Response{
-			"codex plugin marketplace add " + root: response(""),
-			"codex plugin install caveman@acme":    response(""),
-			"codex plugin list --json":             response(matchingList("caveman")),
-		}
-
-		h, runner := newCodex(t, home, script)
-
-		pkg.SynthDir = synthDir
-
-		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
+		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
 
 		Convey("When it is delivered", func() {
-			marketplace := filepath.Join(home, ".agents", "plugins", "marketplace.json")
-
-			Convey("Then the owner marketplace is added and the plugin installed as caveman@acme (F3)", func() {
+			Convey("Then the name the host registered is the one installed and recorded", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldResemble, []string{
-					"codex plugin marketplace add " + root,
-					"codex plugin install caveman@acme",
-					"codex plugin list --json",
-				})
-				So(ownerDoc(t, st, "acme"), ShouldEqualJSON, `{"name":"acme","owner":{"name":"acme"},"plugins":[
-  {"name":"caveman","source":"./caveman/`+pkg.Version+`"}]}`)
-			})
-
-			Convey("Then the personal marketplace entry points at the package dir", func() {
-				So(err, ShouldBeNil)
-				So(readTestFile(t, marketplace), ShouldEqualJSON, `{
-  "plugins": {
-    "caveman": {"source": {"source": "local", "path": "`+synthDir+`"}}
-  }
-}`)
-			})
-
-			Convey("Then the RMA removes the entry, the marketplace and the install", func() {
-				entryDigest := digest.Bytes([]byte(`{"source":{"path":"` + synthDir + `","source":"local"}}`))
-
-				So(res.RMA, ShouldResemble, []receipt.Op{
-					{
-						Kind: receipt.OpConfigKey, Path: marketplace, KeyPath: "plugins.caveman",
-						Digest: entryDigest, Existed: false,
-					},
-					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "rm", "acme"}},
-					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "uninstall", "caveman@acme"}},
-				})
-			})
-
-			Convey("Then the result carries the marketplace entry artifact that landed", func() {
-				So(res.Artifacts, ShouldResemble, []receipt.Artifact{{
-					Kind: "marketplace", Name: "caveman", Path: marketplace, Digest: res.RMA[0].Digest,
-				}})
-			})
-
-			Convey("Then a second synth keeps foreign entries and stays idempotent", func() {
-				foreign := `{"name": "personal", "plugins": {"other": {"source": {"source": "local", "path": "/tmp/other"}}}}`
-				writeFixtureFile(t, marketplace, foreign, 0o600)
-
-				_, secondErr := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
-
-				So(secondErr, ShouldBeNil)
-
-				after := readTestFile(t, marketplace)
-				So(after, ShouldContainSubstring, `"other"`)
-				So(after, ShouldContainSubstring, `"personal"`)
-
-				_, thirdErr := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Synth})
-				So(thirdErr, ShouldBeNil)
-				So(readTestFile(t, marketplace), ShouldEqual, after)
+				So(callKeys(runner), ShouldContain, "codex plugin add caveman@acme-tools")
+				So(res.RMA[1].Command, ShouldResemble, []string{"plugin", "remove", "caveman@acme-tools"})
 			})
 		})
 	})
 }
 
-// codexReplacedEntry is the older personal marketplace entry a synth update
-// replaces, next to a foreign entry.
-const codexReplacedEntry = `{"plugins":{` +
-	`"caveman":{"source":{"source":"local","path":"/old-store"}},` +
-	`"other":{"source":{"source":"local","path":"/tmp/other"}}}}`
-
-// codexReplaceSetup pre-writes the older entry and builds a Codex adapter with
-// a store and trash whose runner scripts a full synth install and uninstall.
-func codexReplaceSetup(t *testing.T) (host.Host, *hostcli.ScriptRunner, *store.Store, host.Package, string) {
+// codexSynthWorld is one Codex home over the stateful fake CLI with a store
+// for synth packages.
+func codexSynthWorld(t *testing.T) (host.Host, *codexCLI, *store.Store, string) {
 	t.Helper()
 
 	fakeCodex(t)
-
-	home := t.TempDir()
 	t.Setenv("CODEX_HOME", "")
 
-	marketplace := filepath.Join(home, ".agents", "plugins", "marketplace.json")
-
-	writeFixtureFile(t, marketplace, codexReplacedEntry, 0o600)
-
+	home := t.TempDir()
 	st := openStore(t)
-	pkg := codexPackage(t)
-	pkg.SynthDir = synthPackage(t, st, pkg.ID, pkg.Version).SynthDir
+	cli := newCodexCLI()
 
-	h, runner := newCodex(t, home, map[string]hostcli.Response{
-		"codex plugin marketplace add " + ownerRoot(st, "acme"): response(""),
-		"codex plugin install caveman@acme":                     response(""),
-		"codex plugin list --json":                              response(matchingList("caveman")),
-		"codex plugin uninstall caveman@acme":                   response(""),
-		"codex plugin marketplace rm acme":                      response(""),
-	}, host.WithStore(st), host.WithTrash(st.Trash()))
-
-	return h, runner, st, pkg, marketplace
+	return host.NewCodex(host.WithHome(home), host.WithRunner(cli), host.WithStore(st), host.WithTrash(st.Trash())), cli, st, home
 }
 
-// TestCodexSynthReplaceKeepsBackup pins T1.7-review-1 [B1]/[M1]: a synth
-// delivery that replaces an existing personal marketplace entry returns the
-// RMA and artifacts execution produced — the entry op carries the trash bucket
-// of the replaced value, the artifact is the entry that landed.
-func TestCodexSynthReplaceKeepsBackup(t *testing.T) {
-	Convey("Given an existing caveman entry pointing at an older synth dir", t, func() {
-		h, runner, st, pkg, marketplace := codexReplaceSetup(t)
-		entryDigest := digest.Bytes([]byte(`{"source":{"path":"` + pkg.SynthDir + `","source":"local"}}`))
+// TestCodexSynthDeliver pins the codex-cli 0.157.1 synth grammar (T1.7-G):
+// the owner root is added as a local marketplace (Codex reads the owner
+// document at .claude-plugin/marketplace.json), the plugin is added as
+// name@owner, and a new version is the same `plugin add` again.
+func TestCodexSynthDeliver(t *testing.T) {
+	Convey("Given a synth package acme/caveman in the store", t, func() {
+		h, cli, st, home := codexSynthWorld(t)
+		pkg := synthPackage(t, st, "acme/caveman", "1.0.0")
+		root := ownerRoot(st, "acme")
 
-		Convey("When synth delivers the new dir", func() {
+		Convey("When it is delivered", func() {
 			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 			So(err, ShouldBeNil)
 
-			Convey("Then the entry op records the trashed previous value", func() {
-				So(res.RMA, ShouldHaveLength, 3)
-				So(res.RMA[0].Kind, ShouldEqual, receipt.OpConfigKey)
-				So(res.RMA[0].KeyPath, ShouldEqual, "plugins.caveman")
-				So(res.RMA[0].Digest, ShouldEqual, entryDigest)
-				So(res.RMA[0].Existed, ShouldBeTrue)
-				So(res.RMA[0].Backup, ShouldNotBeEmpty)
-				So(trashedValue(t, st, res.RMA[0].Backup), ShouldEqualJSON, `{"source":{"source":"local","path":"/old-store"}}`)
+			Convey("Then the owner marketplace is added and the plugin installed as caveman@acme", func() {
+				So(cli.Calls(), ShouldResemble, []string{
+					"codex plugin marketplace list --json",
+					"codex plugin marketplace add " + root + " --json",
+					"codex plugin add caveman@acme",
+					"codex plugin list --json",
+				})
+
+				version, installed := cli.Installed("caveman@acme")
+				So(installed, ShouldBeTrue)
+				So(version, ShouldEqual, "1.0.0")
+				So(res.Observed.Verified, ShouldBeTrue)
+				So(ownerDoc(t, st, "acme"), ShouldEqualJSON,
+					`{"name":"acme","owner":{"name":"acme"},"plugins":[{"name":"caveman","source":"./caveman/1.0.0"}]}`)
 			})
 
-			Convey("Then the result carries the marketplace entry artifact that landed", func() {
-				So(res.Artifacts, ShouldResemble, []receipt.Artifact{{
-					Kind: "marketplace", Name: "caveman", Path: marketplace, Digest: entryDigest,
-				}})
+			Convey("Then the RMA removes the plugin, then the marketplace, and the personal marketplace is never written", func() {
+				So(res.RMA, ShouldResemble, []receipt.Op{
+					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "remove", "acme"}},
+					{Kind: receipt.OpHostInstall, Command: []string{"plugin", "remove", "caveman@acme"}},
+				})
+				So(res.Artifacts, ShouldBeEmpty)
+				So(fileExists(filepath.Join(home, ".agents")), ShouldBeFalse)
+			})
+
+			Convey("Then a new version is added again and the host moves to it", func() {
+				next := synthPackage(t, st, "acme/caveman", "1.1.0")
+
+				_, nextErr := h.Deliver(t.Context(), "", host.Delivery{Package: next, Strategy: host.Synth})
+				So(nextErr, ShouldBeNil)
+
+				version, _ := cli.Installed("caveman@acme")
+				So(version, ShouldEqual, "1.1.0")
+				So(ownerDoc(t, st, "acme"), ShouldContainSubstring, `"./caveman/1.1.0"`)
+			})
+
+			Convey("Then a host that keeps the old version fails verify, never a silent success", func() {
+				cli.stale = true
+				next := synthPackage(t, st, "acme/caveman", "1.1.0")
+
+				nextRes, nextErr := h.Deliver(t.Context(), "", host.Delivery{Package: next, Strategy: host.Synth})
+
+				typed, ok := errors.AsType[*host.DeliveryError](nextErr)
+				So(ok, ShouldBeTrue)
+				So(typed.Step, ShouldEqual, "verify")
+				So(nextRes.RMA, ShouldHaveLength, 2)
 			})
 		})
 
-		Convey("When the replacement is only planned", func() {
+		Convey("When it is only planned", func() {
 			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth, DryRun: true})
 
-			Convey("Then the plan names the entry it would replace and nothing is trashed or run", func() {
+			Convey("Then only the read-only listing runs and nothing is written", func() {
 				So(err, ShouldBeNil)
-				So(res.RMA[0].Existed, ShouldBeTrue)
-				So(res.RMA[0].Backup, ShouldBeEmpty)
-				So(res.Artifacts, ShouldResemble, []receipt.Artifact{{
-					Kind: "marketplace", Name: "caveman", Path: marketplace, Digest: entryDigest,
-				}})
-				So(runner.Calls(), ShouldBeEmpty)
-				So(readTestFile(t, marketplace), ShouldEqual, codexReplacedEntry)
-				So(mustTrashEntries(t, st), ShouldBeEmpty)
+				So(cli.Calls(), ShouldResemble, []string{"codex plugin marketplace list --json"})
+				So(res.RMA, ShouldHaveLength, 2)
+				So(fileExists(filepath.Join(root, ".claude-plugin", "marketplace.json")), ShouldBeFalse)
 			})
 		})
 	})
 }
 
-// TestCodexSynthReplaceRemoveHasNoResidue pins the removal half of [B1]: the
-// receipt of a replacing synth delivery is an exact reverse, so pkg/apply's
-// remove is `current` and leaves the document as it was before the delivery —
-// the older entry restored, the delivered synth dir gone, the foreign entry
-// kept.
-func TestCodexSynthReplaceRemoveHasNoResidue(t *testing.T) {
-	Convey("Given a synth delivery that replaced an older caveman entry", t, func() {
-		h, runner, st, pkg, marketplace := codexReplaceSetup(t)
+// TestCodexSynthMarketplaceCollision pins the F3 collision rule on Codex: a
+// marketplace named after the owner from another source is foreign (codex
+// refuses to re-add a name from a different source), so verger's owner
+// marketplace becomes <owner>-verger.
+func TestCodexSynthMarketplaceCollision(t *testing.T) {
+	Convey("Given a user's own marketplace named acme", t, func() {
+		h, cli, st, _ := codexSynthWorld(t)
+		cli.marketplaces["acme"] = t.TempDir()
 
-		res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
-		So(err, ShouldBeNil)
+		pkg := synthPackage(t, st, "acme/caveman", "1.0.0")
 
-		rec := receipt.Receipt{
-			Schema: receipt.Schema, Package: pkg.ID, Host: string(host.Codex), Scope: receipt.ScopeUser,
-			Strategy: string(host.Synth), Version: pkg.Version, Artifacts: res.Artifacts, RMA: res.RMA,
-		}
-
-		deps := applyWorld(t, st, ownerExisting(pkg.ID))
-		deps.Hosts[host.Codex] = h
-
-		Convey("When apply removes the cell", func() {
-			report, runErr := apply.Run(t.Context(), deps, apply.Plan{Actions: []apply.Action{{
-				Kind: apply.ActionRemove, Host: host.Codex, Previous: &rec, Cause: "user", Initiator: "codex",
-			}}}, apply.Options{})
-
-			Convey("Then the cell is current and the document is back to its pre-delivery state", func() {
-				So(runErr, ShouldBeNil)
-				So(report.Cells[0].Status, ShouldEqual, apply.StatusCurrent)
-
-				after := readTestFile(t, marketplace)
-				So(after, ShouldEqualJSON, codexReplacedEntry)
-				So(after, ShouldNotContainSubstring, pkg.SynthDir)
-			})
-
-			Convey("Then the host install is undone in reverse order, the marketplace after its refcount", func() {
-				calls := callKeys(runner)
-				So(calls[len(calls)-3:], ShouldResemble, []string{
-					"codex plugin uninstall caveman@acme",
-					"codex plugin list --json",
-					"codex plugin marketplace rm acme",
-				})
-			})
-		})
-	})
-}
-
-// TestCodexSynthFailedInstallRollback pins NF-5: when the host install fails
-// after the personal marketplace entry was replaced, the error comes with the
-// executed RMA (the entry op carries its trash bucket), so apply's rollback
-// restores the user's previous value instead of leaving it overwritten.
-func TestCodexSynthFailedInstallRollback(t *testing.T) {
-	Convey("Given an existing caveman entry and a host that refuses the install", t, func() {
-		h, runner, st, pkg, marketplace := codexReplaceSetup(t)
-		runner.Set("codex plugin install caveman@acme", hostcli.Response{Code: 1, Stderr: "install failed"})
-
-		Convey("When the adapter delivers", func() {
+		Convey("When the synth package is delivered", func() {
 			res, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 
-			Convey("Then the error carries the executed RMA with the entry's backup", func() {
-				So(err, ShouldNotBeNil)
-				So(res.RMA, ShouldHaveLength, 3)
-				So(res.RMA[0].Existed, ShouldBeTrue)
-				So(res.RMA[0].Backup, ShouldNotBeEmpty)
+			Convey("Then it lands as caveman@acme-verger and the RMA names it", func() {
+				So(err, ShouldBeNil)
+
+				_, installed := cli.Installed("caveman@acme-verger")
+				So(installed, ShouldBeTrue)
+				So(res.RMA[0].Command, ShouldResemble, []string{"plugin", "marketplace", "remove", "acme-verger"})
 			})
 		})
 
-		Convey("When apply installs and rolls the failure back", func() {
-			deps := applyWorld(t, st, ownerExisting(pkg.ID))
-			deps.Hosts[host.Codex] = h
+		Convey("When acme-verger is foreign too", func() {
+			cli.marketplaces["acme-verger"] = t.TempDir()
 
-			cell := applyCell(t, deps, apply.Action{
-				Kind: apply.ActionInstall, Host: host.Codex,
-				Delivery: host.Delivery{Package: pkg, Strategy: host.Synth},
-			})
+			_, err := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 
-			Convey("Then the user's previous entry is back and nothing is hands-off", func() {
-				So(cell.Status, ShouldEqual, apply.StatusFailed)
-				So(readTestFile(t, marketplace), ShouldEqualJSON, codexReplacedEntry)
-				So(strings.Join(cell.Notes, "\n"), ShouldNotContainSubstring, "no backup recorded")
+			Convey("Then the cell is hands-off after the read-only listing", func() {
+				_, ok := errors.AsType[*render.HandsOffError](err)
+				So(ok, ShouldBeTrue)
+				So(cli.Calls(), ShouldResemble, []string{"codex plugin marketplace list --json"})
 			})
 		})
 	})
 }
 
-// mustTrashEntries lists the store trash.
-func mustTrashEntries(t *testing.T, st *store.Store) []store.Entry {
-	t.Helper()
+// TestCodexSynthRemoveAndRollback pins removal on codex-cli 0.157.1: `plugin
+// remove` then — only once no installed plugin comes from it — `marketplace
+// remove`; a failed install is rolled back without leaving the marketplace
+// registered.
+func TestCodexSynthRemoveAndRollback(t *testing.T) {
+	Convey("Given two packages of one owner installed", t, func() {
+		h, cli, st, _ := codexSynthWorld(t)
 
-	entries, err := st.Trash().List()
-	if err != nil {
-		t.Fatalf("trash list: %v", err)
-	}
+		first := synthPackage(t, st, "acme/caveman", "1.0.0")
+		second := synthPackage(t, st, "acme/other", "2.0.0")
 
-	return entries
+		firstRes, err := h.Deliver(t.Context(), "", host.Delivery{Package: first, Strategy: host.Synth})
+		So(err, ShouldBeNil)
+
+		secondRes, err := h.Deliver(t.Context(), "", host.Delivery{Package: second, Strategy: host.Synth})
+		So(err, ShouldBeNil)
+
+		uninstall := func(pkg host.Package, rma []receipt.Op) host.Result {
+			res, uninstallErr := h.Uninstall(t.Context(), "", receipt.Receipt{
+				Package: pkg.ID, Host: "codex", Scope: receipt.ScopeUser, Strategy: string(host.Synth), RMA: rma,
+			})
+			So(uninstallErr, ShouldBeNil)
+
+			return res
+		}
+
+		Convey("When the first is uninstalled", func() {
+			res := uninstall(first, firstRes.RMA)
+
+			Convey("Then the marketplace stays for the other plugin", func() {
+				_, registered := cli.Registered("acme")
+				So(registered, ShouldBeTrue)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "still serves 1")
+
+				_, installed := cli.Installed("caveman@acme")
+				So(installed, ShouldBeFalse)
+			})
+
+			Convey("Then the last one takes the marketplace with it", func() {
+				uninstall(second, secondRes.RMA)
+
+				_, registered := cli.Registered("acme")
+				So(registered, ShouldBeFalse)
+			})
+		})
+	})
+
+	Convey("Given a synth install the host refuses", t, func() {
+		h, cli, st, _ := codexSynthWorld(t)
+		cli.fail["plugin add caveman@acme"] = hostcli.Response{Code: 1, Stderr: "Error: install failed"}
+
+		deps := applyWorld(t, st, ownerMap{})
+		deps.Hosts[host.Codex] = h
+
+		cell := applyCell(t, deps, apply.Action{
+			Kind: apply.ActionInstall, Host: host.Codex,
+			Delivery: host.Delivery{Package: synthPackage(t, st, "acme/caveman", "1.0.0"), Strategy: host.Synth},
+		})
+
+		Convey("When apply installs and rolls back", func() {
+			Convey("Then the cell fails and the owner marketplace is not left registered", func() {
+				So(cell.Status, ShouldEqual, apply.StatusFailed)
+
+				_, registered := cli.Registered("acme")
+				So(registered, ShouldBeFalse)
+				So(strings.Join(cell.Notes, "\n"), ShouldNotContainSubstring, "rollback:")
+			})
+		})
+	})
+}
+
+// TestCodexSynthLeavesPersonalMarketplace pins that synth never touches
+// ~/.agents/plugins/marketplace.json: codex-cli 0.157.1 reads it implicitly,
+// and the object-map entry verger once wrote there made `codex plugin
+// marketplace list` fail ("invalid type: map, expected a sequence").
+func TestCodexSynthLeavesPersonalMarketplace(t *testing.T) {
+	Convey("Given a user's personal marketplace document", t, func() {
+		h, _, st, home := codexSynthWorld(t)
+
+		personal := filepath.Join(home, ".agents", "plugins", "marketplace.json")
+
+		const document = `{"name":"personal","plugins":[{"name":"mine","source":{"source":"local","path":"./mine"}}]}`
+		writeFixtureFile(t, personal, document, 0o600)
+
+		_, err := h.Deliver(t.Context(), "", host.Delivery{Package: synthPackage(t, st, "acme/caveman", "1.0.0"), Strategy: host.Synth})
+
+		Convey("When a synth package is delivered", func() {
+			Convey("Then the document is byte-identical", func() {
+				So(err, ShouldBeNil)
+				So(readTestFile(t, personal), ShouldEqual, document)
+			})
+		})
+	})
+}
+
+// TestCodexSynthFailedAddReturnsRMA pins NF-5 on the rewritten Codex install:
+// a refused `plugin add` returns the error together with the inverse RMA.
+func TestCodexSynthFailedAddReturnsRMA(t *testing.T) {
+	Convey("Given a host that refuses the plugin add", t, func() {
+		h, cli, st, _ := codexSynthWorld(t)
+		cli.fail["plugin add caveman@acme"] = hostcli.Response{Code: 1, Stderr: "Error: install failed"}
+
+		res, err := h.Deliver(t.Context(), "", host.Delivery{Package: synthPackage(t, st, "acme/caveman", "1.0.0"), Strategy: host.Synth})
+
+		Convey("When the adapter delivers", func() {
+			Convey("Then the error carries the executed RMA", func() {
+				So(err, ShouldNotBeNil)
+				So(res.RMA, ShouldHaveLength, 2)
+			})
+		})
+	})
 }
 
 func TestCodexInstallRefusals(t *testing.T) {
@@ -1200,9 +1205,9 @@ func TestCodexNativeVerifyFailure(t *testing.T) {
 		ref := "https://github.com/acme/plugins.git"
 
 		h, runner := newCodex(t, home, map[string]hostcli.Response{
-			"codex plugin marketplace add " + ref:  response(""),
-			"codex plugin install caveman@plugins": response(""),
-			"codex plugin list --json":             response("[]"),
+			"codex plugin marketplace add " + ref + " --json": response(`{"marketplaceName":"plugins"}`),
+			"codex plugin add caveman@plugins":                response(""),
+			"codex plugin list --json":                        response(codexList()),
 		})
 
 		pkg := codexPackage(t)
@@ -1290,9 +1295,9 @@ func TestCodexUninstall(t *testing.T) {
 		t.Setenv("CODEX_HOME", "")
 
 		h, runner := newCodex(t, home, map[string]hostcli.Response{
-			"codex plugin uninstall caveman@plugins": response(""),
-			"codex plugin list --json":               response("[]"),
-			"codex plugin marketplace rm plugins":    response(""),
+			"codex plugin remove caveman@plugins":     response(""),
+			"codex plugin list --json":                response(codexList()),
+			"codex plugin marketplace remove plugins": response(""),
 		})
 
 		r := receipt.Receipt{
@@ -1301,8 +1306,8 @@ func TestCodexUninstall(t *testing.T) {
 			Scope:    receipt.ScopeUser,
 			Strategy: string(host.Native),
 			RMA: []receipt.Op{
-				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "rm", "plugins"}},
-				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "uninstall", "caveman@plugins"}},
+				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "remove", "plugins"}},
+				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "remove", "caveman@plugins"}},
 				{Kind: receipt.OpWriteFile, Path: filepath.Join(home, "file"), Digest: "aa"},
 			},
 		}
@@ -1313,22 +1318,22 @@ func TestCodexUninstall(t *testing.T) {
 			Convey("Then host ops run in reverse order, the marketplace after an empty refcount", func() {
 				So(err, ShouldBeNil)
 				So(callKeys(runner), ShouldResemble, []string{
-					"codex plugin uninstall caveman@plugins",
+					"codex plugin remove caveman@plugins",
 					"codex plugin list --json",
-					"codex plugin marketplace rm plugins",
+					"codex plugin marketplace remove plugins",
 				})
 				So(res.Strategy, ShouldEqual, host.Native)
 			})
 		})
 
 		Convey("When another plugin still comes from the marketplace", func() {
-			runner.Set("codex plugin list --json", response(`[{"name":"other","marketplace":"plugins"}]`))
+			runner.Set("codex plugin list --json", response(codexList("other@plugins")))
 
 			res, err := h.Uninstall(t.Context(), home, r)
 
 			Convey("Then the marketplace is kept with a note (§4.8 refcount)", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldNotContain, "codex plugin marketplace rm plugins")
+				So(callKeys(runner), ShouldNotContain, "codex plugin marketplace remove plugins")
 				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "still serves 1")
 			})
 		})
@@ -1340,48 +1345,84 @@ func TestCodexUninstall(t *testing.T) {
 
 			Convey("Then the marketplace is kept rather than pulled from under unknown plugins", func() {
 				So(err, ShouldBeNil)
-				So(callKeys(runner), ShouldNotContain, "codex plugin marketplace rm plugins")
+				So(callKeys(runner), ShouldNotContain, "codex plugin marketplace remove plugins")
 				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "kept")
+			})
+		})
+
+		Convey("When the marketplace is no longer configured", func() {
+			runner.Set("codex plugin marketplace remove plugins",
+				hostcli.Response{Code: 1, Stderr: "Error: marketplace `plugins` is not configured or installed"})
+
+			res, err := h.Uninstall(t.Context(), home, r)
+
+			Convey("Then it is already removed, with a note", func() {
+				So(err, ShouldBeNil)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "was not configured")
 			})
 		})
 	})
 
-	Convey("Given a failing codex plugin uninstall", t, func() {
+	Convey("Given a receipt recorded before the codex-cli 0.157.1 grammar was verified", t, func() {
 		fakeCodex(t)
 		home := t.TempDir()
 		t.Setenv("CODEX_HOME", "")
 
-		marketplace := filepath.Join(home, ".agents", "plugins", "marketplace.json")
-
-		writeFixtureFile(t, marketplace, `{"plugins":{"caveman":{"source":{"source":"local","path":"/store/synth"}}}}`, 0o600)
-
-		digest := digest.Bytes([]byte(`{"source":{"path":"/store/synth","source":"local"}}`))
-
-		h, _ := newCodex(t, home, map[string]hostcli.Response{
-			"codex plugin uninstall caveman@acme": {Code: 1, Stderr: "no such plugin"},
-			"codex plugin list --json":            response("[]"),
-			"codex plugin marketplace rm acme":    {Code: 1, Stderr: "no such marketplace"},
+		h, runner := newCodex(t, home, map[string]hostcli.Response{
+			"codex plugin remove caveman@acme":     response(""),
+			"codex plugin list --json":             response(codexList()),
+			"codex plugin marketplace remove acme": response(""),
 		})
 
-		r := receipt.Receipt{
-			Package:  "acme/caveman",
-			Host:     "codex",
-			Scope:    receipt.ScopeUser,
-			Strategy: string(host.Synth),
+		_, err := h.Uninstall(t.Context(), home, receipt.Receipt{
+			Package: "acme/caveman", Host: "codex", Scope: receipt.ScopeUser, Strategy: string(host.Synth),
 			RMA: []receipt.Op{
-				{Kind: receipt.OpConfigKey, Path: marketplace, KeyPath: "plugins.caveman", Digest: digest, Existed: false},
 				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "rm", "acme"}},
 				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "uninstall", "caveman@acme"}},
 			},
-		}
-
-		res, err := h.Uninstall(t.Context(), home, r)
+		})
 
 		Convey("When it is uninstalled", func() {
-			Convey("Then it falls back to removing the owned marketplace entry", func() {
+			Convey("Then the legacy verbs run as the real ones", func() {
 				So(err, ShouldBeNil)
-				So(readTestFile(t, marketplace), ShouldEqualJSON, `{"plugins":{}}`)
-				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "fallback")
+				So(callKeys(runner), ShouldResemble, []string{
+					"codex plugin remove caveman@acme",
+					"codex plugin list --json",
+					"codex plugin marketplace remove acme",
+				})
+			})
+		})
+	})
+}
+
+// TestCodexUninstallKeepsExistedResources pins the Host.Deliver contract on the
+// codex host-install path: an op marked Existed predates the delivery, so its
+// inverse is a no-op with a note and no CLI call — the plugin and the
+// marketplace stay. (This adapter records Existed=false on the plugin path:
+// `plugin add` is the delivery's own target and is idempotent, so `plugin
+// remove` is the right inverse, exactly as the claude adapter treats it.)
+func TestCodexUninstallKeepsExistedResources(t *testing.T) {
+	Convey("Given a receipt whose host-install ops predate the delivery", t, func() {
+		fakeCodex(t)
+		home := t.TempDir()
+		t.Setenv("CODEX_HOME", "")
+
+		h, runner := newCodex(t, home, nil)
+
+		res, err := h.Uninstall(t.Context(), home, receipt.Receipt{
+			Package: "acme/caveman", Host: "codex", Scope: receipt.ScopeUser, Strategy: string(host.Native),
+			RMA: []receipt.Op{
+				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "remove", "acme"}, Existed: true},
+				{Kind: receipt.OpHostInstall, Command: []string{"plugin", "remove", "caveman@acme"}, Existed: true},
+			},
+		})
+
+		Convey("When it is uninstalled", func() {
+			Convey("Then both resources are kept, noted, and no host call runs", func() {
+				So(err, ShouldBeNil)
+				So(runner.Calls(), ShouldBeEmpty)
+				So(res.Notes, ShouldHaveLength, 2)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "existed before this delivery; kept")
 			})
 		})
 	})

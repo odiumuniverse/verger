@@ -1,0 +1,42 @@
+{
+  "installed": [
+    {
+      "pluginId": "foo@acme",
+      "name": "foo",
+      "marketplaceName": "acme",
+      "version": "1.1.0",
+      "installed": true,
+      "enabled": true,
+      "source": {
+        "source": "local",
+        "path": "/home/u/mkt/acme/foo/1.1.0"
+      },
+      "marketplaceSource": {
+        "sourceType": "local",
+        "source": "/home/u/mkt/acme"
+      },
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL"
+    }
+  ],
+  "available": [
+    {
+      "pluginId": "bar@acme",
+      "name": "bar",
+      "marketplaceName": "acme",
+      "version": "2.0.0",
+      "installed": false,
+      "enabled": false,
+      "source": {
+        "source": "local",
+        "path": "/home/u/mkt/acme/bar/2.0.0"
+      },
+      "marketplaceSource": {
+        "sourceType": "local",
+        "source": "/home/u/mkt/acme"
+      },
+      "installPolicy": "AVAILABLE",
+      "authPolicy": "ON_INSTALL"
+    }
+  ]
+}
