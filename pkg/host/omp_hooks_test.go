@@ -69,6 +69,7 @@ func TestOmpHookModulesDelivered(t *testing.T) {
 				notes := strings.Join(res.Notes, "\n")
 				So(notes, ShouldContainSubstring, "2 hook module(s) are code the host runs unsandboxed")
 				So(notes, ShouldContainSubstring, "no trust gate")
+				So(notes, ShouldContainSubstring, "restart omp to load them")
 			})
 
 			Convey("Then the load probe ran and the module passed it", func() {

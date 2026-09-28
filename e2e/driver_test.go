@@ -729,10 +729,30 @@ func manualInstallCodex(t *testing.T, env Env) {
 // manualInstallGemini links the fixture as an extension. --consent mirrors
 // the adapter's flagConsent: without it gemini-cli asks for workspace trust
 // and hangs a non-interactive run.
+//
+// The fixture is staged first: its manifest name is the owner-bearing package
+// id (`acme/e2e-fixture`), which the synth rung needs, while gemini-cli 0.61.0
+// refuses such a name in its own grammar — "Invalid extension name:
+// "acme/e2e-fixture". Only letters (a-z, A-Z), numbers (0-9), and dashes (-)
+// are allowed." The staged copy carries the bare name the oracle then lists,
+// which is what `adopt gemini:<name>` looks up.
 func manualInstallGemini(t *testing.T, env Env) {
 	t.Helper()
 
-	out, code := runHost(t, env, "gemini", "extensions", "link", filepath.Join(env.Work, "fixture"), "--consent")
+	root := filepath.Join(env.Work, "gemini-extension")
+
+	if err := os.CopyFS(root, os.DirFS(filepath.Join(env.Work, "fixture"))); err != nil {
+		t.Fatalf("e2e: stage the fixture for gemini: %v", err)
+	}
+
+	writeFile(t, filepath.Join(root, "gemini-extension.json"), fmt.Sprintf(`{
+  "name": %q,
+  "version": "1.0.0",
+  "description": "verger e2e fixture"
+}
+`, fixtureName))
+
+	out, code := runHost(t, env, "gemini", "extensions", "link", root, "--consent")
 	if code != 0 {
 		t.Fatalf("e2e: gemini extensions link -> %d\n%s", code, out)
 	}
@@ -1302,6 +1322,28 @@ func TestUnitOmpSpec(t *testing.T) {
 
 	if marker := filepath.ToSlash(looseSkillMarker("/home", "omp")); !strings.HasSuffix(marker, "/.agents/skills/e2e-skill/SKILL.md") {
 		t.Fatalf("omp loose marker = %q, want the shared ~/.agents skill tree", marker)
+	}
+}
+
+// TestUnitGeminiStagedName pins the gemini manual install against the real
+// grammar: gemini-cli 0.61.0 refuses an extension name carrying anything but
+// letters, digits and dashes ("Invalid extension name: \"acme/e2e-fixture\""),
+// so the adopt leg stages a copy named after the fixture and adopts that name.
+func TestUnitGeminiStagedName(t *testing.T) {
+	if strings.ContainsAny(fixtureName, "/\\ :@") {
+		t.Fatalf("fixtureName %q is not a gemini-legal extension name", fixtureName)
+	}
+
+	for _, r := range fixtureName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+
+		t.Fatalf("fixtureName %q carries %q, which gemini-cli 0.61.0 rejects", fixtureName, r)
+	}
+
+	if !strings.ContainsAny(fixtureManifestName(), "/") {
+		t.Fatalf("fixtureManifestName() = %q, want the owner-bearing id the synth rung needs", fixtureManifestName())
 	}
 }
 

@@ -958,7 +958,7 @@ func (p *loosePlanner) hookModules() error {
 		written++
 	}
 
-	p.note("%d hook module(s) are code the host runs unsandboxed on every session, with no trust gate of its own; %s loads them from the next session",
+	p.note("%d hook module(s) are code the host runs unsandboxed on every session, with no trust gate of its own; restart %s to load them (a live session imports neither the module nor an edit to it, and reloading plugins does not either)",
 		written, p.spec.host)
 
 	return nil
