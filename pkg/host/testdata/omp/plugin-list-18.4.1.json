@@ -1,0 +1,18 @@
+{
+  "npm": [],
+  "marketplace": [
+    {
+      "id": "alpha@acme",
+      "scope": "user",
+      "entries": [
+        {
+          "scope": "user",
+          "installPath": "/tmp/omp-probe/home6/.omp/plugins/cache/plugins/acme___alpha___1.0.0",
+          "version": "1.0.0",
+          "installedAt": "2026-09-28T11:12:21.220Z",
+          "lastUpdated": "2026-09-28T11:12:21.220Z"
+        }
+      ]
+    }
+  ]
+}

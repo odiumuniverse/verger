@@ -1,0 +1,1 @@
+✘ Failed to add marketplace: Error: Marketplace "Acme" conflicts with existing marketplace "acme" on case-insensitive filesystems

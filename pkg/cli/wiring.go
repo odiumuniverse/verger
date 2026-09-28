@@ -191,7 +191,7 @@ func (a *app) hosts(client *verger.Client) []host.Host {
 		options = append(options, host.WithHome(userHome))
 	}
 
-	factories := []func(...host.Option) host.Host{host.NewClaude, host.NewCodex, host.NewGemini}
+	factories := []func(...host.Option) host.Host{host.NewClaude, host.NewCodex, host.NewGemini, host.NewOmp}
 
 	out := make([]host.Host, 0, len(factories))
 
@@ -835,6 +835,8 @@ func hostCLIName(id host.ID) (string, bool) {
 		return "pi", true
 	case host.DSH:
 		return "dsh", true
+	case host.Omp:
+		return "omp", true
 	default:
 		return "", false
 	}

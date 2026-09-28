@@ -13,9 +13,9 @@ import (
 var isolatedHome string
 
 // TestMain pins HOME, VERGER_HOME, BEADLE_HOME, XDG_CONFIG_HOME,
-// XDG_DATA_HOME, CLAUDE_CONFIG_DIR and CODEX_HOME before the suite runs, so a
-// test that forgets its own t.Setenv cannot touch the developer's real home or
-// profile.
+// XDG_DATA_HOME, CLAUDE_CONFIG_DIR, CODEX_HOME and the omp relocations before
+// the suite runs, so a test that forgets its own t.Setenv cannot touch the
+// developer's real home or profile.
 func TestMain(m *testing.M) {
 	os.Exit(isolateTestHome(m)) // os.Exit skips defers: clean up inside the helper
 }
@@ -38,6 +38,12 @@ func isolateTestHome(m *testing.M) int {
 		"XDG_DATA_HOME":     filepath.Join(home, ".local", "share"),
 		"CLAUDE_CONFIG_DIR": "",
 		"CODEX_HOME":        "",
+		// omp relocates its agent dir through these; an omp adapter test that
+		// forgot to pin them would write into the real one.
+		"PI_CODING_AGENT_DIR": "",
+		"PI_CONFIG_DIR":       "",
+		"OMP_PROFILE":         "",
+		"PI_PROFILE":          "",
 	} {
 		//nolint:usetesting // TestMain cannot use t.Setenv; tests override per test
 		if err := os.Setenv(name, value); err != nil {

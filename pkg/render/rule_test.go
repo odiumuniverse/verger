@@ -184,3 +184,107 @@ Second line.
 		})
 	})
 }
+
+// TestRuleMarkdown pins the omp rulebook rendering: the source frontmatter
+// survives with the documented keys first, an unknown key stays, and a rule
+// without a description gains one from its first non-empty line (omp drops a
+// rule that carries no condition, no alwaysApply and no description).
+func TestRuleMarkdown(t *testing.T) {
+	Convey("Given a rule with frontmatter", t, func() {
+		source := []byte(`---
+description: Always-on house style.
+globs:
+  - "**/*.go"
+alwaysApply: true
+customField: kept
+---
+
+Tabs never reach the tree.
+`)
+
+		content, err := render.RuleMarkdown("always", source)
+
+		Convey("When it is rendered", func() {
+			Convey("Then the documented keys keep their order and the unknown key survives", func() {
+				So(err, ShouldBeNil)
+				So(string(content), ShouldEqual, `---
+description: Always-on house style.
+globs: ['**/*.go']
+alwaysApply: true
+customField: kept
+---
+Tabs never reach the tree.
+`)
+			})
+		})
+	})
+
+	Convey("Given a rule without frontmatter", t, func() {
+		content, err := render.RuleMarkdown("caveman", []byte("\nSpeak like caveman.\nSecond line.\n"))
+
+		Convey("When it is rendered", func() {
+			Convey("Then a description is derived from the first non-empty line", func() {
+				So(err, ShouldBeNil)
+				So(string(content), ShouldEqual, `---
+description: Speak like caveman.
+---
+Speak like caveman.
+Second line.
+`)
+			})
+		})
+	})
+
+	Convey("Given a rule whose description is blank", t, func() {
+		content, err := render.RuleMarkdown("blank", []byte("---\ndescription: \"  \"\nglobs: [\"*.md\"]\n---\nKeep it short.\n"))
+
+		Convey("When it is rendered", func() {
+			Convey("Then the blank description is replaced, not dropped", func() {
+				So(err, ShouldBeNil)
+				So(string(content), ShouldContainSubstring, "description: Keep it short.")
+				So(string(content), ShouldContainSubstring, "globs: ['*.md']")
+			})
+		})
+	})
+
+	Convey("Given an empty rule", t, func() {
+		for i, source := range [][]byte{nil, {}, []byte("   \n\t\n"), []byte("---\nname: x\n---\n")} {
+			Convey("When empty rule form "+strconv.Itoa(i)+" is rendered", func() {
+				_, err := render.RuleMarkdown("empty", source)
+
+				_, ok := errors.AsType[*render.RenderError](err)
+
+				Convey("Then it is refused", func() {
+					So(ok, ShouldBeTrue)
+				})
+			})
+		}
+	})
+
+	Convey("Given a malformed frontmatter block", t, func() {
+		_, err := render.RuleMarkdown("bad", []byte("---\nglobs: [unclosed\n---\nbody\n"))
+
+		Convey("When it is rendered", func() {
+			Convey("Then the parse failure is reported, never silently dropped", func() {
+				_, ok := errors.AsType[*render.RenderError](err)
+				So(ok, ShouldBeTrue)
+			})
+		})
+	})
+
+	Convey("Given a rule with a long and multibyte first line", t, func() {
+		line := strings.Repeat("я", 130)
+
+		content, err := render.RuleMarkdown("long", []byte(line+"\nbody\n"))
+
+		Convey("When it is rendered", func() {
+			Convey("Then the derived description is 120 valid runes", func() {
+				So(err, ShouldBeNil)
+
+				description := descriptionOf(t, string(content))
+				So(description, ShouldEqual, string([]rune(line)[:120]))
+				So(utf8.ValidString(description), ShouldBeTrue)
+			})
+		})
+	})
+}

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -26,7 +27,8 @@ import (
 // ID identifies one agent host.
 type ID string
 
-// Host ids of Ф1 (all nine are declared; adapters arrive per task).
+// Host ids of Ф1 (the nine Ф1 ids plus omp, whose adapter arrives in Ф2;
+// adapters are registered one task at a time).
 const (
 	Claude   ID = "claude"
 	Codex    ID = "codex"
@@ -37,6 +39,7 @@ const (
 	Kilo     ID = "kilo"
 	Pi       ID = "pi"
 	DSH      ID = "dsh"
+	Omp      ID = "omp"
 )
 
 // Strategy is how a package is delivered into a host.
@@ -141,6 +144,13 @@ const (
 	stepPolicy    = "policy"
 	stepUninstall = "uninstall"
 )
+
+// isFile reports whether path is an existing regular file.
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+
+	return err == nil && info.Mode().IsRegular()
+}
 
 // warningLines returns the non-empty trimmed lines of host output.
 func warningLines(out []byte) []string {
@@ -354,6 +364,31 @@ func hostInverses(ctx context.Context, r receipt.Receipt, run func(context.Conte
 	}
 
 	return notes, nil
+}
+
+// marketplaceRefcount is the §4.8 refcount of one marketplace: it is kept
+// while the oracle lists a plugin from it, and kept when the oracle cannot tell
+// — removing a marketplace another plugin needs is worse than leaving it. The
+// listing is the host's own oracle, read-only.
+func marketplaceRefcount(ctx context.Context, host ID, listed func(context.Context) ([]Installed, error), marketplace string) (string, bool) {
+	entries, err := listed(ctx)
+	if err != nil {
+		return fmt.Sprintf("%s plugin list failed (%v); marketplace %s kept", host, err, marketplace), true
+	}
+
+	serving := 0
+
+	for _, entry := range entries {
+		if entry.Marketplace == marketplace {
+			serving++
+		}
+	}
+
+	if serving > 0 {
+		return fmt.Sprintf("marketplace %s still serves %d installed plugin(s); kept", marketplace, serving), true
+	}
+
+	return "", false
 }
 
 // UnsupportedStrategyError reports a strategy the adapter never delivers.

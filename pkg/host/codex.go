@@ -193,7 +193,7 @@ func (h *codex) install(ctx context.Context, pkg Package, plan *codexInstall) (O
 
 	entry, found := installedAs(listed, plan.plugin, plan.marketplace)
 
-	if found && staleSynthVersion(plan, entry, pkg.Version) {
+	if found && staleSynthVersion(plan.synth != nil, entry, pkg.Version) {
 		found = false
 	}
 
@@ -209,12 +209,12 @@ func (h *codex) install(ctx context.Context, pkg Package, plan *codexInstall) (O
 	return OracleResult{Listed: listed, Verified: true}, nil
 }
 
-// staleSynthVersion reports whether the oracle lists the plugin at a version
-// other than the one this delivery renders. A synth install renders exactly
-// its own version, so any other listing is not this install; when either side
-// reports no version the plain match decides.
-func staleSynthVersion(plan *codexInstall, entry Installed, version string) bool {
-	return plan.synth != nil && entry.Version != "" && version != "" && entry.Version != version
+// staleSynthVersion reports whether the oracle lists a plugin at a version
+// other than the one this delivery renders. A synth install renders exactly its
+// own version, so any other listing is not this install; when either side
+// reports no version, or the delivery is not synth, the plain match decides.
+func staleSynthVersion(synth bool, entry Installed, version string) bool {
+	return synth && entry.Version != "" && version != "" && entry.Version != version
 }
 
 // addedMarketplace reads the marketplace name `plugin marketplace add --json`
@@ -356,28 +356,11 @@ func codexArgv(argv []string) []string {
 	}
 }
 
-// marketplaceInUse is the §4.8 refcount of one marketplace: it is kept while
-// the oracle lists a plugin from it, and kept when the oracle cannot tell —
-// removing a marketplace another plugin needs is worse than leaving it.
+// marketplaceInUse is the §4.8 refcount of one marketplace (shared with the
+// omp adapter): it is kept while the oracle lists a plugin from it, and kept
+// when the oracle cannot tell.
 func (h *codex) marketplaceInUse(ctx context.Context, marketplace string) (string, bool) {
-	listed, err := h.Oracle().List(ctx)
-	if err != nil {
-		return fmt.Sprintf("codex plugin list failed (%v); marketplace %s kept", err, marketplace), true
-	}
-
-	serving := 0
-
-	for _, entry := range listed {
-		if entry.Marketplace == marketplace {
-			serving++
-		}
-	}
-
-	if serving > 0 {
-		return fmt.Sprintf("marketplace %s still serves %d installed plugin(s); kept", marketplace, serving), true
-	}
-
-	return "", false
+	return marketplaceRefcount(ctx, Codex, h.Oracle().List, marketplace)
 }
 
 // codexOracle is the Codex CLI oracle: list JSON, never an LLM.

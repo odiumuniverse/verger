@@ -133,10 +133,10 @@ func TestClaudeKnownAndAliases(t *testing.T) {
 		all := host.All()
 
 		Convey("Then every spec id is known and All is complete and ordered", func() {
-			So(all, ShouldHaveLength, 9)
+			So(all, ShouldHaveLength, 10)
 			So(all, ShouldResemble, []host.ID{
 				host.Claude, host.Codex, host.Gemini, host.Agy, host.Cursor,
-				host.OpenCode, host.Kilo, host.Pi, host.DSH,
+				host.OpenCode, host.Kilo, host.Pi, host.DSH, host.Omp,
 			})
 
 			for _, id := range all {

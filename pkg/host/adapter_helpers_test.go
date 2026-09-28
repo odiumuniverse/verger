@@ -868,3 +868,199 @@ func assertCLIPolicyBlocked(t *testing.T, home string, pkg host.Package, adapter
 		})
 	}
 }
+
+// ompCLI is a stateful fake of the omp 18.4.1 plugin grammar with the output
+// shapes and refusal texts captured live (docs/reviews/omp-grammar.probe.log,
+// fixtures in testdata/omp/): `--json` is honoured on `plugin list` alone,
+// marketplaces register under the name their document declares, `marketplace
+// add` is not idempotent, `plugin install` needs --force to reinstall, and
+// every refusal goes to stderr with exit 1.
+type ompCLI struct {
+	mu           sync.Mutex
+	marketplaces map[string]string // name → registered path
+	installed    map[string]string // plugin@marketplace → version
+	fail         map[string]hostcli.Response
+	calls        []string
+}
+
+// newOmpCLI builds an empty fake.
+func newOmpCLI() *ompCLI {
+	return &ompCLI{marketplaces: map[string]string{}, installed: map[string]string{}, fail: map[string]hostcli.Response{}}
+}
+
+// Run implements hostcli.Runner.
+func (o *ompCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, error) {
+	key := strings.Join(args, " ")
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.calls = append(o.calls, bin.Name+" "+key)
+
+	if resp, ok := o.fail[key]; ok {
+		return resp.Stdout, &hostcli.ExitError{Name: bin.Name, Code: resp.Code, Stderr: resp.Stderr}
+	}
+
+	return o.dispatch(key, args)
+}
+
+// dispatch routes one recorded call; --json is dropped first, exactly as the
+// real CLI ignores it outside `plugin list` (the fake answers the same bytes
+// either way, so a test can assert the flag was or was not passed).
+func (o *ompCLI) dispatch(key string, args []string) ([]byte, error) {
+	bare := slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == flagJSONTest })
+
+	switch {
+	case len(bare) == 3 && bare[0] == "plugin" && bare[1] == "marketplace" && bare[2] == "list":
+		return o.marketplaceList(), nil
+	case len(bare) >= 4 && bare[0] == "plugin" && bare[1] == "marketplace":
+		return o.marketplace(bare[2], bare[3])
+	case len(bare) == 2 && bare[0] == "plugin" && bare[1] == "list":
+		return o.pluginList()
+	case len(bare) >= 3 && bare[0] == "plugin":
+		return o.plugin(bare[1], bare[2], slices.Contains(bare[3:], "--force"))
+	default:
+		return nil, ompRefused(1, "✘ error: unrecognized command '%s'", key)
+	}
+}
+
+// Calls returns the recorded calls as `<name> <joined args>` keys.
+func (o *ompCLI) Calls() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return slices.Clone(o.calls)
+}
+
+// Registered reports the path of a registered marketplace.
+func (o *ompCLI) Registered(name string) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	path, ok := o.marketplaces[name]
+
+	return path, ok
+}
+
+// Installed reports the version of an installed plugin selector.
+func (o *ompCLI) Installed(id string) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	version, ok := o.installed[id]
+
+	return version, ok
+}
+
+// ompRefused is a non-zero exit of the fake omp CLI; omp writes every refusal
+// to stderr and leaves stdout empty.
+func ompRefused(code int, format string, args ...any) error {
+	return &hostcli.ExitError{Name: "omp", Code: code, Stderr: fmt.Sprintf(format, args...)}
+}
+
+// marketplaceList is `omp plugin marketplace list` (its text table: --json is
+// ignored by omp 18.4.1 on this verb).
+func (o *ompCLI) marketplaceList() []byte {
+	if len(o.marketplaces) == 0 {
+		return []byte("No marketplaces configured\n\nAdd one with: omp plugin marketplace add <source>\n")
+	}
+
+	var b strings.Builder
+
+	b.WriteString("Configured Marketplaces:\n\n")
+
+	for _, name := range slices.Sorted(maps.Keys(o.marketplaces)) {
+		b.WriteString("  " + name + "  " + o.marketplaces[name] + "\n")
+	}
+
+	return []byte(b.String())
+}
+
+// pluginList is `omp plugin list --json`.
+func (o *ompCLI) pluginList() ([]byte, error) {
+	out := []map[string]any{}
+
+	for _, id := range slices.Sorted(maps.Keys(o.installed)) {
+		plugin, marketplace := splitTestID(id)
+		out = append(out, map[string]any{
+			"id": id, "scope": "user",
+			"entries": []map[string]any{{
+				"scope": "user", "version": o.installed[id],
+				"installPath": filepath.Join(".omp", "plugins", "cache", "plugins", marketplace+"___"+plugin+"___"+o.installed[id]),
+			}},
+		})
+	}
+
+	return json.MarshalIndent(map[string]any{"npm": []any{}, "marketplace": out}, "", "  ")
+}
+
+// marketplace runs one `omp plugin marketplace add|remove <arg>`.
+func (o *ompCLI) marketplace(verb, arg string) ([]byte, error) {
+	switch verb {
+	case "add":
+		name, _, err := readTestMarketplace(arg)
+		if err != nil {
+			return nil, ompRefused(1, "✘ Failed to add marketplace: Error: %v", err)
+		}
+
+		for registered := range o.marketplaces {
+			if strings.EqualFold(registered, name) {
+				return nil, ompRefused(1, "✘ Failed to add marketplace: Error: Marketplace %q already exists", registered)
+			}
+		}
+
+		o.marketplaces[name] = arg
+
+		return []byte("✔ Added marketplace: " + arg + "\n"), nil
+	case "remove":
+		if _, ok := o.marketplaces[arg]; !ok {
+			return nil, ompRefused(1, "✘ Failed to remove marketplace: Error: Marketplace %q not found", arg)
+		}
+
+		delete(o.marketplaces, arg)
+
+		return []byte("✔ Removed marketplace: " + arg + "\n"), nil
+	default:
+		return nil, ompRefused(1, "✘ error: unrecognized marketplace verb %s", verb)
+	}
+}
+
+// plugin runs one `omp plugin install|uninstall <selector>`.
+func (o *ompCLI) plugin(verb, id string, force bool) ([]byte, error) {
+	plugin, marketplace := splitTestID(id)
+
+	switch verb {
+	case "install":
+		root, ok := o.marketplaces[marketplace]
+		if !ok {
+			return nil, ompRefused(1, "✘ Failed to install %s: Error: Marketplace %q not found", id, marketplace)
+		}
+
+		version, err := testPluginVersion(root, plugin)
+		if err != nil {
+			return nil, ompRefused(1, "✘ Failed to install %s: Error: %v", id, err)
+		}
+
+		if _, installed := o.installed[id]; installed && !force {
+			return nil, ompRefused(1, "✘ Failed to install %s: Error: Plugin %q is already installed. Use force option to reinstall.", id, id)
+		}
+
+		o.installed[id] = version
+
+		return []byte("✔ Installed " + plugin + " from " + marketplace + " (" + version + ")\n"), nil
+	case "uninstall":
+		if _, installed := o.installed[id]; !installed {
+			return nil, ompRefused(1, "✘ %s is not installed", id)
+		}
+
+		delete(o.installed, id)
+
+		return []byte("✔ Uninstalled " + id + "\n"), nil
+	default:
+		return nil, ompRefused(1, "✘ error: unrecognized plugin verb %s", verb)
+	}
+}
+
+// flagJSONTest is the --json flag as the fake sees it (the adapter's own
+// constant is unexported to the test package).
+const flagJSONTest = "--json"

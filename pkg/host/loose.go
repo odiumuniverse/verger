@@ -131,9 +131,12 @@ type looseSpec struct {
 	renderAgent    func(render.Agent, string) ([]byte, error) // default Agent.ClaudeMarkdown
 	commandExt     string                                     // rendered command file extension, default ".md"
 	renderCommand  func(render.Command) ([]byte, error)       // default Command.Markdown
+	rulesDir       string                                     // host-native rulebook dir; empty keeps the D23 skill wrapper
+	renderRule     func(string, []byte) ([]byte, error)       // default render.RuleMarkdown
 	hooksPath      string                                     // hooks document, default settingsPath
 	hooksFormat    manifest.Format                            // hook dialect, default FormatClaude
 	hooksTrustNote bool                                       // Codex: hooks need a /hooks review
+	hooksBlocked   string                                     // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
 	mcpConfig      *mcpConfigSpec                             // config-document MCP surface (Codex, Gemini)
 	variables      map[string]string                          // host-specific braced variables (Gemini extensionPath)
 }
@@ -200,6 +203,15 @@ func (s looseSpec) renderedCommand(cmd render.Command) ([]byte, error) {
 	}
 
 	return cmd.Markdown(), nil
+}
+
+// renderedRule renders one rule source as the surface's rulebook document.
+func (s looseSpec) renderedRule(name string, rule []byte) ([]byte, error) {
+	if s.renderRule != nil {
+		return s.renderRule(name, rule)
+	}
+
+	return render.RuleMarkdown(name, rule)
 }
 
 // looseStepKind tags one planned side effect.
@@ -723,11 +735,16 @@ func (p *loosePlanner) commandDocument(component manifest.Component) (render.Com
 	}
 }
 
-// rule plans one rule wrapped as a skill (D23).
+// rule plans one rule: the host-native rulebook document when the surface
+// declares a rules dir, else the D23 skill wrapper.
 func (p *loosePlanner) rule(component manifest.Component) error {
 	data, err := p.sourceFile(component)
 	if err != nil {
 		return err
+	}
+
+	if p.spec.rulesDir != "" {
+		return p.nativeRule(component, data)
 	}
 
 	rel, content, err := render.RuleSkill(component.Name, data)
@@ -756,6 +773,27 @@ func (p *loosePlanner) rule(component manifest.Component) error {
 	return p.writeRendered("rule", component.Name, file, content, dirOwned || fileOwned)
 }
 
+// nativeRule plans one host-native rule document (`<rulesDir>/<name>.md`); the
+// renderer preserves the source frontmatter and guarantees what the host needs
+// to see the rule at all.
+func (p *loosePlanner) nativeRule(component manifest.Component, data []byte) error {
+	target := filepath.Join(p.spec.rulesDir, component.Name+markdownExt)
+
+	keep, err := p.checkOwnership(target, false)
+	if err != nil || !keep {
+		return err
+	}
+
+	rendered, err := p.spec.renderedRule(component.Name, data)
+	if err != nil {
+		return p.deliveryError(stepPlan, err)
+	}
+
+	_, existed := p.ownerOf(target)
+
+	return p.writeRendered("rule", component.Name, target, rendered, existed)
+}
+
 // writeRendered plans one rendered file write.
 func (p *loosePlanner) writeRendered(kind, name, target string, data []byte, existed bool) error {
 	sum := digest.Bytes(data)
@@ -770,9 +808,16 @@ func (p *loosePlanner) writeRendered(kind, name, target string, data []byte, exi
 }
 
 // hooks plans the shared hooks document edit; hooks are only written when the
-// delivery allows them.
+// delivery allows them, and never for a host whose hooks are code modules
+// rather than a declarative document (looseSpec.hooksBlocked).
 func (p *loosePlanner) hooks() error {
 	if len(p.pkg.Hooks) == 0 {
+		return nil
+	}
+
+	if p.spec.hooksBlocked != "" {
+		p.note("%d hook(s) skipped: %s", len(p.pkg.Hooks), p.spec.hooksBlocked)
+
 		return nil
 	}
 

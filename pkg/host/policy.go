@@ -80,6 +80,12 @@ func policyFiles(host ID, home string) []string {
 		}
 
 		return files
+	case Omp:
+		// Conscious nil: omp has no managed policy document. Its settings file
+		// (`<agentDir>/config.yml`) carries UI and approval preferences and no
+		// marketplace allow/deny list, and there is no `EditYAML` to write it
+		// anyway — a policy verger cannot read is not a policy it may claim.
+		return nil
 	default:
 		return nil
 	}
