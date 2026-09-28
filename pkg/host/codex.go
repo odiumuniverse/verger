@@ -152,7 +152,7 @@ func (h *codex) deliverInstall(ctx context.Context, home string, d Delivery, syn
 	}
 
 	if d.DryRun {
-		return Result{Strategy: d.Strategy, RMA: plan.rma(), Notes: []string{"dry-run"}}, nil
+		return Result{Strategy: d.Strategy, RMA: plan.rma(), Notes: []string{noteDryRun}}, nil
 	}
 
 	observed, err := h.install(ctx, d.Package, &plan)
@@ -250,11 +250,11 @@ func (h *codex) installPlan(ctx context.Context, d Delivery, synth bool) (codexI
 
 	_, name := splitID(d.Package.ID)
 	if name == "" {
-		return codexInstall{}, &NotSupportedError{Host: Codex, Operation: "install without a package name"}
+		return codexInstall{}, &NotSupportedError{Host: Codex, Operation: unsupportedNoName}
 	}
 
 	if d.Package.Marketplace == "" {
-		return codexInstall{}, &NotSupportedError{Host: Codex, Operation: "native install without a marketplace"}
+		return codexInstall{}, &NotSupportedError{Host: Codex, Operation: unsupportedNoMarketplace}
 	}
 
 	// The planned name is the ref's last segment; the add reports the real one.

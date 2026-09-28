@@ -171,8 +171,8 @@ func agentFields(agent Agent) []field {
 		value any
 		ok    bool
 	}{
-		{"name", agent.Name, agent.Name != ""},
-		{"description", agent.Description, agent.Description != ""},
+		{keyName, agent.Name, agent.Name != ""},
+		{keyDescription, agent.Description, agent.Description != ""},
 		{"mode", agent.Mode, agent.Mode != ""},
 		{"model", agent.Model, agent.Model != ""},
 		{"tools", agent.Tools, len(agent.Tools) > 0},

@@ -150,7 +150,7 @@ func (h *gemini) deliverInstall(ctx context.Context, home string, d Delivery, sy
 	}
 
 	if d.DryRun {
-		return Result{Strategy: d.Strategy, RMA: slices.Clone(plan.rma), Notes: []string{"dry-run"}}, nil
+		return Result{Strategy: d.Strategy, RMA: slices.Clone(plan.rma), Notes: []string{noteDryRun}}, nil
 	}
 
 	artifacts, observed, err := h.install(ctx, d.Package, plan)
@@ -224,11 +224,11 @@ func (h *gemini) installPlan(ctx context.Context, d Delivery, synth bool) (gemin
 	} else {
 		_, name := splitID(d.Package.ID)
 		if name == "" {
-			return geminiInstall{}, &NotSupportedError{Host: Gemini, Operation: "install without a package name"}
+			return geminiInstall{}, &NotSupportedError{Host: Gemini, Operation: unsupportedNoName}
 		}
 
 		if d.Package.Marketplace == "" {
-			return geminiInstall{}, &NotSupportedError{Host: Gemini, Operation: "native install without a marketplace"}
+			return geminiInstall{}, &NotSupportedError{Host: Gemini, Operation: unsupportedNoMarketplace}
 		}
 
 		plan.name = name

@@ -36,8 +36,8 @@ func RuleSkill(name string, rule []byte) (string, []byte, error) {
 	description := firstLine(body)
 
 	return "skills/rule-" + slug, composeFrontmatter([]field{
-		{Key: "name", Value: "rule-" + slug},
-		{Key: "description", Value: truncateRunes(description, 120)},
+		{Key: keyName, Value: "rule-" + slug},
+		{Key: keyDescription, Value: truncateRunes(description, 120)},
 	}, body), nil
 }
 
@@ -45,7 +45,7 @@ func RuleSkill(name string, rule []byte) (string, []byte, error) {
 // (omp://rulebook-matching-pipeline.md#2): the keys omp reads come first in
 // their documented order, every other source key keeps its value behind them.
 var ompRuleKeys = []string{
-	"name", "description", "globs", "alwaysApply", "condition",
+	keyName, keyDescription, "globs", "alwaysApply", "condition",
 	"ttsr_trigger", "astCondition", "question", "scope", "agents", "interruptMode",
 }
 
@@ -67,13 +67,13 @@ func RuleMarkdown(name string, rule []byte) ([]byte, error) {
 		}
 	}
 
-	if strings.TrimSpace(valueString(doc["description"])) == "" {
+	if strings.TrimSpace(valueString(doc[keyDescription])) == "" {
 		description := truncateRunes(firstLine(body), 120)
 		if description == "" {
 			return nil, &RenderError{Kind: kindRule, Name: name, Cause: errors.New("the rule is empty")}
 		}
 
-		doc["description"] = description
+		doc[keyDescription] = description
 	}
 
 	return composeFrontmatter(orderedFields(doc, ompRuleKeys), trimLeadingBlankLines(body)), nil

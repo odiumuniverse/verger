@@ -25,6 +25,8 @@ const (
 	transportStdio = "stdio"
 	keyCommand     = "command"
 	keyType        = "type"
+	keyName        = "name"
+	keyDescription = "description"
 )
 
 // RenderError reports malformed canonical input a renderer cannot express.

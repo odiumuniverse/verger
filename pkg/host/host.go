@@ -136,6 +136,13 @@ type Host interface {
 	Uninstall(ctx context.Context, home string, r receipt.Receipt) (Result, error)
 }
 
+// Delivery note and refusal texts shared by the adapters.
+const (
+	noteDryRun               = "dry-run"
+	unsupportedNoName        = "install without a package name"
+	unsupportedNoMarketplace = "native install without a marketplace"
+)
+
 // Delivery step names shared by the adapters.
 const (
 	stepPlan      = "plan"

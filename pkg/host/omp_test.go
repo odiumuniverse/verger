@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
-
 	"os"
 	"path/filepath"
 	"strings"
@@ -636,6 +635,7 @@ func copyFixtureTree(t *testing.T, root string) string {
 				return readErr
 			}
 
+			//nolint:gosec // G703: the destination is below the test's own temp dir
 			return os.WriteFile(target, data, 0o600)
 		default:
 			return nil
@@ -1047,7 +1047,9 @@ func TestOmpUninstall(t *testing.T) {
 				})
 				_, installed := cli.Installed("caveman@acme")
 				So(installed, ShouldBeFalse)
+
 				_, registered := cli.Registered("acme")
+
 				So(registered, ShouldBeFalse)
 				So(res.Strategy, ShouldEqual, host.Native)
 			})
@@ -1125,7 +1127,9 @@ func TestOmpUninstall(t *testing.T) {
 			Convey("Then it is kept with a note (the §4.8 refcount)", func() {
 				So(err, ShouldBeNil)
 				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "still serves 1 installed plugin(s); kept")
+
 				_, registered := cli.Registered("acme")
+
 				So(registered, ShouldBeTrue)
 			})
 		})

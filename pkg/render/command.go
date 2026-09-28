@@ -124,7 +124,7 @@ func commandFields(cmd Command) []field {
 		value any
 		ok    bool
 	}{
-		{"description", cmd.Description, cmd.Description != ""},
+		{keyDescription, cmd.Description, cmd.Description != ""},
 		{"argument-hint", cmd.ArgumentHint, cmd.ArgumentHint != ""},
 		{"arguments", cmd.Arguments, len(cmd.Arguments) > 0},
 		{"model", cmd.Model, cmd.Model != ""},

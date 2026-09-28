@@ -230,7 +230,7 @@ func (h *omp) deliverInstall(ctx context.Context, home string, d Delivery, synth
 	}
 
 	if d.DryRun {
-		return Result{Strategy: d.Strategy, RMA: plan.rma(), Notes: []string{"dry-run"}}, nil
+		return Result{Strategy: d.Strategy, RMA: plan.rma(), Notes: []string{noteDryRun}}, nil
 	}
 
 	observed, artifacts, err := h.install(ctx, h.base.effectiveHome(home), d.Package, &plan)
@@ -264,56 +264,18 @@ func (h *omp) install(ctx context.Context, userHome string, pkg Package, plan *o
 		}
 
 		name, found := h.knownMarketplace(registered, pkg, plan)
-
 		if !found {
-			if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}); err != nil && !ompMarketplaceExists(err) {
+			if name, err = h.register(ctx, registered, pkg, plan); err != nil {
 				return err
-			}
-
-			after, err := h.marketplaces(ctx)
-			if err != nil {
-				return err
-			}
-
-			if name, found = h.resolveMarketplace(after, registered, pkg, plan); !found {
-				return &DeliveryError{
-					Host: string(Omp), Package: pkg.ID, Step: stepPlan,
-					Cause: fmt.Errorf("the marketplace %s registered from %s is not reported by omp plugin marketplace list (%s)",
-						plan.marketplace, plan.addRef, strings.Join(marketplaceNames(after), ", ")),
-				}
 			}
 		}
 
 		plan.marketplace = name
 		pinned = name
 
-		if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordInstallCLI, plan.installID(), flagForce}); err != nil {
-			return err
-		}
+		observed, err = h.verify(ctx, pkg, plan)
 
-		listed, err := h.Oracle().List(ctx)
-		if err != nil {
-			return err
-		}
-
-		entry, matched := installedAs(listed, plan.plugin, plan.marketplace)
-
-		if matched && staleSynthVersion(plan.synth != nil, entry, pkg.Version) {
-			matched = false
-		}
-
-		if !matched {
-			return &DeliveryError{
-				Host:    string(Omp),
-				Package: pkg.ID,
-				Step:    stepVerify,
-				Cause:   fmt.Errorf("%s %s is not listed by the oracle", plan.installID(), pkg.Version),
-			}
-		}
-
-		observed = OracleResult{Listed: listed, Verified: true}
-
-		return nil
+		return err
 	})
 	if err != nil {
 		return observed, nil, err
@@ -327,6 +289,64 @@ func (h *omp) install(ctx context.Context, userHome string, pkg Package, plan *o
 	}
 
 	return observed, []receipt.Artifact{artifact}, nil
+}
+
+// register runs the non-idempotent `plugin marketplace add` and names what it
+// registered: the planned name when the catalog declares it, else the entry
+// that appeared. A refusal saying the marketplace already exists is tolerated
+// (the manager is not idempotent), any other refusal surfaces.
+func (h *omp) register(ctx context.Context, before []registeredMarketplace, pkg Package, plan *ompInstall) (string, error) {
+	if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}); err != nil && !ompMarketplaceExists(err) {
+		return "", err
+	}
+
+	after, err := h.marketplaces(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	name, found := h.resolveMarketplace(after, before, pkg, plan)
+	if !found {
+		return "", &DeliveryError{
+			Host: string(Omp), Package: pkg.ID, Step: stepPlan,
+			Cause: fmt.Errorf("the marketplace %s registered from %s is not reported by omp plugin marketplace list (%s)",
+				plan.marketplace, plan.addRef, strings.Join(marketplaceNames(after), ", ")),
+		}
+	}
+
+	return name, nil
+}
+
+// verify installs the plugin from the resolved marketplace (--force: omp
+// refuses a reinstall without it) and asks the oracle whether the host now
+// lists it; a miss is a *DeliveryError at the verify step, never a silent step
+// down.
+func (h *omp) verify(ctx context.Context, pkg Package, plan *ompInstall) (OracleResult, error) {
+	if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordInstallCLI, plan.installID(), flagForce}); err != nil {
+		return OracleResult{}, err
+	}
+
+	listed, err := h.Oracle().List(ctx)
+	if err != nil {
+		return OracleResult{}, err
+	}
+
+	entry, matched := installedAs(listed, plan.plugin, plan.marketplace)
+
+	if matched && staleSynthVersion(plan.synth != nil, entry, pkg.Version) {
+		matched = false
+	}
+
+	if !matched {
+		return OracleResult{}, &DeliveryError{
+			Host:    string(Omp),
+			Package: pkg.ID,
+			Step:    stepVerify,
+			Cause:   fmt.Errorf("%s %s is not listed by the oracle", plan.installID(), pkg.Version),
+		}
+	}
+
+	return OracleResult{Listed: listed, Verified: true}, nil
 }
 
 // knownMarketplace resolves a marketplace this delivery may reuse without
@@ -439,11 +459,11 @@ func (h *omp) installPlan(ctx context.Context, d Delivery, synth bool) (ompInsta
 
 	_, name := splitID(d.Package.ID)
 	if name == "" {
-		return ompInstall{}, &NotSupportedError{Host: Omp, Operation: "install without a package name"}
+		return ompInstall{}, &NotSupportedError{Host: Omp, Operation: unsupportedNoName}
 	}
 
 	if d.Package.Marketplace == "" {
-		return ompInstall{}, &NotSupportedError{Host: Omp, Operation: "native install without a marketplace"}
+		return ompInstall{}, &NotSupportedError{Host: Omp, Operation: unsupportedNoMarketplace}
 	}
 
 	return ompInstall{

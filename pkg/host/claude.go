@@ -156,7 +156,7 @@ func (h *claude) deliverInstall(ctx context.Context, home string, d Delivery, sy
 	}
 
 	if d.DryRun {
-		return Result{Strategy: d.Strategy, RMA: slices.Clone(plan.rma), Notes: []string{"dry-run"}}, nil
+		return Result{Strategy: d.Strategy, RMA: slices.Clone(plan.rma), Notes: []string{noteDryRun}}, nil
 	}
 
 	verb := wordInstallCLI
@@ -216,11 +216,11 @@ func (h *claude) installPlan(ctx context.Context, d Delivery, synth bool) (insta
 
 	_, name := splitID(d.Package.ID)
 	if name == "" {
-		return installPlan{}, &NotSupportedError{Host: Claude, Operation: "install without a package name"}
+		return installPlan{}, &NotSupportedError{Host: Claude, Operation: unsupportedNoName}
 	}
 
 	if d.Package.Marketplace == "" {
-		return installPlan{}, &NotSupportedError{Host: Claude, Operation: "native install without a marketplace"}
+		return installPlan{}, &NotSupportedError{Host: Claude, Operation: unsupportedNoMarketplace}
 	}
 
 	return newInstallPlan(d.Package.Marketplace, name, marketplaceName(d.Package.Marketplace)), nil

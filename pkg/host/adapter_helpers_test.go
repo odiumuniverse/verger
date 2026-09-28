@@ -354,6 +354,8 @@ func newCodexCLI() *codexCLI {
 }
 
 // Run implements hostcli.Runner.
+//
+//nolint:dupl // every stateful fake has the same record-then-dispatch shell; the grammars differ below it
 func (c *codexCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, error) {
 	key := strings.Join(args, " ")
 
@@ -889,6 +891,8 @@ func newOmpCLI() *ompCLI {
 }
 
 // Run implements hostcli.Runner.
+//
+//nolint:dupl // every stateful fake has the same record-then-dispatch shell; the grammars differ below it
 func (o *ompCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []byte) ([]byte, error) {
 	key := strings.Join(args, " ")
 
@@ -915,10 +919,22 @@ func (o *ompCLI) dispatch(key string, args []string) ([]byte, error) {
 		return o.marketplaceList(), nil
 	case len(bare) >= 4 && bare[0] == "plugin" && bare[1] == "marketplace":
 		return o.marketplace(bare[2], bare[3])
-	case len(bare) == 2 && bare[0] == "plugin" && bare[1] == "list":
+	case len(bare) >= 2 && bare[0] == "plugin":
+		return o.dispatchPlugin(bare, key)
+	default:
+		return nil, ompRefused(1, "✘ error: unrecognized command '%s'", key)
+	}
+}
+
+// dispatchPlugin routes `plugin list` and `plugin <verb> <selector> [--force]`.
+func (o *ompCLI) dispatchPlugin(bare []string, key string) ([]byte, error) {
+	switch {
+	case len(bare) == 2 && bare[1] == "list":
 		return o.pluginList()
-	case len(bare) >= 3 && bare[0] == "plugin":
-		return o.plugin(bare[1], bare[2], slices.Contains(bare[3:], "--force"))
+	case len(bare) == 3:
+		return o.plugin(bare[1], bare[2], false)
+	case len(bare) == 4 && bare[3] == flagForceTest:
+		return o.plugin(bare[1], bare[2], true)
 	default:
 		return nil, ompRefused(1, "✘ error: unrecognized command '%s'", key)
 	}
@@ -1061,6 +1077,9 @@ func (o *ompCLI) plugin(verb, id string, force bool) ([]byte, error) {
 	}
 }
 
-// flagJSONTest is the --json flag as the fake sees it (the adapter's own
-// constant is unexported to the test package).
-const flagJSONTest = "--json"
+// flagJSONTest and flagForceTest are the flags as the fake sees them (the
+// adapter's own constants are unexported to the test package).
+const (
+	flagJSONTest  = "--json"
+	flagForceTest = "--force"
+)
