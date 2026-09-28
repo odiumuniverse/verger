@@ -2,7 +2,7 @@
 # Local reproduction helper for the T1.13 e2e driver.
 #
 #   ./e2e/run.sh                 # build the image and run the claude leg
-#   ./e2e/run.sh gemini          # one host: claude|codex|gemini|omp
+#   ./e2e/run.sh gemini          # one host: claude|codex|gemini|omp|cursor
 #   ./e2e/run.sh claude noimage  # skip the image build (image already local)
 #   ./e2e/run.sh claude negative # negative leg (no host CLI on PATH)
 #   ./e2e/run.sh claude check    # preflight only: assert the expected tests exist
@@ -23,12 +23,12 @@ host="${1:-claude}"
 mode="${2:-}"
 
 usage() {
-  echo "usage: $0 [claude|codex|gemini|omp] [noimage|negative|check]" >&2
+  echo "usage: $0 [claude|codex|gemini|omp|cursor] [noimage|negative|check]" >&2
   exit 2
 }
 
 case "$host" in
-  claude | codex | gemini | omp) ;;
+  claude | codex | gemini | omp | cursor) ;;
   *) usage ;;
 esac
 

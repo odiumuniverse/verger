@@ -366,7 +366,7 @@ func ensureHost(t *testing.T, env Env, spec hostSpec) {
 		}
 	}
 
-	t.Skipf("e2e: %s CLI is not installed for E2E_HOST=%s (npm install -g %s)", spec.binary, spec.id, strings.Join(spec.installRefs(), " "))
+	t.Skipf("e2e: %s CLI is not installed for E2E_HOST=%s (%s)", spec.binary, spec.id, spec.installHint())
 }
 
 // makeFixture writes the host's fixture package below the work dir.
@@ -1086,6 +1086,8 @@ func looseSkillMarker(home, host string) string {
 		// omp reads the shared ~/.agents root through its ungated agents
 		// provider, so its loose skills land beside Codex's.
 		"omp": ".agents/skills/e2e-skill/SKILL.md",
+		// cursor-agent reads its own skills directory below its home.
+		"cursor": ".cursor/skills/e2e-skill/SKILL.md",
 	}[host]
 
 	if rel == "" {
@@ -1276,15 +1278,16 @@ func TestUnitOracleHasName(t *testing.T) {
 	}
 }
 
-// TestUnitHostSpecs pins the matrix shape: four hosts, npm pins, oracles.
+// TestUnitHostSpecs pins the matrix shape: five hosts, pins, oracles, and an
+// install path for each (npm, or a reason why there is none).
 func TestUnitHostSpecs(t *testing.T) {
 	specs := hostSpecs()
-	if len(specs) != 4 {
-		t.Fatalf("hostSpecs length = %d, want 4", len(specs))
+	if len(specs) != 5 {
+		t.Fatalf("hostSpecs length = %d, want 5", len(specs))
 	}
 
 	for _, spec := range specs {
-		if spec.id == "" || spec.binary == "" || spec.npm == "" || spec.pin == "" {
+		if spec.id == "" || spec.binary == "" || spec.pin == "" {
 			t.Fatalf("incomplete host spec: %+v", spec)
 		}
 
@@ -1292,10 +1295,46 @@ func TestUnitHostSpecs(t *testing.T) {
 			t.Fatalf("host spec %s lacks oracle/config/fixture data", spec.id)
 		}
 
+		switch {
+		case spec.npm == "" && spec.installNote == "":
+			t.Fatalf("host spec %s has neither an npm package nor a reason", spec.id)
+		case spec.npm != "" && spec.installNote != "":
+			t.Fatalf("host spec %s installs from npm and still carries a note", spec.id)
+		}
+
 		refs := spec.installRefs()
-		if len(refs) == 0 || refs[0] != spec.npm+"@"+spec.pin {
+		if spec.npm != "" && (len(refs) == 0 || refs[0] != spec.npm+"@"+spec.pin) {
 			t.Fatalf("host spec %s install refs = %v, want the pinned npm package first", spec.id, refs)
 		}
+
+		if spec.npm == "" && len(refs) != 0 {
+			t.Fatalf("host spec %s has no npm package but install refs %v", spec.id, refs)
+		}
+	}
+}
+
+// TestUnitCursorSpec pins the cursor entry: a host with a real CLI but no npm
+// distribution and no installer, so its leg needs the binary already present.
+func TestUnitCursorSpec(t *testing.T) {
+	spec, ok := hostSpecByID("cursor")
+	if !ok {
+		t.Fatal("the matrix has no cursor entry")
+	}
+
+	if spec.npm != "" || spec.installNote == "" {
+		t.Fatalf("cursor spec = npm %q, note %q; want no npm package and a reason", spec.npm, spec.installNote)
+	}
+
+	if spec.adoptReason == "" {
+		t.Fatal("cursor has no manual install; the adopt leg needs a reason")
+	}
+
+	if !slices.Contains(spec.listArgs, "mcp") {
+		t.Fatalf("cursor list args = %v, want the mcp listing", spec.listArgs)
+	}
+
+	if marker := filepath.ToSlash(looseSkillMarker("/home", "cursor")); !strings.HasSuffix(marker, "/.cursor/skills/e2e-skill/SKILL.md") {
+		t.Fatalf("cursor loose marker = %q", marker)
 	}
 }
 

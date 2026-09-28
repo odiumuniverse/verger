@@ -17,6 +17,9 @@ const (
 	// omp publishes @oh-my-pi/pi-coding-agent on npm; the binary is a Bun
 	// program and its launcher needs the bun runtime (npmExtra).
 	ompVersionPin = "18.4.1"
+	// cursor-agent ships from cursor.com/install (a self-updating binary), not
+	// from npm; the pin is what was live-verified locally.
+	cursorVersionPin = "2026.06.15-18-00-12-6f5a2cf"
 )
 
 // hostSpec describes one host CLI the matrix exercises.
@@ -27,7 +30,11 @@ type hostSpec struct {
 	// npmExtra lists npm packages the host CLI needs beside its own: the omp
 	// launcher starts with `#!/usr/bin/env bun`.
 	npmExtra []string
-	pin      string // fallback version when no E2E_*_VERSION is set
+	// installNote is non-empty when the host CLI has no npm distribution: the
+	// leg then runs only where the binary is already present, and the note is
+	// the reason a runner without it skips instead of failing.
+	installNote string
+	pin         string // fallback version when no E2E_*_VERSION is set
 	// configDirs are host-owned directories below HOME: residue scan and
 	// failure listings.
 	configDirs []string
@@ -85,6 +92,19 @@ func hostSpecs() []hostSpec {
 			fixtureManifest: "gemini-extension.json",
 		},
 		{
+			id:          "cursor",
+			binary:      "cursor-agent",
+			pin:         cursorVersionPin,
+			installNote: "cursor-agent ships from cursor.com/install (a self-updating binary), not from npm",
+			configDirs:  []string{".cursor"},
+			listArgs:    []string{"mcp", "list"},
+			hooksFile:   ".cursor/hooks.json",
+			// cursor-agent has no plugin, extension or marketplace command, so
+			// the fixture cannot be installed with the host itself.
+			adoptReason:     "cursor-agent has no plugin, extension or marketplace command",
+			fixtureManifest: ".claude-plugin/plugin.json",
+		},
+		{
 			id:              "omp",
 			binary:          "omp",
 			npm:             "@oh-my-pi/pi-coding-agent",
@@ -132,8 +152,23 @@ func (h hostSpec) moduleRef() string {
 	return h.npm + "@" + h.version()
 }
 
+// installHint is what the skip message tells a reader to do: install the npm
+// package, or the reason this host has none.
+func (h hostSpec) installHint() string {
+	if h.npm == "" {
+		return h.installNote
+	}
+
+	return "npm install -g " + strings.Join(h.installRefs(), " ")
+}
+
 // installRefs is the npm install argument list of one host: its own package at
-// the pinned version plus the runtime packages it needs (omp's launcher).
+// the pinned version plus the runtime packages it needs (omp's launcher). A host
+// without an npm distribution has none, and installNote says why.
 func (h hostSpec) installRefs() []string {
+	if h.npm == "" {
+		return nil
+	}
+
 	return append([]string{h.moduleRef()}, h.npmExtra...)
 }

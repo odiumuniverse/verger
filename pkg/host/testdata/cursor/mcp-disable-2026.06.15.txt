@@ -1,0 +1,2 @@
+✓ Disabled MCP server: probe
+The server will no longer be loaded or prompted for approval.
