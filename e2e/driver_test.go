@@ -936,6 +936,10 @@ func TestE2ERemoteArchiveScenario(t *testing.T) {
 	requireE2E(t)
 
 	spec := requireHostFromEnv(t)
+
+	if spec.noRegisterReason != "" {
+		t.Skipf("e2e: %s has no host-registering stratum: %s", spec.id, spec.noRegisterReason)
+	}
 	env := newEnv(t, spec)
 	assertTempHome(t, env)
 
@@ -1383,6 +1387,25 @@ func TestUnitGeminiStagedName(t *testing.T) {
 
 	if !strings.ContainsAny(fixtureManifestName(), "/") {
 		t.Fatalf("fixtureManifestName() = %q, want the owner-bearing id the synth rung needs", fixtureManifestName())
+	}
+}
+
+// TestUnitCursorSpec also pins that the cursor leg skips the rung it cannot
+// have, so a remote payload is never silently reported as a successful
+// registration.
+func TestUnitNoRegisterSpecsHaveAReason(t *testing.T) {
+	for _, spec := range hostSpecs() {
+		if spec.noRegisterReason == "" {
+			continue
+		}
+
+		if spec.adoptReason == "" {
+			t.Fatalf("host spec %s skips the archive scenario but claims a manual install", spec.id)
+		}
+
+		if strings.TrimSpace(spec.noRegisterReason) == "" {
+			t.Fatalf("host spec %s carries a blank reason", spec.id)
+		}
 	}
 }
 

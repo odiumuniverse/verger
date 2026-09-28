@@ -34,6 +34,11 @@ jobs:
           - host: gemini
             package: '@google/gemini-cli'
             version: 0.61.0
+          # cursor-agent has no npm distribution (it ships from
+          # cursor.com/install) and no installer to ride, so it has no positive
+          # matrix entry: a job that always skips proves nothing. The host is
+          # covered by the negative matrix here and by a local leg
+          # (e2e/run.sh cursor) on a machine where the CLI is present.
           # omp has no package named after its binary: the CLI ships as
           # @oh-my-pi/pi-coding-agent and its launcher needs the bun runtime.
           - host: omp
@@ -93,7 +98,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        host: [claude, codex, gemini, omp]
+        host: [claude, codex, gemini, omp, cursor]
     steps:
       - uses: actions/checkout@v7
 

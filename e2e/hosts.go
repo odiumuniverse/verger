@@ -52,6 +52,11 @@ type hostSpec struct {
 	// adoptReason is non-empty when the host has no verified manual-install
 	// grammar for the adopt leg; the leg is then skipped with this reason.
 	adoptReason string
+	// noRegisterReason is non-empty when the host has no stratum that
+	// registers a package with the host CLI at all (no plugin manager), so the
+	// remote-archive scenario — which exists to exercise that rung — cannot
+	// apply and is skipped with this reason.
+	noRegisterReason string
 }
 
 // hostSpecs is the Ф1 e2e matrix (DESIGN §10.3, D21): three real CLIs, plus
@@ -101,8 +106,9 @@ func hostSpecs() []hostSpec {
 			hooksFile:   ".cursor/hooks.json",
 			// cursor-agent has no plugin, extension or marketplace command, so
 			// the fixture cannot be installed with the host itself.
-			adoptReason:     "cursor-agent has no plugin, extension or marketplace command",
-			fixtureManifest: ".claude-plugin/plugin.json",
+			adoptReason:      "cursor-agent has no plugin, extension or marketplace command",
+			noRegisterReason: "cursor-agent has no plugin, extension or marketplace command, so no stratum registers a package with the host",
+			fixtureManifest:  ".claude-plugin/plugin.json",
 		},
 		{
 			id:              "omp",

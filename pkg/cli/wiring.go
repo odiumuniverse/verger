@@ -191,7 +191,7 @@ func (a *app) hosts(client *verger.Client) []host.Host {
 		options = append(options, host.WithHome(userHome))
 	}
 
-	factories := []func(...host.Option) host.Host{host.NewClaude, host.NewCodex, host.NewGemini, host.NewOmp}
+	factories := []func(...host.Option) host.Host{host.NewClaude, host.NewCodex, host.NewGemini, host.NewOmp, host.NewCursor}
 
 	out := make([]host.Host, 0, len(factories))
 
