@@ -8,7 +8,11 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # Every artifact is built once, on the mac runner, and shipped to the smoke
+  # matrix as a workflow artifact. The release is created only after all three
+  # have run on their own OS/arch, so a broken linux-arm64 binary can never be
+  # published: the smoke job failing fails the publish job.
+  build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -42,15 +46,18 @@ jobs:
             rm -f signing.p12
           } || echo "::warning::could not import the signing identity; releases fall back to ad-hoc signing"
 
-      # The tarball carries a bare `verger` at its root because the formula does
-      # `bin.install "verger"`.
-      - name: Build the universal tarball
+      # Each tarball carries a bare `verger` at its root because the formula
+      # does `bin.install "verger"`. The linux binaries cross-compile from the
+      # mac runner: CGO_ENABLED=0 means no cgo, so no cross toolchain is needed
+      # and the result is static. They are NOT signed — a codesign signature is
+      # meaningless off darwin and codesign would reject it.
+      - name: Build every artifact
         run: |
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p build/arm64 build/amd64 dist
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/arm64/verger ./cmd/verger
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/amd64/verger ./cmd/verger
-          lipo -create -output dist/verger build/arm64/verger build/amd64/verger
+          mkdir -p build/darwin-arm64 build/darwin-amd64 dist
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-arm64/verger ./cmd/verger
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-amd64/verger ./cmd/verger
+          lipo -create -output dist/verger build/darwin-arm64/verger build/darwin-amd64/verger
           # Sign after lipo: merging architectures invalidates an earlier signature, and
           # the identifier must be set because codesign would default a Go binary to a.out.
           if codesign --force --sign "odiumuniverse code signing" --timestamp=none --identifier com.odiumuniverse.verger dist/verger 2>/dev/null; then
@@ -60,19 +67,130 @@ jobs:
             echo "::warning::no signing identity; dist/verger stays ad-hoc signed"
           fi
           tar -czf "dist/verger-${version}-darwin-universal.tar.gz" -C dist verger
+          rm -f dist/verger
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
+          tar -czf "dist/verger-${version}-linux-amd64.tar.gz" -C dist verger
+          rm -f dist/verger
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
+          tar -czf "dist/verger-${version}-linux-arm64.tar.gz" -C dist verger
+          rm -f dist/verger
+
+          ls -l dist
+
+      # sha256 of every published artifact, so a user can verify a download
+      # without trusting the release page.
+      - name: Checksum the artifacts
+        run: |
+          cd dist
+          shasum -a 256 ./*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Upload the darwin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-universal
+          path: dist/verger-*-darwin-universal.tar.gz
+          if-no-files-found: error
+
+      - name: Upload the linux-amd64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist/verger-*-linux-amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload the linux-arm64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist/verger-*-linux-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload the checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/checksums.txt
+          if-no-files-found: error
+
+  # Each tarball is unpacked and RUN on a runner of its own OS and arch — not
+  # merely built for it. A cross-compiled binary that cannot execute is the
+  # failure this catches, and `fail-fast: false` keeps the other two results so
+  # one run reports all three.
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            asset: darwin-universal
+          - runner: ubuntu-latest
+            asset: linux-amd64
+          - runner: ubuntu-24.04-arm
+            asset: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist
+
+      - name: Run the packaged binary on this runner
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tarball="dist/verger-${version}-${{ matrix.asset }}.tar.gz"
+          mkdir -p unpack
+          tar -xzf "$tarball" -C unpack
+          test -x unpack/verger || { echo "::error::the tarball has no executable verger at its root"; exit 1; }
+          got="$(unpack/verger version)"
+          echo "verger version on ${{ matrix.runner }}: ${got}"
+          case "$got" in
+            *"${version}"*) ;;
+            *) echo "::error::packaged binary reports '${got}', expected the tag version ${version}"; exit 1 ;;
+          esac
+
+  publish:
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-universal
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist
 
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" "dist/verger-${version}-darwin-universal.tar.gz" --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --clobber
 
-      # The first tag also creates Formula/verger.rb: the tap is not seeded with a
-      # placeholder sha256 (that would fail `brew audit` and the tap's own CI), so the
-      # formula appears only once a real artifact exists to point at.
+      # The first tag also creates Formula/verger.rb: the tap is not seeded with
+      # a placeholder sha256 (that would fail `brew audit` and the tap's own CI),
+      # so the formula appears only once a real artifact exists to point at.
+      #
+      # The formula is RENDERED IN FULL from the template below on every run,
+      # not patched in place. The previous shape had a single top-level url and
+      # sha256 for a darwin-only tap, and grafting two OS blocks onto it by
+      # regex is how a formula ends up serving a linuxbrew user a darwin
+      # tarball. Re-rendering makes the result a pure function of the tag, so
+      # the two-OS shape is guaranteed rather than maintained.
       - name: Bump the formula in homebrew-tap
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
@@ -82,36 +200,57 @@ jobs:
             echo "::error::TAP_TOKEN is not set; the homebrew-tap formula cannot be bumped" >&2
             exit 1
           fi
-          url="https://github.com/odiumuniverse/verger/releases/download/${GITHUB_REF_NAME}/verger-${version}-darwin-universal.tar.gz"
-          sha="$(shasum -a 256 "dist/verger-${version}-darwin-universal.tar.gz" | cut -d' ' -f1)"
+          base="https://github.com/odiumuniverse/verger/releases/download/${GITHUB_REF_NAME}"
+          sha_darwin="$(sha256sum "dist/verger-${version}-darwin-universal.tar.gz" | cut -d' ' -f1)"
+          sha_amd64="$(sha256sum "dist/verger-${version}-linux-amd64.tar.gz" | cut -d' ' -f1)"
+          sha_arm64="$(sha256sum "dist/verger-${version}-linux-arm64.tar.gz" | cut -d' ' -f1)"
+          mkdir -p formula
           git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/odiumuniverse/homebrew-tap.git" tap
           cd tap
-          ruby - "$url" "$sha" <<'RB'
-          path = "Formula/verger.rb"
-          url, sha = ARGV
-          if File.exist?(path)
-            src = File.read(path)
-            src = src.sub(%r{url "https://github\.com/odiumuniverse/verger[^"]*"}, "url \"#{url}\"")
-            src = src.sub(/sha256 ".*"/, "sha256 \"#{sha}\"")
-          else
-            src = <<~FORMULA
-              class Verger < Formula
-                desc "Deliver agent packages to every coding agent host"
-                homepage "https://github.com/odiumuniverse/verger"
-                url "#{url}"
-                sha256 "#{sha}"
-                license "MIT"
+          ruby - "$base" "$version" "$sha_darwin" "$sha_amd64" "$sha_arm64" <<'RB'
+          require "fileutils"
+          base, version, sha_darwin, sha_amd64, sha_arm64 = ARGV
+          template = <<~'FORMULA'
+            class Verger < Formula
+              desc "Deliver agent packages to every coding agent host"
+              homepage "https://github.com/odiumuniverse/verger"
+              version "__VERSION__"
+              license "MIT"
 
-                def install
-                  bin.install "verger"
-                end
+              on_macos do
+                url "__DARWIN_URL__"
+                sha256 "__DARWIN_SHA__"
+              end
 
-                test do
-                  assert_match version.to_s, shell_output("\#{bin}/verger version")
+              on_linux do
+                if OS::CPU == :arm64
+                  url "__ARM64_URL__"
+                  sha256 "__ARM64_SHA__"
+                else
+                  url "__AMD64_URL__"
+                  sha256 "__AMD64_SHA__"
                 end
               end
-            FORMULA
-          end
+
+              def install
+                bin.install "verger"
+              end
+
+              test do
+                assert_match version.to_s, shell_output("#{bin}/verger version")
+              end
+            end
+          FORMULA
+          src = template
+            .gsub("__VERSION__", version)
+            .gsub("__DARWIN_URL__", "#{base}/verger-#{version}-darwin-universal.tar.gz")
+            .gsub("__DARWIN_SHA__", sha_darwin)
+            .gsub("__ARM64_URL__", "#{base}/verger-#{version}-linux-arm64.tar.gz")
+            .gsub("__ARM64_SHA__", sha_arm64)
+            .gsub("__AMD64_URL__", "#{base}/verger-#{version}-linux-amd64.tar.gz")
+            .gsub("__AMD64_SHA__", sha_amd64)
+          path = "Formula/verger.rb"
+          FileUtils.mkdir_p(File.dirname(path))
           File.write(path, src)
           RB
           git add Formula/verger.rb
