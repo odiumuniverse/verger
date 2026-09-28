@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/gofrs/flock"
@@ -30,14 +31,15 @@ const (
 	// marketplace's version.
 	flagForce = "--force"
 
-	ompDirName     = ".omp"       // base config root below HOME
-	ompInstallID   = "install-id" // the config-independent install marker
-	ompAgentName   = "agent"      // default agent dir below the base root
-	ompSharedDir   = ".agents"    // the shared home omp's `agents` provider reads, ungated
-	ompAgentsDir   = "agents"     // subagents, below the agent dir
-	ompCommandsDir = "commands"   // slash commands, below the agent dir
-	ompRulesDir    = "rules"      // rulebook documents, below the agent dir
-	ompMCPDoc      = "mcp.json"   // MCP servers, below the agent dir
+	ompDirName       = ".omp"       // base config root below HOME
+	ompInstallID     = "install-id" // the config-independent install marker
+	ompAgentName     = "agent"      // default agent dir below the base root
+	ompSharedDir     = ".agents"    // the shared home omp's `agents` provider reads, ungated
+	ompAgentsDir     = "agents"     // subagents, below the agent dir
+	ompCommandsDir   = "commands"   // slash commands, below the agent dir
+	ompRulesDir      = "rules"      // rulebook documents, below the agent dir
+	ompMCPDoc        = "mcp.json"   // MCP servers, below the agent dir
+	ompSkillsDirName = "skills"     // the host's own skills dir, which outranks the shared root
 	// ompPluginLock is the process-exclusive advisory lock serializing every
 	// omp plugin/marketplace mutation: omp's manager is not transactional and
 	// has no cross-process locking, so two writers overwrite each other
@@ -171,6 +173,16 @@ func (h *omp) deliverLoose(ctx context.Context, home string, d Delivery) (Result
 	err = h.base.executeLoose(ctx, spec, d.Package, plan)
 	result := plan.result(d.Strategy, false)
 
+	// The shared root is not the only place omp looks for a skill: its own agent
+	// dir wins on a name clash, so a user's copy shadows the delivered one.
+	if slices.ContainsFunc(d.Package.Components, func(component manifest.Component) bool {
+		return component.Kind == manifest.KindSkill
+	}) {
+		result.Notes = append(result.Notes, "omp reads skills from "+filepath.Join(ompSharedDir, "skills")+
+			" and from its own agent dir ("+filepath.Join(ompAgentDir(userHome), ompSkillsDirName)+
+			"), which wins on a name clash (its native provider outranks the shared one): a same-named skill there shadows the delivered one")
+	}
+
 	if err == nil && d.AllowHooks {
 		if verifyErr := h.verifyHookModules(ctx, userHome, d.Package); verifyErr != nil {
 			return result, verifyErr
@@ -272,6 +284,10 @@ type ompInstall struct {
 	marketplace string       // the registered marketplace name (corrected after the add on the native path)
 	version     string       // the delivered version (stale-synth-version check)
 	synth       *synthLayout // synth: the owner marketplace
+	// existed is true when the marketplace was registered before this delivery:
+	// its inverse then keeps it, because a delivery may remove only what it
+	// registered itself (Host.Deliver, Op.Existed).
+	existed bool
 }
 
 // installID is the plugin selector `<plugin>@<marketplace>`.
@@ -289,7 +305,7 @@ func ompMarketplacePath(name string) string {
 // rma removes the plugin, then — refcounted at removal — its marketplace.
 func (p ompInstall) rma() []receipt.Op {
 	return []receipt.Op{
-		{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordMarketplace, wordRemove, p.marketplace}},
+		{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordMarketplace, wordRemove, p.marketplace}, Existed: p.existed},
 		{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordUninstall, p.installID()}},
 	}
 }
@@ -309,6 +325,11 @@ func (h *omp) deliverInstall(ctx context.Context, home string, d Delivery, synth
 	}
 
 	if d.DryRun {
+		// A dry run registers nothing, so its inverse may not claim the right to
+		// remove a marketplace; the real run corrects this as it learns whether
+		// it registered one.
+		plan.existed = true
+
 		return Result{Strategy: d.Strategy, RMA: plan.rma(), Notes: []string{noteDryRun}}, nil
 	}
 
@@ -337,24 +358,19 @@ func (h *omp) install(ctx context.Context, userHome string, pkg Package, plan *o
 			}
 		}
 
-		registered, err := h.marketplaces(ctx)
-		if err != nil {
-			return err
-		}
-
-		name, found := h.knownMarketplace(registered, pkg, plan)
-		if !found {
-			if name, err = h.register(ctx, registered, pkg, plan); err != nil {
+		if !plan.existed {
+			if err := h.resolveAndRegister(ctx, pkg, plan); err != nil {
 				return err
 			}
 		}
 
-		plan.marketplace = name
-		pinned = name
+		pinned = plan.marketplace
 
-		observed, err = h.verify(ctx, pkg, plan)
+		var verifyErr error
 
-		return err
+		observed, verifyErr = h.verify(ctx, pkg, plan)
+
+		return verifyErr
 	})
 	if err != nil {
 		return observed, nil, err
@@ -371,29 +387,34 @@ func (h *omp) install(ctx context.Context, userHome string, pkg Package, plan *o
 }
 
 // register runs the non-idempotent `plugin marketplace add` and names what it
-// registered: the planned name when the catalog declares it, else the entry
-// that appeared. A refusal saying the marketplace already exists is tolerated
-// (the manager is not idempotent), any other refusal surfaces.
-func (h *omp) register(ctx context.Context, before []registeredMarketplace, pkg Package, plan *ompInstall) (string, error) {
-	if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}); err != nil && !ompMarketplaceExists(err) {
-		return "", err
+// registered, reporting whether this run registered it. A refusal saying the
+// marketplace already exists is tolerated (the manager is not idempotent); any
+// other refusal surfaces. When the refusal left no new entry and no receipt
+// proves the marketplace, the delivery fails instead of adopting a name it
+// would then take the liberty of removing.
+func (h *omp) register(ctx context.Context, before []registeredMarketplace, pkg Package, plan *ompInstall) (string, bool, error) {
+	_, addErr := h.base.run(ctx, wordOmp, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef})
+	registeredNow := addErr == nil
+
+	if addErr != nil && !ompMarketplaceExists(addErr) {
+		return "", false, addErr
 	}
 
 	after, err := h.marketplaces(ctx)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	name, found := h.resolveMarketplace(after, before, pkg, plan)
+	name, found := h.resolveMarketplace(after, before, pkg, plan, registeredNow)
 	if !found {
-		return "", &DeliveryError{
+		return "", false, &DeliveryError{
 			Host: string(Omp), Package: pkg.ID, Step: stepPlan,
-			Cause: fmt.Errorf("the marketplace %s registered from %s is not reported by omp plugin marketplace list (%s)",
-				plan.marketplace, plan.addRef, strings.Join(marketplaceNames(after), ", ")),
+			Cause: fmt.Errorf("this delivery did not register a marketplace and %s is not proven verger's (%s); remove or adopt it by hand",
+				plan.marketplace, strings.Join(marketplaceNames(after), ", ")),
 		}
 	}
 
-	return name, nil
+	return name, registeredNow, nil
 }
 
 // verify installs the plugin from the resolved marketplace (--force: omp
@@ -428,31 +449,44 @@ func (h *omp) verify(ctx context.Context, pkg Package, plan *ompInstall) (Oracle
 	return OracleResult{Listed: listed, Verified: true}, nil
 }
 
-// knownMarketplace resolves a marketplace this delivery may reuse without
-// calling `plugin marketplace add`: the registered one this package owns, or
-// one that already serves the ref.
-func (h *omp) knownMarketplace(registered []registeredMarketplace, pkg Package, plan *ompInstall) (string, bool) {
+// resolveAndRegister gives the plan a marketplace of this delivery's own: a
+// receipt-proven one (a re-delivery), or one this run registers. Anything else
+// fails, because the name may belong to the user: adopting it would hand this
+// delivery the right to remove a marketplace it never created. On failure the
+// plan is marked as not registered, so the recorded inverse keeps whatever
+// holds the name.
+func (h *omp) resolveAndRegister(ctx context.Context, pkg Package, plan *ompInstall) error {
+	registered, err := h.marketplaces(ctx)
+	if err != nil {
+		return err
+	}
+
+	if name, owned := h.ownedMarketplace(pkg, registered); owned {
+		plan.marketplace, plan.existed = name, true
+
+		return nil
+	}
+
+	name, registeredNow, err := h.register(ctx, registered, pkg, plan)
+	if err != nil {
+		// Nothing was registered by this run, so the inverse must not remove
+		// whatever holds the name.
+		plan.existed = true
+
+		return err
+	}
+
+	plan.marketplace, plan.existed = name, !registeredNow
+
+	return nil
+}
+
+// ownedMarketplace resolves a marketplace this package's receipts prove it
+// registered, which is the only marketplace a delivery may reuse without
+// asking the host — and the only one its inverse may remove.
+func (h *omp) ownedMarketplace(pkg Package, registered []registeredMarketplace) (string, bool) {
 	for _, entry := range registered {
 		if h.ownsMarketplace(pkg, entry.Name) {
-			return entry.Name, true
-		}
-	}
-
-	if plan.synth != nil {
-		// The owner document declares the name, and the registered path is the
-		// owner root (the store never moves).
-		for _, entry := range registered {
-			if entry.Name == plan.marketplace && samePath(entry.Path, plan.addRef) {
-				return entry.Name, true
-			}
-		}
-
-		return "", false
-	}
-
-	// A local directory ref registers under the path it was added from.
-	for _, entry := range registered {
-		if samePath(entry.Path, plan.addRef) {
 			return entry.Name, true
 		}
 	}
@@ -476,29 +510,34 @@ func (h *omp) ownsMarketplace(pkg Package, name string) bool {
 // name when it is now registered (the catalog declares it, and for synth the
 // document is verger's own), else the single entry that appeared. Anything
 // else is ambiguous and fails rather than guessing a name.
-func (h *omp) resolveMarketplace(after, before []registeredMarketplace, pkg Package, plan *ompInstall) (string, bool) {
-	for _, entry := range after {
-		if entry.Name == plan.marketplace || h.ownsMarketplace(pkg, entry.Name) {
-			return entry.Name, true
-		}
-	}
-
+func (h *omp) resolveMarketplace(after, before []registeredMarketplace, pkg Package, plan *ompInstall, registeredNow bool) (string, bool) {
 	known := map[string]bool{}
 
 	for _, entry := range before {
 		known[entry.Name] = true
 	}
 
-	appeared := make([]string, 0, 1)
-
+	// The entry this run's own add created is ours by construction.
 	for _, entry := range after {
 		if !known[entry.Name] {
-			appeared = append(appeared, entry.Name)
+			return entry.Name, true
 		}
 	}
 
-	if len(appeared) == 1 {
-		return appeared[0], true
+	// A receipt proves an earlier delivery of this package registered it.
+	if name, owned := h.ownedMarketplace(pkg, after); owned {
+		return name, true
+	}
+
+	// The planned name counts only when this run's add succeeded: the catalog
+	// then declares it, and on the synth path the document is verger's own.
+	// After a refusal that left no new entry the name belongs to someone else.
+	if registeredNow {
+		for _, entry := range after {
+			if entry.Name == plan.marketplace {
+				return entry.Name, true
+			}
+		}
 	}
 
 	return "", false
@@ -562,14 +601,14 @@ func marketplaceNames(registered []registeredMarketplace) []string {
 // back from `plugin marketplace list` before the RMA is composed.
 func (h *omp) installPlan(ctx context.Context, d Delivery, synth bool) (ompInstall, error) {
 	if synth {
-		layout, name, _, err := ownerMarketplacePlan(ctx, Omp, d.Package, h.marketplaces)
+		layout, name, registered, err := ownerMarketplacePlan(ctx, Omp, d.Package, h.marketplaces)
 		if err != nil {
 			return ompInstall{}, err
 		}
 
 		return ompInstall{
 			addRef: layout.root, plugin: layout.identity.Name, marketplace: name,
-			version: d.Package.Version, synth: &layout,
+			version: d.Package.Version, synth: &layout, existed: registered,
 		}, nil
 	}
 
@@ -639,7 +678,7 @@ func parseOmpMarketplaces(out []byte) []registeredMarketplace {
 // cross-process locking of its own, so two verger runs (hosts are delivered in
 // parallel, pkg/apply) must not interleave their plugin writes.
 func (h *omp) withPluginLock(ctx context.Context, userHome string, run func() error) error {
-	dir := ompBase(userHome)
+	dir := ompStateRoot(userHome)
 
 	if err := fsutil.EnsureDir(dir, 0o700); err != nil {
 		return &DeliveryError{Host: string(Omp), Step: stepInstall, Cause: err}
@@ -818,6 +857,22 @@ type ompPluginList struct {
 // marketplace entries are the verification target; the npm array is decoded
 // with the shared tolerant walker, since no omp host here has one installed.
 func parseOmpInstalled(out []byte) ([]Installed, error) {
+	var keys map[string]json.RawMessage
+
+	if err := json.Unmarshal(out, &keys); err != nil {
+		return nil, err
+	}
+
+	// An unrecognized document means "cannot tell", never "nothing installed":
+	// the marketplace refcount keeps a marketplace when the oracle cannot list,
+	// and an empty answer from a renamed key would remove one another plugin
+	// needs.
+	if _, npm := keys["npm"]; !npm {
+		if _, marketplaces := keys["marketplace"]; !marketplaces {
+			return nil, errors.New("the output carries neither an npm nor a marketplace list")
+		}
+	}
+
 	var doc ompPluginList
 
 	if err := json.Unmarshal(out, &doc); err != nil {
@@ -859,6 +914,21 @@ func parseOmpInstalled(out []byte) ([]Installed, error) {
 	}
 
 	return listed, nil
+}
+
+// ompStateRoot resolves the root omp keeps its plugin and marketplace state in:
+// the base root, or `<base>/profiles/<profile>` for a named profile. The lock
+// and every mutation of that state resolve through it, so verger never locks one
+// tree and writes another. Live-verified: with OMP_PROFILE=work the host reads
+// `~/.omp/profiles/work/plugins/` and reports nothing installed from the default
+// root, and PI_CONFIG_DIR moves the same state to `<home>/<dir>/plugins`. Plugin
+// state is a sibling of the agent dir, so PI_CODING_AGENT_DIR does not move it.
+func ompStateRoot(home string) string {
+	if profile := ompProfile(); profile != "" {
+		return filepath.Join(ompBase(home), "profiles", profile)
+	}
+
+	return ompBase(home)
 }
 
 // ompBase resolves omp's base config root below HOME: PI_CONFIG_DIR replaces

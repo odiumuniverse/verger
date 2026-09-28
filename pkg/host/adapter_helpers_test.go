@@ -887,6 +887,9 @@ type ompCLI struct {
 	// (live-observed with marketplace `beta` and package `one`). Keys are the
 	// full selector, values the registry version it resolved to.
 	shadow map[string]string
+	// dropInstalls models a host that accepted an install and reports success
+	// while listing nothing: the drift the verify step exists for.
+	dropInstalls bool
 	// registry is what such an install left behind: plugin → version, reported
 	// in the npm list, never as a marketplace entry.
 	registry map[string]string
@@ -1102,6 +1105,10 @@ func (o *ompCLI) plugin(verb, id string, force bool) ([]byte, error) {
 
 	switch verb {
 	case "install":
+		if o.dropInstalls {
+			return []byte("✔ Installed " + plugin + "\n"), nil
+		}
+
 		if version, shadowed := o.shadow[id]; shadowed {
 			o.registry[plugin] = version
 

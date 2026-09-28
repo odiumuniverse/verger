@@ -297,6 +297,11 @@ func TestOmpLooseGolden(t *testing.T) {
 				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "0600")
 			})
 
+			Convey("Then the shared skills root and its shadowing rule are named", func() {
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "which wins on a name clash")
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, filepath.Join(".omp", "agent", "skills"))
+			})
+
 			Convey("Then the result carries no secret value", func() {
 				rendered, marshalErr := json.Marshal(res)
 				So(marshalErr, ShouldBeNil)
@@ -757,7 +762,7 @@ func TestOmpNativeRedeivery(t *testing.T) {
 		})
 	})
 
-	Convey("Given the ref a registered marketplace already points at", t, func() {
+	Convey("Given a marketplace the USER registered from the very ref path", t, func() {
 		fakeOmp(t)
 		clearOmpEnv(t)
 
@@ -774,15 +779,70 @@ func TestOmpNativeRedeivery(t *testing.T) {
 
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
 
-		Convey("When it is delivered", func() {
-			Convey("Then the registered path alone proves the name, so no add is attempted", func() {
-				So(err, ShouldBeNil)
-				So(cli.Calls(), ShouldResemble, []string{
-					"omp plugin marketplace list",
-					"omp plugin install caveman@acme-tools --force",
-					"omp plugin list --json",
+		Convey("When the package is delivered", func() {
+			Convey("Then the delivery refuses to adopt it, and its inverse may not remove it", func() {
+				failure, ok := errors.AsType[*host.DeliveryError](err)
+				So(ok, ShouldBeTrue)
+				So(failure.Step, ShouldEqual, "plan")
+				So(failure.Error(), ShouldContainSubstring, "not proven verger's")
+
+				_, registered := cli.Registered("acme-tools")
+				So(registered, ShouldBeTrue)
+
+				_, installed := cli.Installed("caveman@acme-tools")
+				So(installed, ShouldBeFalse)
+
+				So(res.RMA, ShouldNotBeEmpty)
+				So(res.RMA[0].Existed, ShouldBeTrue)
+
+				Convey("And an uninstall of that receipt leaves the user's marketplace alone", func() {
+					uninstalled, uninstallErr := h.Uninstall(t.Context(), home, receipt.Receipt{
+						Strategy: string(host.Native), RMA: res.RMA,
+					})
+
+					So(uninstallErr, ShouldBeNil)
+					So(strings.Join(uninstalled.Notes, "\n"), ShouldContainSubstring, "existed before this delivery; kept")
+
+					_, stillThere := cli.Registered("acme-tools")
+					So(stillThere, ShouldBeTrue)
+					So(cli.Calls(), ShouldNotContain, "omp plugin marketplace remove acme-tools")
 				})
-				So(res.Observed.Verified, ShouldBeTrue)
+			})
+		})
+	})
+
+	Convey("Given a user marketplace whose path carries a space", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		cli := newOmpCLI()
+
+		ref := filepath.Join(t.TempDir(), "my marketplace")
+		writeFixtureFile(t, filepath.Join(ref, ".claude-plugin", "marketplace.json"), `{
+  "name": "acme-tools",
+  "owner": {"name": "acme"},
+  "plugins": [{"name": "caveman", "source": "./caveman/1.2.3"}]
+}`, 0o600)
+		writeFixtureFile(t, filepath.Join(ref, "caveman", "1.2.3", ".claude-plugin", "plugin.json"), `{"name":"caveman","version":"1.2.3"}`, 0o600)
+
+		cli.marketplaces["acme-tools"] = ref
+
+		h := host.NewOmp(host.WithHome(home), host.WithRunner(cli))
+
+		pkg := ompPackage(t)
+		pkg.Marketplace = ref
+
+		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
+
+		Convey("When it is delivered", func() {
+			Convey("Then a path match is still not an ownership proof", func() {
+				_, ok := errors.AsType[*host.DeliveryError](err)
+				So(ok, ShouldBeTrue)
+				So(res.RMA[0].Existed, ShouldBeTrue)
+
+				_, registered := cli.Registered("acme-tools")
+				So(registered, ShouldBeTrue)
 			})
 		})
 	})
@@ -834,7 +894,6 @@ func TestOmpSynthDeliver(t *testing.T) {
 				_, againErr := h.Deliver(t.Context(), "", host.Delivery{Package: pkg, Strategy: host.Synth})
 				So(againErr, ShouldBeNil)
 				So(cli.Calls()[before:], ShouldResemble, []string{
-					"omp plugin marketplace list",
 					"omp plugin marketplace list",
 					"omp plugin install caveman@acme --force",
 					"omp plugin list --json",
@@ -933,30 +992,30 @@ func TestOmpInstallRefusals(t *testing.T) {
 }
 
 func TestOmpNativeVerifyFailure(t *testing.T) {
-	Convey("Given a marketplace already registered at the ref's path", t, func() {
+	Convey("Given an install the oracle does not report back", t, func() {
 		fakeOmp(t)
 		clearOmpEnv(t)
 
 		home := t.TempDir()
-		ref := filepath.Join(t.TempDir(), "marketplace")
+		cli := newOmpCLI()
+		cli.dropInstalls = true
 
-		h, runner := newOmp(t, home, map[string]hostcli.Response{
-			"omp plugin marketplace list":                   response("Configured Marketplaces:\n\n  acme-tools  " + ref + "\n"),
-			"omp plugin install caveman@acme-tools --force": response("✔ Installed caveman from acme-tools (1.2.3)\n"),
-			"omp plugin list --json":                        response(`{"npm": [], "marketplace": []}`),
-		})
+		ref := ompMarketplace(t, "acme-tools", "caveman", "1.2.3")
+
+		h := host.NewOmp(host.WithHome(home), host.WithRunner(cli))
 
 		pkg := ompPackage(t)
 		pkg.Marketplace = ref
 
 		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
 
-		Convey("When the oracle does not report the plugin back", func() {
+		Convey("When the plugin is missing from the list", func() {
 			Convey("Then the delivery fails at the verify step, never silently", func() {
 				failure, ok := errors.AsType[*host.DeliveryError](err)
 				So(ok, ShouldBeTrue)
 				So(failure.Step, ShouldEqual, "verify")
-				So(callKeys(runner), ShouldNotContain, "omp plugin marketplace add "+ref)
+				So(failure.Error(), ShouldContainSubstring, "is not listed by the oracle")
+				So(cli.Calls(), ShouldContain, "omp plugin install caveman@acme-tools --force")
 			})
 		})
 	})
@@ -1281,4 +1340,104 @@ func TestOmpOracleNPMEntryNeverMatchesAMarketplace(t *testing.T) {
 			})
 		})
 	})
+}
+
+// TestOmpOracleUnrecognizedDocument pins the F2 rule: a document whose keys the
+// oracle does not recognize is "cannot tell", never "nothing installed" — the
+// marketplace refcount keeps a marketplace when the oracle cannot list, so an
+// empty answer from a renamed key must not look like an empty host.
+func TestOmpOracleUnrecognizedDocument(t *testing.T) {
+	Convey("Given a host answering an unfamiliar plugin list document", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		for _, body := range []string{"{}", "null", `{"plugins": {}}`, `{"installed": [], "available": []}`} {
+			Convey("When the body is "+body, func() {
+				h, _ := newOmp(t, t.TempDir(), map[string]hostcli.Response{
+					"omp plugin list --json": response(body),
+				})
+
+				listed, err := h.Oracle().List(t.Context())
+
+				Convey("Then the oracle reports that it cannot read the output", func() {
+					oracleErr, ok := errors.AsType[*host.OracleError](err)
+					So(ok, ShouldBeTrue)
+					So(oracleErr.Output, ShouldEqual, body)
+					So(listed, ShouldBeEmpty)
+				})
+			})
+		}
+	})
+}
+
+// TestOmpUninstallKeepsMarketplaceWhenListingUnclear pins the other half of F2:
+// when the oracle cannot list, the marketplace refcount keeps the marketplace
+// instead of removing one another plugin may need.
+func TestOmpUninstallKeepsMarketplaceWhenListingUnclear(t *testing.T) {
+	Convey("Given a host whose plugin list cannot be read", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		h, runner := newOmp(t, t.TempDir(), map[string]hostcli.Response{
+			"omp plugin list --json": response("{}"),
+		})
+
+		r := receipt.Receipt{Strategy: string(host.Native), RMA: []receipt.Op{
+			{Kind: receipt.OpHostInstall, Command: []string{"plugin", "marketplace", "remove", "acme"}},
+		}}
+
+		res, err := h.Uninstall(t.Context(), "", r)
+
+		Convey("When the marketplace inverse runs", func() {
+			Convey("Then it is kept with a note and the removal never runs", func() {
+				So(err, ShouldBeNil)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "marketplace acme kept")
+				So(callKeys(runner), ShouldNotContain, "omp plugin marketplace remove acme")
+			})
+		})
+	})
+}
+
+// TestOmpLockFollowsTheStateRoot pins G-PROFILE: the lock and the mutations it
+// serializes resolve through the same root, and that root follows a named
+// profile and PI_CONFIG_DIR (live-verified: with OMP_PROFILE=work the host reads
+// ~/.omp/profiles/work/plugins/ and reports nothing installed from the default
+// root; PI_CONFIG_DIR moves the same state below <home>/<dir>).
+func TestOmpLockFollowsTheStateRoot(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"default root", nil, filepath.Join(".omp", ".omp-plugin.verger.lock")},
+		{"named profile", map[string]string{"OMP_PROFILE": "work"}, filepath.Join(".omp", "profiles", "work", ".omp-plugin.verger.lock")},
+		{"pi config dir", map[string]string{"PI_CONFIG_DIR": "cfg"}, filepath.Join("cfg", ".omp-plugin.verger.lock")},
+	}
+
+	for _, item := range cases {
+		Convey("Given the "+item.name, t, func() {
+			h, cli, home := ompWorld(t)
+
+			for name, value := range item.env {
+				t.Setenv(name, value)
+			}
+
+			ref := ompMarketplace(t, "acme-tools", "caveman", "1.2.3")
+
+			pkg := ompPackage(t)
+			pkg.Marketplace = ref
+
+			_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
+
+			Convey("When a delivery mutates the plugin state", func() {
+				Convey("Then the lock lives in the root the host reads, not the default one", func() {
+					So(err, ShouldBeNil)
+					So(cli.Calls(), ShouldNotBeEmpty)
+
+					So(fileExists(filepath.Join(home, item.want)), ShouldBeTrue)
+					So(fileExists(filepath.Join(home, ".omp", ".omp-plugin.verger.lock")), ShouldEqual, item.want == filepath.Join(".omp", ".omp-plugin.verger.lock"))
+				})
+			})
+		})
+	}
 }
