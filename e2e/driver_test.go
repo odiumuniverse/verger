@@ -190,13 +190,22 @@ func newEnv(t *testing.T, spec hostSpec) Env {
 		}
 	}
 
-	return Env{
+	env := Env{
 		Home:    home,
 		Bin:     os.Getenv("E2E_VERGER_BIN"),
 		Host:    spec.id,
 		Version: spec.version(),
 		Work:    work,
 	}
+
+	// E2E_PATH prepends directories to the child PATH: a host that ships from
+	// a second toolchain (dsh lives in another node version here) needs it on
+	// PATH without touching the developer's shell.
+	if extra := strings.TrimSpace(os.Getenv("E2E_PATH")); extra != "" {
+		env.PATH = extra + string(os.PathListSeparator) + os.Getenv("PATH")
+	}
+
+	return env
 }
 
 // assertTempHome pins the isolation contract before any run: HOME is a temp
@@ -349,11 +358,11 @@ func oracleHasName(raw []byte, name string) bool {
 func ensureHost(t *testing.T, env Env, spec hostSpec) {
 	t.Helper()
 
-	if _, err := exec.LookPath(spec.binary); err == nil {
+	if _, err := lookPath(env, spec.binary); err == nil {
 		return
 	}
 
-	if os.Getenv("E2E_NPM_INSTALL") == "1" {
+	if os.Getenv("E2E_NPM_INSTALL") == "1" && len(spec.installRefs()) > 0 {
 		t.Logf("e2e: installing %s from npm", strings.Join(spec.installRefs(), " "))
 
 		out, code := runHost(t, env, "npm", append([]string{"install", "-g"}, spec.installRefs()...)...)
@@ -361,7 +370,7 @@ func ensureHost(t *testing.T, env Env, spec hostSpec) {
 			t.Fatalf("e2e: npm install -g %s -> %d\n%s", strings.Join(spec.installRefs(), " "), code, out)
 		}
 
-		if _, err := exec.LookPath(spec.binary); err == nil {
+		if _, err := lookPath(env, spec.binary); err == nil {
 			return
 		}
 	}
@@ -404,6 +413,10 @@ func writeFile(t *testing.T, path, body string) {
 // hostList runs the host's own JSON list oracle.
 func hostList(t *testing.T, env Env, spec hostSpec) string {
 	t.Helper()
+
+	if len(spec.listArgs) == 0 {
+		t.Fatalf("e2e: %s has no listing oracle argv; the caller must honour spec.noOracleReason", spec.id)
+	}
 
 	out, code := runHost(t, env, spec.binary, spec.listArgs...)
 	if code != 0 {
@@ -565,8 +578,24 @@ func adoptLeg(t *testing.T, env Env, spec hostSpec) {
 	hooksPath := filepath.Join(env.Home, filepath.FromSlash(spec.hooksFile))
 	hooksBefore, hooksBeforeOK := snapshotFile(hooksPath)
 
-	// the oracle lists the bare plugin name; pkg/cli matches that form (M2)
-	out, code := runVerger(t, env, "adopt", spec.id+":"+fixtureName, "--json")
+	// `verger adopt` installs the adopted package into **every detected host**
+	// (D4) and exits non-zero when one of them refuses it — on a machine with
+	// ten CLIs that is the normal case (finding F2 in W3-E2E10-1.md). The leg
+	// therefore runs adopt with a PATH that resolves only the host under test,
+	// which is also the honest isolation for "the user has this one host".
+	restore := env.PATH
+	env.PATH = hostOnlyPath(t, env, spec)
+
+	// the oracle lists the bare plugin name; pkg/cli matches that form (M2).
+	// A host whose oracle names paths (pi) is adopted by that path.
+	ref := spec.id + ":" + fixtureName
+	if spec.adoptByPath {
+		ref = spec.id + ":" + filepath.Join(env.Work, "fixture")
+	}
+
+	out, code := runVerger(t, env, "adopt", ref, "--json")
+
+	env.PATH = restore
 	if code != 0 {
 		t.Fatalf("e2e: verger adopt %s:%s -> %d\n%s", spec.id, fixtureName, code, out)
 	}
@@ -612,6 +641,8 @@ func manualInstall(t *testing.T, env Env, spec hostSpec) {
 		manualInstallGemini(t, env)
 	case "omp":
 		manualInstallOmp(t, env)
+	case "pi":
+		manualInstallPi(t, env)
 	default:
 		t.Fatalf("e2e: no manual install for %s", spec.id)
 	}
@@ -755,6 +786,20 @@ func manualInstallGemini(t *testing.T, env Env) {
 	out, code := runHost(t, env, "gemini", "extensions", "link", root, "--consent")
 	if code != 0 {
 		t.Fatalf("e2e: gemini extensions link -> %d\n%s", code, out)
+	}
+}
+
+// manualInstallPi registers the fixture directory with pi's own installer
+// (`pi install <ABS_DIR>`, dist/package-manager-cli.js:105-150): pi records the
+// resolved path in settings.json, user scope, and lists it back by that path.
+func manualInstallPi(t *testing.T, env Env) {
+	t.Helper()
+
+	dir := filepath.Join(env.Work, "fixture")
+
+	out, code := runHost(t, env, "pi", "install", dir)
+	if code != 0 {
+		t.Fatalf("e2e: pi install %s -> %d\n%s", dir, code, out)
 	}
 }
 
@@ -908,7 +953,12 @@ func TestE2ELocalFixtureScenario(t *testing.T) {
 	case "loose":
 		// causal oracle expectation: loose never registers with the host CLI
 		assertLooseMarker(t, env, spec)
-		requireOracle(t, env, spec, fixtureName, false)
+
+		if spec.noOracleReason == "" {
+			requireOracle(t, env, spec, fixtureName, false)
+		} else {
+			t.Logf("e2e: %s: oracle check skipped: %s", spec.id, spec.noOracleReason)
+		}
 	case "synth", "native":
 		requireOracle(t, env, spec, fixtureName, true)
 	default:
@@ -921,7 +971,11 @@ func TestE2ELocalFixtureScenario(t *testing.T) {
 	}
 
 	assertNotCurrent(t, env, spec.id)
-	requireOracle(t, env, spec, fixtureName, false)
+
+	if spec.noOracleReason == "" {
+		requireOracle(t, env, spec, fixtureName, false)
+	}
+
 	assertNoResidue(t, env, spec)
 
 	adoptLeg(t, env, spec)
@@ -976,7 +1030,11 @@ func TestE2ERemoteArchiveScenario(t *testing.T) {
 	}
 
 	assertNotCurrent(t, env, spec.id)
-	requireOracle(t, env, spec, fixtureName, false)
+
+	if spec.noOracleReason == "" {
+		requireOracle(t, env, spec, fixtureName, false)
+	}
+
 	assertNoResidue(t, env, spec)
 }
 
@@ -1083,22 +1141,7 @@ func assertLooseMarker(t *testing.T, env Env, spec hostSpec) {
 
 // looseSkillMarker is the host-loose skill path of the fixture skill.
 func looseSkillMarker(home, host string) string {
-	rel := map[string]string{
-		"claude": ".claude/skills/e2e-skill/SKILL.md",
-		"codex":  ".agents/skills/e2e-skill/SKILL.md",
-		"gemini": ".gemini/skills/e2e-skill/SKILL.md",
-		// omp reads the shared ~/.agents root through its ungated agents
-		// provider, so its loose skills land beside Codex's.
-		"omp": ".agents/skills/e2e-skill/SKILL.md",
-		// cursor-agent reads its own skills directory below its home.
-		"cursor": ".cursor/skills/e2e-skill/SKILL.md",
-	}[host]
-
-	if rel == "" {
-		return ""
-	}
-
-	return filepath.Join(home, filepath.FromSlash(rel))
+	return looseSkillMarkerFor(home, host, "e2e-skill")
 }
 
 // serveFixtureArchive packs the fixture into a single-rooted tar.gz and serves
@@ -1282,21 +1325,60 @@ func TestUnitOracleHasName(t *testing.T) {
 	}
 }
 
-// TestUnitHostSpecs pins the matrix shape: five hosts, pins, oracles, and an
-// install path for each (npm, or a reason why there is none).
+// TestUnitHostSpecs pins the matrix shape: all ten hosts of U4, pins, oracles
+// (or the documented reason there is none), and an install path for each (npm,
+// or a reason why there is none).
 func TestUnitHostSpecs(t *testing.T) {
 	specs := hostSpecs()
-	if len(specs) != 5 {
-		t.Fatalf("hostSpecs length = %d, want 5", len(specs))
+
+	want := []string{"claude", "codex", "gemini", "agy", "cursor", "opencode", "kilo", "pi", "dsh", "omp"}
+	if len(specs) != len(want) {
+		t.Fatalf("hostSpecs length = %d, want %d", len(specs), len(want))
+	}
+
+	for i, id := range want {
+		if specs[i].id != id {
+			t.Fatalf("hostSpecs[%d] = %q, want %q", i, specs[i].id, id)
+		}
 	}
 
 	for _, spec := range specs {
-		if spec.id == "" || spec.binary == "" || spec.pin == "" {
+		if spec.id == "" || spec.binary == "" {
 			t.Fatalf("incomplete host spec: %+v", spec)
 		}
 
-		if len(spec.listArgs) == 0 || len(spec.configDirs) == 0 || spec.fixtureManifest == "" {
-			t.Fatalf("host spec %s lacks oracle/config/fixture data", spec.id)
+		if spec.npm != "" && spec.pin == "" {
+			t.Fatalf("host spec %s installs from npm without a pin", spec.id)
+		}
+
+		if len(spec.configDirs) == 0 || spec.fixtureManifest == "" {
+			t.Fatalf("host spec %s lacks config/fixture data", spec.id)
+		}
+
+		// An oracle is either usable, or its absence carries the reason the
+		// scenarios print instead of shelling out.
+		if len(spec.listArgs) == 0 && spec.noOracleReason == "" {
+			t.Fatalf("host spec %s has no listing oracle and no reason", spec.id)
+		}
+
+		if len(spec.canonKinds) == 0 {
+			t.Fatalf("host spec %s has no canon component kinds", spec.id)
+		}
+
+		if spec.canonHooksBlocked == "" && spec.hooksFile == "" {
+			t.Fatalf("host spec %s takes hooks but names no hooks document", spec.id)
+		}
+
+		if slices.Contains(spec.canonKinds, "mcp") && spec.mcpFile == "" {
+			t.Fatalf("host spec %s takes MCP but names no MCP document", spec.id)
+		}
+
+		if spec.canonHooksBlocked == "" && !slices.Contains(spec.canonKinds, "hook") {
+			t.Fatalf("host spec %s has no hook component and no blocked reason", spec.id)
+		}
+
+		if spec.adoptByPath && spec.adoptReason == "" && spec.noOracleReason == "" && len(spec.listArgs) == 0 {
+			t.Fatalf("host spec %s adopts by path without a listing oracle", spec.id)
 		}
 
 		switch {
@@ -1469,4 +1551,579 @@ func TestUnitFixtureIdentity(t *testing.T) {
 	if fixtureManifestName() != fixtureID {
 		t.Fatalf("fixtureManifestName = %q, want %q", fixtureManifestName(), fixtureID)
 	}
+}
+
+// ---- the canon package leg (W3-E2E10) --------------------------------------
+
+// canonName is the fixture package of the canon leg: one directory carrying
+// every component beadle's canon bundle has (skills + agents + commands + MCP +
+// hooks), the shape DESIGN §9.3 publishes as `local:<vault>/bundle`.
+const (
+	canonName  = "e2e-canon"
+	canonID    = fixtureOwner + "/" + canonName
+	canonSkill = "e2e-canon-skill"
+	canonAgent = "e2e-canon-agent"
+	canonCmd   = "e2e-canon-command"
+	canonMCP   = "e2e-canon-mcp"
+	canonHook  = "e2e-canon-hook"
+)
+
+// artifactDoc mirrors one receipt artifact (pkg/receipt §Artifact): the driver
+// reads the receipt as an on-disk contract and never imports pkg/receipt.
+type artifactDoc struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Digest string `json:"digest"`
+}
+
+// receiptDoc mirrors the fields of one receipt the canon leg asserts on.
+type receiptDoc struct {
+	Schema    int           `json:"schema"`
+	Package   string        `json:"package"`
+	Host      string        `json:"host"`
+	Scope     string        `json:"scope"`
+	Strategy  string        `json:"strategy"`
+	Artifacts []artifactDoc `json:"artifacts"`
+}
+
+// makeCanonFixture writes the canon-shaped directory package: a claude-format
+// payload carrying all five components at once (the claude reader is the only
+// one that yields skills + agents + commands + hooks + MCP, pkg/manifest
+// claude.go:44-48; the Agent Plugins format carries skills and MCP only,
+// agentplugins.go:53-54).
+func makeCanonFixture(t *testing.T, env Env) string {
+	t.Helper()
+
+	dir := filepath.Join(env.Work, "canon")
+
+	writeFile(t, filepath.Join(dir, ".claude-plugin", "plugin.json"), fmt.Sprintf(`{
+  "name": %q,
+  "version": "1.0.0",
+  "description": "verger e2e canon fixture"
+}
+`, canonID))
+
+	writeFile(t, filepath.Join(dir, "skills", canonSkill, "SKILL.md"),
+		"---\nname: "+canonSkill+"\ndescription: e2e canon skill\n---\n\nCanon fixture body.\n")
+
+	writeFile(t, filepath.Join(dir, "agents", canonAgent+".md"),
+		"---\nname: "+canonAgent+"\ndescription: e2e canon agent\n---\n\nCanon agent body.\n")
+
+	writeFile(t, filepath.Join(dir, "commands", canonCmd+".md"),
+		"---\nname: "+canonCmd+"\ndescription: e2e canon command\n---\n\nCanon command body.\n")
+
+	// One stdio server with no secret reference: a payload that needs a secret
+	// fails the delivery with MissingSecretsError, which is a different leg.
+	writeFile(t, filepath.Join(dir, ".mcp.json"), fmt.Sprintf(`{
+  "mcpServers": {
+    %q: {"command": "echo", "args": ["canon"]}
+  }
+}
+`, canonMCP))
+
+	// One approved-by-flag command hook in the claude dialect.
+	writeFile(t, filepath.Join(dir, "hooks", "hooks.json"), fmt.Sprintf(`{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo %s"}]}
+    ]
+  }
+}
+`, canonHook))
+
+	return dir
+}
+
+// canonReceiptPath is the receipt file of one cell: <home>/state/receipts/<pkg
+// as directories>/<host>-<scope>.json (pkg/receipt cellPath).
+func canonReceiptPath(env Env, host string) string {
+	return filepath.Join(env.Home, ".verger", "state", "receipts",
+		filepath.FromSlash(fixtureOwner), canonName, host+"-user.json")
+}
+
+// readReceipt loads one cell's receipt.
+func readReceipt(t *testing.T, env Env, host string) receiptDoc {
+	t.Helper()
+
+	path := canonReceiptPath(env, host)
+
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the path is inside the driver's temp home
+	if err != nil {
+		t.Fatalf("e2e: read receipt %s: %v", path, err)
+	}
+
+	doc := receiptDoc{}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("e2e: parse receipt %s: %v\n%s", path, err, data)
+	}
+
+	return doc
+}
+
+// receiptKinds is the set of component kinds a receipt records. Record-level
+// artifacts collapse onto their component (an `mcp-record` is the per-record
+// ownership claim of an `mcp` server, dsh writes those instead of one entry),
+// and the document-level `patch-document` claim is not a component.
+func receiptKinds(doc receiptDoc) []string {
+	kinds := make([]string, 0, len(doc.Artifacts))
+
+	for _, artifact := range doc.Artifacts {
+		kind := strings.TrimSuffix(artifact.Kind, "-record")
+		if kind == "patch-document" {
+			continue
+		}
+
+		kinds = append(kinds, kind)
+	}
+
+	slices.Sort(kinds)
+
+	return slices.Compact(kinds)
+}
+
+// assertReceiptKinds fails when the receipt is missing a kind the host spec
+// expects, or carries a kind the host cannot take.
+func assertReceiptKinds(t *testing.T, doc receiptDoc, spec hostSpec) {
+	t.Helper()
+
+	got := receiptKinds(doc)
+	want := slices.Clone(spec.canonKinds)
+	slices.Sort(want)
+
+	for _, kind := range want {
+		if !slices.Contains(got, kind) {
+			t.Fatalf("e2e: %s receipt kinds %v are missing %q (artifacts %+v)", spec.id, got, kind, doc.Artifacts)
+		}
+	}
+
+	for _, kind := range got {
+		if kind == "rule" {
+			continue // a rules component the canon fixture does not carry
+		}
+
+		if !slices.Contains(want, kind) {
+			t.Fatalf("e2e: %s receipt records kind %q, which its host spec does not list (kinds %v)", spec.id, kind, got)
+		}
+	}
+}
+
+// assertArtifactsOnDisk proves every recorded artifact still exists, and for a
+// whole file that verger wrote alone, that its bytes still match the receipt.
+// A config-document artifact (mcp|hook|patch-document) records the digest of
+// the value verger wrote inside a host document the user may also edit
+// (pkg/host/loose.go:1385-1392), so its claim is the value's presence, not the
+// file's bytes.
+func assertArtifactsOnDisk(t *testing.T, doc receiptDoc) {
+	t.Helper()
+
+	for _, artifact := range doc.Artifacts {
+		if artifact.Path == "" {
+			continue // record ops carry no filesystem target
+		}
+
+		// A record artifact names a value inside a document, not a path: the
+		// scheme-shaped target (dsh://patch/…, cursor://hooks/…) is asserted
+		// through the document itself.
+		if !filepath.IsAbs(artifact.Path) {
+			continue
+		}
+
+		if !fileExists(artifact.Path) {
+			t.Fatalf("e2e: receipt artifact %s %q is missing on disk: %s", artifact.Kind, artifact.Name, artifact.Path)
+		}
+
+		switch artifact.Kind {
+		case "skill", "agent", "command", "rule":
+			// A skill is recorded as its directory (a tree digest), the other
+			// kinds as one file.
+			info, err := os.Stat(artifact.Path)
+			if err != nil {
+				t.Fatalf("e2e: stat %s: %v", artifact.Path, err)
+			}
+
+			if info.IsDir() {
+				assertTreeNotEmpty(t, artifact.Path)
+
+				continue
+			}
+
+			if artifact.Digest == "" {
+				continue
+			}
+
+			got, err := digestFile(artifact.Path)
+			if err != nil {
+				t.Fatalf("e2e: digest %s: %v", artifact.Path, err)
+			}
+
+			if got != artifact.Digest {
+				t.Fatalf("e2e: %s digest = %s, receipt records %s", artifact.Path, got, artifact.Digest)
+			}
+		case "mcp":
+			// The receipt records a synthetic URI for an MCP server, so the
+			// host's own document is the fact (assertMCPDocument).
+		default:
+			// hook and patch-document records name the document itself; the
+			// value-level assertion lives in assertHookSurface.
+		}
+	}
+}
+
+// assertMCPDocument proves the fixture's MCP server landed in the document the
+// host itself reads, and is gone after remove.
+func assertMCPDocument(t *testing.T, env Env, spec hostSpec, want bool) {
+	t.Helper()
+
+	if spec.mcpFile == "" {
+		return
+	}
+
+	file := filepath.Join(env.Home, filepath.FromSlash(spec.mcpFile))
+
+	if !want {
+		if !fileExists(file) {
+			return
+		}
+
+		data, err := os.ReadFile(file) //nolint:gosec // G304: temp home
+		if err != nil {
+			t.Fatalf("e2e: read %s: %v", file, err)
+		}
+
+		if strings.Contains(string(data), canonMCP) {
+			t.Fatalf("e2e: %s still carries the MCP server %s after remove:\n%s", file, canonMCP, data)
+		}
+
+		return
+	}
+
+	data, err := os.ReadFile(file) //nolint:gosec // G304: temp home
+	if err != nil {
+		t.Fatalf("e2e: read MCP document %s: %v", file, err)
+	}
+
+	if !strings.Contains(string(data), canonMCP) {
+		t.Fatalf("e2e: %s does not carry the MCP server %s:\n%s", file, canonMCP, data)
+	}
+}
+
+// assertTreeNotEmpty fails when a delivered skill directory carries no file at
+// all (the receipt records the tree, so the tree must still hold something).
+func assertTreeNotEmpty(t *testing.T, dir string) {
+	t.Helper()
+
+	found := false
+
+	_ = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil //nolint:nilerr // a missing subtree is reported by the caller
+		}
+
+		found = true
+
+		return fs.SkipAll
+	})
+
+	if !found {
+		t.Fatalf("e2e: delivered skill tree %s is empty", dir)
+	}
+}
+
+// digestFile is the sha256 of a file, hex encoded (the receipt digest shape).
+func digestFile(path string) (string, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the caller passes a receipt path
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(data)
+
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// assertHookSurface proves the hook component either landed in the host's hooks
+// document or was refused with the reason the host spec documents.
+func assertHookSurface(t *testing.T, env Env, spec hostSpec, notes []string, want bool) {
+	t.Helper()
+
+	if spec.canonHooksBlocked != "" {
+		if !want {
+			return
+		}
+
+		// The host takes no hook component: the install report must say so
+		// (pkg/host/loose.go:909-912) and the hook must not appear anywhere.
+		joined := strings.Join(notes, "\n")
+		if !strings.Contains(joined, "hook") {
+			t.Fatalf("e2e: %s blocks hooks (%s) but no note says so; notes:\n%s", spec.id, spec.canonHooksBlocked, joined)
+		}
+
+		if strings.Contains(joined, "1 hook(s) skipped") && !strings.Contains(joined, spec.canonHooksBlocked) {
+			t.Fatalf("e2e: %s note does not carry the documented reason %q:\n%s", spec.id, spec.canonHooksBlocked, joined)
+		}
+
+		file := filepath.Join(env.Home, filepath.FromSlash(spec.hooksFile))
+		if fileExists(file) {
+			data, err := os.ReadFile(file) //nolint:gosec // G304: temp home
+			if err != nil {
+				t.Fatalf("e2e: read %s: %v", file, err)
+			}
+
+			if strings.Contains(string(data), canonHook) {
+				t.Fatalf("e2e: %s claims to block hooks but %s carries %s", spec.id, file, canonHook)
+			}
+		}
+
+		return
+	}
+
+	file := filepath.Join(env.Home, filepath.FromSlash(spec.hooksFile))
+
+	if !want {
+		if fileExists(file) {
+			data, err := os.ReadFile(file) //nolint:gosec // G304: temp home
+			if err != nil {
+				t.Fatalf("e2e: read %s: %v", file, err)
+			}
+
+			if strings.Contains(string(data), canonHook) {
+				t.Fatalf("e2e: %s still mentions %s after remove:\n%s", file, canonHook, data)
+			}
+		}
+
+		return
+	}
+
+	data, err := os.ReadFile(file) //nolint:gosec // G304: temp home
+	if err != nil {
+		t.Fatalf("e2e: read hooks document %s: %v", file, err)
+	}
+
+	if !strings.Contains(string(data), canonHook) {
+		t.Fatalf("e2e: %s does not carry the canon hook %s:\n%s", file, canonHook, data)
+	}
+}
+
+// TestE2ECanonPackageScenario delivers the canon-shaped directory package (a
+// `local:` payload: skills + agents + commands + MCP + hooks) to one host,
+// asserts what the receipt claims and what is on disk, then removes it and
+// proves the host is clean again. It is the W3 leg for GAP-16: beadle's canon
+// becomes exactly this package (DESIGN §9.3).
+func TestE2ECanonPackageScenario(t *testing.T) {
+	requireE2E(t)
+
+	spec := requireHostFromEnv(t)
+	env := newEnv(t, spec)
+	assertTempHome(t, env)
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpRuntime(t, env, spec)
+		}
+	})
+
+	ensureHost(t, env, spec)
+
+	makeCanonFixture(t, env)
+
+	cell, rec := installCanon(t, env, spec)
+	assertCanonLanded(t, env, spec, cell, rec)
+	assertCanonRemoved(t, env, spec, cell, rec)
+}
+
+// installCanon installs the canon fixture and returns the status cell and the
+// receipt it wrote. The ref is `./canon`: the grammar accepts only a relative
+// local path — an absolute path, `local:<abs>` and `file:<abs>` are rejected
+// (finding F1 in W3-E2E10-1.md).
+func installCanon(t *testing.T, env Env, spec hostSpec) (cellDoc, receiptDoc) {
+	t.Helper()
+
+	out, code := runVerger(t, env, "install", "./canon", "-y", "--hooks", "yes", "--hosts", spec.id, "--json")
+	if code != 0 {
+		t.Fatalf("e2e: verger install ./canon -> %d\n%s", code, out)
+	}
+
+	cell := assertStatus(t, env, spec.id, "current")
+	if cell.Strategy != "loose" {
+		t.Fatalf("e2e: a local payload chose %q, want loose (DESIGN §2.1)", cell.Strategy)
+	}
+
+	if !strings.Contains(cell.Package, canonName) {
+		t.Fatalf("e2e: status cell package %q does not name the canon fixture", cell.Package)
+	}
+
+	// The delivery notes live in the executed-plan document, not in the
+	// receipt-backed status, so carry them on the returned cell.
+	cell.Notes = canonNotes(t, []byte(out), spec.id)
+
+	return cell, readReceipt(t, env, spec.id)
+}
+
+// canonNotes reads the delivery notes of one host from an executed-plan
+// document: they live in the install report, not in the receipt-backed status.
+func canonNotes(t *testing.T, out []byte, host string) []string {
+	t.Helper()
+
+	doc, err := parseCells(out)
+	if err != nil {
+		t.Fatalf("e2e: parse install report: %v\n%s", err, out)
+	}
+
+	for _, cell := range doc.Cells {
+		if cell.Host == host {
+			return cell.Notes
+		}
+	}
+
+	return nil
+}
+
+// assertCanonLanded proves what the receipt claims and what the host holds.
+func assertCanonLanded(t *testing.T, env Env, spec hostSpec, cell cellDoc, rec receiptDoc) {
+	t.Helper()
+
+	assertReceiptKinds(t, rec, spec)
+	assertArtifactsOnDisk(t, rec)
+	assertLooseMarkerFor(t, env, spec, canonSkill)
+
+	if spec.noOracleReason == "" {
+		requireOracle(t, env, spec, canonID, false)
+	}
+
+	assertHookSurface(t, env, spec, cell.Notes, true)
+
+	if slices.Contains(spec.canonKinds, "mcp") {
+		assertMCPDocument(t, env, spec, true)
+	}
+}
+
+// assertCanonRemoved removes the package and proves every trace is gone.
+func assertCanonRemoved(t *testing.T, env Env, spec hostSpec, cell cellDoc, rec receiptDoc) {
+	t.Helper()
+
+	out, code := runVerger(t, env, "remove", cell.Package, "--json")
+	if code != 0 {
+		t.Fatalf("e2e: verger remove %s -> %d\n%s", cell.Package, code, out)
+	}
+
+	assertNotCurrent(t, env, spec.id)
+
+	if fileExists(canonReceiptPath(env, spec.id)) {
+		t.Fatalf("e2e: the receipt survived remove: %s", canonReceiptPath(env, spec.id))
+	}
+
+	for _, artifact := range rec.Artifacts {
+		if artifact.Path == "" || !filepath.IsAbs(artifact.Path) {
+			continue
+		}
+
+		switch artifact.Kind {
+		case "skill", "agent", "command", "rule":
+			if fileExists(artifact.Path) {
+				t.Fatalf("e2e: remove left the %s artifact %s", artifact.Kind, artifact.Path)
+			}
+		}
+	}
+
+	assertHookSurface(t, env, spec, nil, false)
+
+	if slices.Contains(spec.canonKinds, "mcp") {
+		assertMCPDocument(t, env, spec, false)
+	}
+
+	assertNoResidue(t, env, spec)
+}
+
+// assertLooseMarkerFor proves one named loose skill landed for the host.
+func assertLooseMarkerFor(t *testing.T, env Env, spec hostSpec, skill string) {
+	t.Helper()
+
+	marker := looseSkillMarkerFor(env.Home, spec.id, skill)
+	if marker == "" {
+		t.Skipf("e2e: %s has no loose skills surface", spec.id)
+	}
+
+	if !fileExists(marker) {
+		t.Fatalf("e2e: loose delivery did not write %s", marker)
+	}
+}
+
+// looseSkillMarkerFor is the host-loose path of one named skill: the single
+// table both fixture scenarios read, so a host cannot be covered by one leg and
+// missed by the other.
+func looseSkillMarkerFor(home, host, skill string) string {
+	rel := map[string]string{
+		"claude":   ".claude/skills/%s/SKILL.md",
+		"codex":    ".agents/skills/%s/SKILL.md",
+		"gemini":   ".gemini/skills/%s/SKILL.md",
+		"omp":      ".agents/skills/%s/SKILL.md",
+		"cursor":   ".cursor/skills/%s/SKILL.md",
+		"opencode": ".config/opencode/skills/%s/SKILL.md",
+		"kilo":     ".config/kilo/skills/%s/SKILL.md",
+		"pi":       ".pi/agent/skills/%s/SKILL.md",
+		"agy":      ".agents/skills/%s/SKILL.md",
+		"dsh":      ".dsh/skills/%s/SKILL.md",
+	}[host]
+
+	if rel == "" {
+		return ""
+	}
+
+	return filepath.Join(home, filepath.FromSlash(fmt.Sprintf(rel, skill)))
+}
+
+// hostOnlyPath builds a PATH with exactly one host CLI in it: a symlink to the
+// binary under test in a fresh directory. Every other adapter then fails to
+// detect its host, which is what an adopt fan-out needs to stay scoped.
+func hostOnlyPath(t *testing.T, env Env, spec hostSpec) string {
+	t.Helper()
+
+	bin, err := lookPath(env, spec.binary)
+	if err != nil {
+		t.Skipf("e2e: %s CLI is not installed (%s)", spec.binary, spec.installHint())
+	}
+
+	dir := t.TempDir()
+
+	if err := os.Symlink(bin, filepath.Join(dir, spec.binary)); err != nil {
+		t.Fatalf("e2e: symlink %s: %v", spec.binary, err)
+	}
+
+	// A host CLI is a script with an interpreter (`#!/usr/bin/env node` for the
+	// npm ones, `#!/usr/bin/env bun` for omp's launcher), so the interpreter
+	// must stay reachable — but its own directory holds every npm-installed
+	// host (kilo, pi and dsh live in the same bin as node), so only symlinks to
+	// the interpreters go into the isolated directory. /usr/bin and /bin carry
+	// the shell utilities and no host CLI.
+	for _, runtime := range []string{"node", "bun"} {
+		path, err := lookPath(env, runtime)
+		if err != nil {
+			continue
+		}
+
+		if linkErr := os.Symlink(path, filepath.Join(dir, runtime)); linkErr != nil {
+			t.Fatalf("e2e: symlink %s: %v", runtime, linkErr)
+		}
+	}
+
+	return strings.Join([]string{dir, "/usr/bin", "/bin"}, string(os.PathListSeparator))
+}
+
+// lookPath resolves a host binary the way the child will: env.PATH when the
+// driver pins one (a leg that needs a specific node toolchain), the driver's
+// own PATH otherwise.
+func lookPath(env Env, name string) (string, error) {
+	if env.PATH == "" {
+		return exec.LookPath(name)
+	}
+
+	for _, dir := range filepath.SplitList(env.PATH) {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+
+	return "", exec.ErrNotFound
 }

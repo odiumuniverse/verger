@@ -17,9 +17,17 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: runtime/package-lock.json
       - run: go build -mod=vendor ./...
       - run: go vet -mod=vendor ./...
       - run: go test -mod=vendor -race ./...
+      # The runtime bundle is committed and embedded, so the Go build never
+      # needs node; its published shape and the consent gates are checked here.
+      - run: make test-runtime
 
   lint:
     runs-on: ubuntu-latest

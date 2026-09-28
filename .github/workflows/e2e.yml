@@ -14,37 +14,69 @@ on:
 permissions:
   contents: read
 
+# One leg per host and OS (W3-E2E10). Every host of U4 is installed the way a
+# user installs it:
+#   * npm: claude, codex, gemini, kilo, pi, dsh, omp (+ bun, omp's launcher)
+#   * opencode 2.x: the release archive from opencode.ai (the npm package
+#     `opencode-ai` is the 1.x line) — digest-checked, the same file the
+#     anomalyco/tap/opencode-v2 formula installs
+#   * cursor-agent: cursor.com/install, the documented user path
+#   * agy (Antigravity) is a desktop application with no CLI binary on either
+#     OS, so it has no CI job: its leg runs only where a binary exists and skips
+#     with that reason everywhere else (e2e/README.md, W3-E2E10-1.md §F6).
 jobs:
   e2e:
-    name: e2e (${{ matrix.host }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    container:
-      image: node:22-bookworm   # spec rule 1: one job per host
+    name: e2e (${{ matrix.host }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         include:
           - host: claude
-            package: '@anthropic-ai/claude-code'
-            version: 2.1.283
+            install: npm install -g '@anthropic-ai/claude-code@2.1.284'
           - host: codex
-            package: '@openai/codex'
-            version: 0.157.1
+            install: npm install -g '@openai/codex@0.158.0'
           - host: gemini
-            package: '@google/gemini-cli'
-            version: 0.61.0
-          # cursor-agent has no npm distribution (it ships from
-          # cursor.com/install) and no installer to ride, so it has no positive
-          # matrix entry: a job that always skips proves nothing. The host is
-          # covered by the negative matrix here and by a local leg
-          # (e2e/run.sh cursor) on a machine where the CLI is present.
-          # omp has no package named after its binary: the CLI ships as
-          # @oh-my-pi/pi-coding-agent and its launcher needs the bun runtime.
+            install: npm install -g '@google/gemini-cli@0.46.0'
+          - host: kilo
+            install: npm install -g '@kilocode/cli@7.8.1'
+          - host: pi
+            install: npm install -g '@earendil-works/pi-coding-agent@0.74.2'
+          # dsh needs Node >= 24, which is the node the job sets up below.
+          - host: dsh
+            install: npm install -g '@deepseek-ai/dsh@0.1.7-rc.2'
           - host: omp
-            package: '@oh-my-pi/pi-coding-agent'
-            extra: bun
-            version: 18.4.1
+            install: npm install -g '@oh-my-pi/pi-coding-agent@18.4.2' bun
+          - host: opencode
+            install: |
+              set -euo pipefail
+              os="$(uname -s)"
+              arch="$(uname -m)"
+              case "$os:$arch" in
+                Linux:arm64|Linux:aarch64) asset="opencode-linux-arm64.tar.gz";   sha="f46253f0ff5eff0c1751d3b734ede55cc60d932d60af81d061d03745f9998082"; kind="tar" ;;
+                Linux:x86_64)              asset="opencode-linux-x64-baseline.tar.gz"; sha="5db6a93cadec1704b150e3cc807b95e0d6366651c906b0003fb994fba05b7b40"; kind="tar" ;;
+                Darwin:arm64)              asset="opencode-darwin-arm64.zip";     sha="ea3a69433e33ee1fe3e1924de800aa7f28a32e2e1af1812366e88361a46600e2"; kind="zip" ;;
+                Darwin:x86_64)             asset="opencode-darwin-x64-baseline.zip"; sha="50503bcda1ac7ca4a4075fa4fe3fc84cb54afac960cf2fa0ee5fef01d752d366"; kind="zip" ;;
+                *) echo "no opencode asset for $os:$arch" >&2; exit 1 ;;
+              esac
+              curl -fsSL -o "/tmp/opencode.${kind}" "https://opencode.ai/files/bin/2.0.18/${asset}"
+              if [ "$kind" = zip ]; then
+                echo "${sha}  /tmp/opencode.zip" | shasum -a 256 -c -
+                unzip -o -q /tmp/opencode.zip -d /tmp
+              else
+                echo "${sha}  /tmp/opencode.tar" | sha256sum -c -
+                tar -xzf /tmp/opencode.tar -C /tmp
+              fi
+              mkdir -p "$HOME/.local/bin"
+              install -m 0755 /tmp/opencode "$HOME/.local/bin/opencode"
+          - host: cursor
+            # the installer links the binary as `agent`; the documented name (and
+            # the adapter's host-CLI name) is `cursor-agent`
+            install: |
+              curl -fsSL https://cursor.com/install | bash
+              ln -sf "$HOME/.local/bin/agent" "$HOME/.local/bin/cursor-agent"
     steps:
       - uses: actions/checkout@v7
 
@@ -52,13 +84,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Vet the tagged driver
         run: go vet -mod=vendor -tags e2e ./e2e
 
       - name: Preflight — the scenario tests must exist
         run: |
-          listed="$(go test -mod=vendor -tags e2e -list 'TestE2E(Local|Remote)' ./e2e/...)"
-          for want in TestE2ELocalFixtureScenario TestE2ERemoteArchiveScenario; do
+          listed="$(go test -mod=vendor -tags e2e -list 'TestE2E(Local|Remote|Canon)' ./e2e/...)"
+          for want in TestE2ELocalFixtureScenario TestE2ERemoteArchiveScenario TestE2ECanonPackageScenario; do
             if ! printf '%s\n' "$listed" | grep -qx "$want"; then
               echo "preflight: $want is not selected — a stale -run pattern would silently pass" >&2
               printf '%s\n' "$listed" >&2
@@ -67,7 +103,9 @@ jobs:
           done
 
       - name: Install host CLI
-        run: npm install -g '${{ matrix.package }}@${{ matrix.version }}' ${{ matrix.extra }}
+        env:
+          INSTALL: ${{ matrix.install }}
+        run: bash -c "$INSTALL"
 
       - name: e2e scenario
         env:
@@ -76,29 +114,29 @@ jobs:
           # attempt an npm install (loud failure) instead of a silent skip (N1)
           E2E_NPM_INSTALL: '1'
           E2E_HOST: ${{ matrix.host }}
-          E2E_VERSION: ${{ matrix.version }}
           E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
-        run: go test -mod=vendor -tags e2e -count=1 -timeout 30m -v ./e2e/...
+        run: |
+          # cursor-agent and the opencode archive land in ~/.local/bin
+          export PATH="$HOME/.local/bin:$PATH"
+          go test -mod=vendor -tags e2e -count=1 -timeout 30m -v -run 'TestE2E(Local|Remote|Canon)' ./e2e/...
 
       - name: Failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs-${{ matrix.host }}
+          name: e2e-logs-${{ matrix.host }}-${{ matrix.os }}
           path: e2e-logs/
           if-no-files-found: ignore
           retention-days: 7
 
   negative:
-    name: e2e (no host on PATH)
+    name: e2e (no host on PATH · ${{ matrix.host }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    container:
-      image: node:22-bookworm
     strategy:
       fail-fast: false
       matrix:
-        host: [claude, codex, gemini, omp, cursor]
+        host: [claude, codex, gemini, agy, cursor, opencode, kilo, pi, dsh, omp]
     steps:
       - uses: actions/checkout@v7
 

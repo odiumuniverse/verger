@@ -2,13 +2,17 @@
 # Local reproduction helper for the T1.13 e2e driver.
 #
 #   ./e2e/run.sh                 # build the image and run the claude leg
-#   ./e2e/run.sh gemini          # one host: claude|codex|gemini|omp|cursor
+#   ./e2e/run.sh gemini          # one host of the ten (see hosts below)
 #   ./e2e/run.sh claude noimage  # skip the image build (image already local)
 #   ./e2e/run.sh claude negative # negative leg (no host CLI on PATH)
+#   ./e2e/run.sh claude canon    # canon-package leg (local: skills+agents+
+#                                #   commands+MCP+hooks, the beadle-canon shape)
 #   ./e2e/run.sh claude check    # preflight only: assert the expected tests exist
 #
 # E2E_LOCAL=1 runs the commands on this machine instead of inside the image
 # (Go and, for a real leg, the host CLI must be installed; see README.md).
+# E2E_PATH prepends a toolchain dir to the child PATH (a host that ships from
+# another node version, e.g. dsh).
 #
 # CI does the same with node:22-bookworm + setup-go; the image only bundles
 # node, Go and the three pinned agents for offline/local convenience.
@@ -23,17 +27,17 @@ host="${1:-claude}"
 mode="${2:-}"
 
 usage() {
-  echo "usage: $0 [claude|codex|gemini|omp|cursor] [noimage|negative|check]" >&2
+  echo "usage: $0 [claude|codex|gemini|agy|cursor|opencode|kilo|pi|dsh|omp] [noimage|negative|canon|check]" >&2
   exit 2
 }
 
 case "$host" in
-  claude | codex | gemini | omp | cursor) ;;
+  claude | codex | gemini | agy | cursor | opencode | kilo | pi | dsh | omp) ;;
   *) usage ;;
 esac
 
 case "$mode" in
-  "" | noimage | negative | check) ;;
+  "" | noimage | negative | canon | check) ;;
   *) usage ;;
 esac
 
@@ -47,20 +51,28 @@ fi
 # The -run pattern and the scenario functions each leg must select. Both are
 # asserted by the preflight, so the pattern and the names cannot drift apart
 # silently again.
-if [[ "$mode" == "negative" || "$mode" == "check" ]]; then
-  neg_pattern='TestE2ENegative'
-  neg_expected=(TestE2ENegative)
-fi
+neg_pattern='TestE2ENegative'
+neg_expected=(TestE2ENegative)
+canon_pattern='TestE2ECanonPackageScenario'
+canon_expected=(TestE2ECanonPackageScenario)
 
-if [[ "$mode" != "negative" ]]; then
-  pattern='TestE2E(Local|Remote)'
-  expected=(TestE2ELocalFixtureScenario TestE2ERemoteArchiveScenario)
-  timeout=25m
-else
-  pattern="$neg_pattern"
-  expected=("${neg_expected[@]}")
-  timeout=15m
-fi
+case "$mode" in
+  negative)
+    pattern="$neg_pattern"
+    expected=("${neg_expected[@]}")
+    timeout=15m
+    ;;
+  canon)
+    pattern="$canon_pattern"
+    expected=("${canon_expected[@]}")
+    timeout=25m
+    ;;
+  *)
+    pattern='TestE2E(Local|Remote)'
+    expected=(TestE2ELocalFixtureScenario TestE2ERemoteArchiveScenario)
+    timeout=25m
+    ;;
+esac
 
 local_env=(E2E=1 E2E_HOST="$host")
 docker_env=(-e E2E=1 -e E2E_HOST="$host")
@@ -115,7 +127,8 @@ preflight() {
 if [[ "$mode" == "check" ]]; then
   preflight "$pattern" "${expected[@]}"
   preflight "$neg_pattern" "${neg_expected[@]}"
-  echo "e2e preflight ok: '$pattern' selects ${expected[*]}; '$neg_pattern' selects ${neg_expected[*]}"
+  preflight "$canon_pattern" "${canon_expected[@]}"
+  echo "e2e preflight ok: '$pattern' selects ${expected[*]}; '$neg_pattern' selects ${neg_expected[*]}; '$canon_pattern' selects ${canon_expected[*]}"
 
   exit 0
 fi
