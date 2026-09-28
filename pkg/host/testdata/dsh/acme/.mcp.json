@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "fs": {
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/server.js"],
+      "env": {"TOKEN": "{secret:MCP_TOKEN}"}
+    },
+    "web": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {"Authorization": "Bearer {secret:WEB_TOKEN}"}
+    }
+  }
+}
