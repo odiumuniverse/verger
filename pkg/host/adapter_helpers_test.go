@@ -881,13 +881,26 @@ type ompCLI struct {
 	mu           sync.Mutex
 	marketplaces map[string]string // name → registered path
 	installed    map[string]string // plugin@marketplace → version
-	fail         map[string]hostcli.Response
-	calls        []string
+	// shadow models the registry reachable through the same `name@tag`
+	// spelling: when the marketplace name is also an npm dist-tag, the real CLI
+	// installs the public package and ignores the registered marketplace
+	// (live-observed with marketplace `beta` and package `one`). Keys are the
+	// full selector, values the registry version it resolved to.
+	shadow map[string]string
+	// registry is what such an install left behind: plugin → version, reported
+	// in the npm list, never as a marketplace entry.
+	registry map[string]string
+	fail     map[string]hostcli.Response
+	calls    []string
 }
 
 // newOmpCLI builds an empty fake.
 func newOmpCLI() *ompCLI {
-	return &ompCLI{marketplaces: map[string]string{}, installed: map[string]string{}, fail: map[string]hostcli.Response{}}
+	return &ompCLI{
+		marketplaces: map[string]string{}, installed: map[string]string{},
+		shadow: map[string]string{}, registry: map[string]string{},
+		fail: map[string]hostcli.Response{},
+	}
 }
 
 // Run implements hostcli.Runner.
@@ -958,6 +971,16 @@ func (o *ompCLI) Registered(name string) (string, bool) {
 	return path, ok
 }
 
+// RegistryInstalled reports the version an npm-shadowed selector installed.
+func (o *ompCLI) RegistryInstalled(plugin string) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	version, ok := o.registry[plugin]
+
+	return version, ok
+}
+
 // Installed reports the version of an installed plugin selector.
 func (o *ompCLI) Installed(id string) (string, bool) {
 	o.mu.Lock()
@@ -994,6 +1017,16 @@ func (o *ompCLI) marketplaceList() []byte {
 
 // pluginList is `omp plugin list --json`.
 func (o *ompCLI) pluginList() ([]byte, error) {
+	npm := []map[string]any{}
+
+	for _, plugin := range slices.Sorted(maps.Keys(o.registry)) {
+		version := o.registry[plugin]
+		npm = append(npm, map[string]any{
+			"id": plugin + "@" + version, "name": plugin, "version": version,
+			"path": filepath.Join(".omp", "plugins", "node_modules", plugin),
+		})
+	}
+
 	out := []map[string]any{}
 
 	for _, id := range slices.Sorted(maps.Keys(o.installed)) {
@@ -1007,7 +1040,7 @@ func (o *ompCLI) pluginList() ([]byte, error) {
 		})
 	}
 
-	return json.MarshalIndent(map[string]any{"npm": []any{}, "marketplace": out}, "", "  ")
+	return json.MarshalIndent(map[string]any{"npm": npm, "marketplace": out}, "", "  ")
 }
 
 // marketplace runs one `omp plugin marketplace add|remove <arg>`.
@@ -1047,6 +1080,12 @@ func (o *ompCLI) plugin(verb, id string, force bool) ([]byte, error) {
 
 	switch verb {
 	case "install":
+		if version, shadowed := o.shadow[id]; shadowed {
+			o.registry[plugin] = version
+
+			return []byte("✔ Installed " + plugin + " (" + version + ")\n"), nil
+		}
+
 		root, ok := o.marketplaces[marketplace]
 		if !ok {
 			return nil, ompRefused(1, "✘ Failed to install %s: Error: Marketplace %q not found", id, marketplace)

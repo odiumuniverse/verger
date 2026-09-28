@@ -331,7 +331,7 @@ func (h *omp) verify(ctx context.Context, pkg Package, plan *ompInstall) (Oracle
 		return OracleResult{}, err
 	}
 
-	entry, matched := installedAs(listed, plan.plugin, plan.marketplace)
+	entry, matched := installedFromMarketplace(listed, plan.plugin, plan.marketplace)
 
 	if matched && staleSynthVersion(plan.synth != nil, entry, pkg.Version) {
 		matched = false
@@ -423,6 +423,27 @@ func (h *omp) resolveMarketplace(after, before []registeredMarketplace, pkg Pack
 	}
 
 	return "", false
+}
+
+// installedFromMarketplace finds the plugin the host lists as installed from
+// exactly one marketplace. Unlike the shared installedAs it never accepts an
+// entry that reports no marketplace: `omp plugin install <name>@<tag>` falls
+// back to the npm registry whenever the selector also names a dist-tag
+// (live-observed: a registered marketplace `beta` loses to the public package
+// `one@2.0.0-beta.137.1`), and such an install must fail the verify loudly
+// instead of passing as a marketplace delivery.
+func installedFromMarketplace(listed []Installed, plugin, marketplace string) (Installed, bool) {
+	if marketplace == "" {
+		return Installed{}, false
+	}
+
+	for _, entry := range listed {
+		if entry.Name == plugin && entry.Marketplace == marketplace {
+			return entry, true
+		}
+	}
+
+	return Installed{}, false
 }
 
 // marketplaceNames lists the registered names for one error message.
@@ -710,8 +731,18 @@ func parseOmpInstalled(out []byte) ([]Installed, error) {
 
 	var listed []Installed
 
+	// An npm plugin has no marketplace, whatever its id looks like: the field
+	// is cleared so a registry package can never satisfy a marketplace
+	// selector (the registry is reachable through the same `name@tag` spelling).
 	for _, item := range doc.NPM {
-		collectInstalled(item, &listed)
+		var registry []Installed
+
+		collectInstalled(item, &registry)
+
+		for _, entry := range registry {
+			entry.Marketplace = ""
+			listed = append(listed, entry)
+		}
 	}
 
 	for _, item := range doc.Marketplace {

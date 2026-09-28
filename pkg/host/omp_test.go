@@ -1204,3 +1204,78 @@ func TestOmpLooseApplyRoundTrip(t *testing.T) {
 		})
 	})
 }
+
+// TestOmpNullableMarketplaceShadow pins the safety net of the strict verify:
+// `omp plugin install <name>@<tag>` reaches the npm registry whenever the
+// selector also names a dist-tag, and the registry wins over a registered
+// marketplace of that name (live-observed: marketplace `beta` vs the public
+// package `one@2.0.0-beta.137.1`). Such an install must fail the verify with
+// the marketplace named, never be reported as a delivery of this package.
+func TestOmpNullableMarketplaceShadow(t *testing.T) {
+	Convey("Given a marketplace whose name is also an npm dist-tag", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		cli := newOmpCLI()
+
+		ref := ompMarketplace(t, "beta", "caveman", "1.2.3")
+		cli.shadow["caveman@beta"] = "2.0.0-beta.137.1"
+
+		h := host.NewOmp(host.WithHome(home), host.WithRunner(cli))
+
+		pkg := ompPackage(t)
+		pkg.Marketplace = ref
+
+		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Native})
+
+		Convey("When the registry swallows the install", func() {
+			Convey("Then the verify fails on the step, and no marketplace entry was invented", func() {
+				failure, ok := errors.AsType[*host.DeliveryError](err)
+				So(ok, ShouldBeTrue)
+				So(failure.Step, ShouldEqual, "verify")
+				So(cli.Calls(), ShouldContain, "omp plugin install caveman@beta --force")
+
+				registry, registered := cli.RegistryInstalled("caveman")
+				So(registry, ShouldEqual, "2.0.0-beta.137.1")
+				So(registered, ShouldBeTrue)
+
+				_, fromMarketplace := cli.Installed("caveman@beta")
+				So(fromMarketplace, ShouldBeFalse)
+			})
+		})
+	})
+}
+
+// TestOmpOracleNPMEntryNeverMatchesAMarketplace pins the same net at the
+// parsing level: an npm entry carries no marketplace, whatever its id looks
+// like, so it can never satisfy a marketplace selector.
+func TestOmpOracleNPMEntryNeverMatchesAMarketplace(t *testing.T) {
+	Convey("Given a host listing a registry install beside a marketplace one", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		cli := newOmpCLI()
+		cli.registry["caveman"] = "2.0.0-beta.137.1"
+		cli.installed["alpha@beta"] = "1.0.0"
+
+		h := host.NewOmp(host.WithHome(t.TempDir()), host.WithRunner(cli))
+
+		listed, err := h.Oracle().List(t.Context())
+
+		Convey("When the list is read", func() {
+			Convey("Then the registry entry reports no marketplace and the marketplace one keeps its own", func() {
+				So(err, ShouldBeNil)
+				So(listed, ShouldHaveLength, 2)
+
+				byName := map[string]string{}
+				for _, entry := range listed {
+					byName[entry.Name] = entry.Marketplace
+				}
+
+				So(byName["caveman"], ShouldEqual, "")
+				So(byName["alpha"], ShouldEqual, "beta")
+			})
+		})
+	})
+}
