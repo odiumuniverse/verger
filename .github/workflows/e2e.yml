@@ -33,7 +33,51 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        host: [claude, codex, gemini, kilo, pi, dsh, omp, opencode, cursor]
         include:
+          - host: claude
+            install: npm install -g '@anthropic-ai/claude-code@2.1.284'
+          - host: codex
+            install: npm install -g '@openai/codex@0.158.0'
+          - host: gemini
+            install: npm install -g '@google/gemini-cli@0.46.0'
+          - host: kilo
+            install: npm install -g '@kilocode/cli@7.8.1'
+          - host: pi
+            install: npm install -g '@earendil-works/pi-coding-agent@0.74.2'
+          # dsh needs Node >= 24, which is the node the job sets up below.
+          - host: dsh
+            install: npm install -g '@deepseek-ai/dsh@0.1.7-rc.2'
+          - host: omp
+            install: npm install -g '@oh-my-pi/pi-coding-agent@18.4.2' bun
+          - host: opencode
+            install: |
+              set -euo pipefail
+              os="$(uname -s)"
+              arch="$(uname -m)"
+              case "$os:$arch" in
+                Linux:arm64|Linux:aarch64) asset="opencode-linux-arm64.tar.gz";   sha="f46253f0ff5eff0c1751d3b734ede55cc60d932d60af81d061d03745f9998082"; kind="tar" ;;
+                Linux:x86_64)              asset="opencode-linux-x64-baseline.tar.gz"; sha="5db6a93cadec1704b150e3cc80b95e0d6366651c906b0003fb994fba05b7b40"; kind="tar" ;;
+                Darwin:arm64)              asset="opencode-darwin-arm64.zip";     sha="ea3a69433e33ee1fe3e1924de800aa7f28a32e2e1af1812366e88361a46600e2"; kind="zip" ;;
+                Darwin:x86_64)             asset="opencode-darwin-x64-baseline.zip"; sha="50503bcda1ac7ca4a4075fa4fe3fc84cb54afac960cf2fa0ee5fef01d752d366"; kind="zip" ;;
+                *) echo "no opencode asset for $os:$arch" >&2; exit 1 ;;
+              esac
+              curl -fsSL -o "/tmp/opencode.${kind}" "https://opencode.ai/files/bin/2.0.18/${asset}"
+              if [ "$kind" = zip ]; then
+                echo "${sha}  /tmp/opencode.zip" | shasum -a 256 -c -
+                unzip -o -q /tmp/opencode.zip -d /tmp
+              else
+                echo "${sha}  /tmp/opencode.tar" | sha256sum -c -
+                tar -xzf /tmp/opencode.tar -C /tmp
+              fi
+              mkdir -p "$HOME/.local/bin"
+              install -m 0755 /tmp/opencode "$HOME/.local/bin/opencode"
+          - host: cursor
+            # the installer links the binary as `agent`; the documented name (and
+            # the adapter's host-CLI name) is `cursor-agent`
+            install: |
+              curl -fsSL https://cursor.com/install | bash
+              ln -sf "$HOME/.local/bin/agent" "$HOME/.local/bin/cursor-agent"
           - host: claude
             install: npm install -g '@anthropic-ai/claude-code@2.1.284'
           - host: codex
