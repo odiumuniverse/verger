@@ -228,7 +228,7 @@ func TestLooseGolden(t *testing.T) {
 			})
 
 			Convey("Then the RMA mirrors every artifact in install order", func() {
-				So(res.RMA, ShouldHaveLength, len(res.Artifacts))
+				assertArtifactsBackedByOps(t, res)
 
 				ops := map[string]receipt.Op{}
 				for _, op := range res.RMA {
@@ -330,16 +330,25 @@ func assertHomeModes(t *testing.T, home string) {
 }
 
 // digestOf returns the artifact digest of one kind/name.
-func digestOf(t *testing.T, res host.Result, kind, name string) digest.Hash {
+// digestOf finds one artifact by kind and either its name or its path: a shared
+// config document records one artifact for the whole document, so a test that
+// knows the file asks by path, while a per-file artifact still asks by name.
+func digestOf(t *testing.T, res host.Result, kind, nameOrPath string) digest.Hash {
 	t.Helper()
 
 	for _, artifact := range res.Artifacts {
-		if artifact.Kind == kind && artifact.Name == name {
+		// An empty kind matches any: a document that backs several key families
+		// carries one artifact, so its kind is the first family's.
+		if kind != "" && artifact.Kind != kind {
+			continue
+		}
+
+		if artifact.Name == nameOrPath || artifact.Path == nameOrPath {
 			return artifact.Digest
 		}
 	}
 
-	t.Fatalf("artifact %s/%s not found", kind, name)
+	t.Fatalf("artifact %s/%s not found", kind, nameOrPath)
 
 	return ""
 }
@@ -571,7 +580,7 @@ func TestLooseHooksGating(t *testing.T) {
 			Convey("Then the hooks artifact appears", func() {
 				So(err, ShouldBeNil)
 				So(fileExists(filepath.Join(home, ".claude", "settings.json")), ShouldBeTrue)
-				So(digestOf(t, res, "hook", "hooks"), ShouldNotBeEmpty)
+				So(digestOf(t, res, "hook", filepath.Join(home, ".claude", "settings.json")), ShouldNotBeEmpty)
 			})
 		})
 	})

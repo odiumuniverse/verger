@@ -348,7 +348,7 @@ func TestOmpLooseGolden(t *testing.T) {
 			})
 
 			Convey("Then the RMA mirrors every artifact in install order", func() {
-				So(res.RMA, ShouldHaveLength, len(res.Artifacts))
+				assertArtifactsBackedByOps(t, res)
 
 				ops := map[string]receipt.Op{}
 				for _, op := range res.RMA {
@@ -614,7 +614,7 @@ func TestOmpLooseDryRun(t *testing.T) {
 				So(err, ShouldBeNil)
 				So(homeFiles(t, home), ShouldBeEmpty)
 				So(res.RMA, ShouldNotBeEmpty)
-				So(res.Artifacts, ShouldHaveLength, len(res.RMA))
+				assertArtifactsBackedByOps(t, res)
 				So(res.Notes, ShouldContain, "dry-run")
 			})
 		})
@@ -1767,10 +1767,9 @@ func TestOmpLockWaitIsBounded(t *testing.T) {
 // package installed, updated three times and then removed keeps the user's own
 // key and comment throughout, and the removal takes only this package's key.
 //
-// One server on purpose: a config document carrying two servers records two
-// artifacts at the same path, which a receipt refuses (pkg/receipt
-// Validate: "duplicate artifact path"); that defect is reported separately and
-// is not what this test is about.
+// The document records one artifact however many keys it carries, and a
+// delivery that changes nothing still records its keys, so an update cannot
+// reconcile them away.
 func TestOmpRepeatedDeliveryKeepsOwnMCPKeys(t *testing.T) {
 	Convey("Given an applied omp delivery with a foreign key in mcp.json", t, func() {
 		fakeOmp(t)
@@ -1794,7 +1793,6 @@ func TestOmpRepeatedDeliveryKeepsOwnMCPKeys(t *testing.T) {
 		deps.Hosts[host.Omp] = h
 
 		pkg := ompPackage(t)
-		pkg.MCP = pkg.MCP[:1] // one server: see the note above
 
 		install := applyCell(t, deps, apply.Action{
 			Kind: apply.ActionInstall, Host: host.Omp,
@@ -1817,21 +1815,6 @@ func TestOmpRepeatedDeliveryKeepsOwnMCPKeys(t *testing.T) {
 		assertKeys("after install")
 
 		Convey("When it is delivered again and again", func() {
-			// KNOWN DEFECT, reproduced here and reported with its mechanism:
-			// an update re-delivers a package whose MCP document already
-			// carries the very keys it would write, so the plan holds no change
-			// and records no artifact for the document (pkg/host/loose.go
-			// flushConfig returns early when len(changes) == 0). The receipt of
-			// the update then no longer owns mcp.json, and pkg/apply reconciles
-			// the previous receipt's ownership away, restoring the trash backup
-			// of the document — which predates the first delivery. Net effect:
-			// the package's own key disappears on a repeat delivery, exactly as
-			// the reviewer observed. The fix belongs on the recorded-but-write-
-			// free path (the same `plan.record` the CLI MCP surface uses for an
-			// unchanged server); it is not a locking defect and is left for its
-			// own change.
-			t.Skip("known defect: a no-op re-delivery records no artifact for the shared MCP document, so an update reconciles the key away (see the comment)")
-
 			previous := rec
 
 			for i := range 3 {
@@ -1863,6 +1846,54 @@ func TestOmpRepeatedDeliveryKeepsOwnMCPKeys(t *testing.T) {
 				So(doc, ShouldContainSubstring, `"mine"`)
 				So(doc, ShouldContainSubstring, "disabledServers")
 				So(doc, ShouldContainSubstring, "the user's own comment")
+			})
+		})
+	})
+}
+
+// TestOmpMCPOneArtifactPerDocument pins the artifact model of a shared config
+// document: two MCP servers land as two config-key ops and ONE artifact, so the
+// receipt is accepted (two artifacts claiming one path are refused) and
+// pkg/apply can still resolve the document's keys by the artifact path.
+func TestOmpMCPOneArtifactPerDocument(t *testing.T) {
+	Convey("Given a package with two MCP servers and a user's own server", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		writeFixtureFile(t, filepath.Join(home, ".omp", "agent", "mcp.json"), `{
+  "mcpServers": {"mine": {"command": "mine"}}
+}`, 0o600)
+
+		h, _ := newOmp(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)))
+
+		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: ompPackage(t), Strategy: host.Loose})
+
+		Convey("When it is delivered", func() {
+			Convey("Then one artifact covers the document and every key has its own op", func() {
+				So(err, ShouldBeNil)
+
+				document := filepath.Join(home, ".omp", "agent", "mcp.json")
+
+				artifacts, keys := 0, 0
+
+				for _, artifact := range res.Artifacts {
+					if artifact.Path == document {
+						artifacts++
+					}
+				}
+
+				for _, op := range res.RMA {
+					if op.Kind == receipt.OpConfigKey && op.Path == document {
+						keys++
+					}
+				}
+
+				So(artifacts, ShouldEqual, 1)
+				So(keys, ShouldEqual, 2)
+				assertArtifactsBackedByOps(t, res)
 			})
 		})
 	})

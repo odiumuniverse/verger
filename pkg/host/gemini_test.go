@@ -181,7 +181,7 @@ func TestGeminiLooseGolden(t *testing.T) {
 			})
 
 			Convey("Then the RMA mirrors every artifact in install order", func() {
-				So(res.RMA, ShouldHaveLength, len(res.Artifacts))
+				assertArtifactsBackedByOps(t, res)
 				So(res.Artifacts, ShouldNotBeEmpty)
 
 				ops := map[string]receipt.Op{}
@@ -462,8 +462,8 @@ func TestGeminiLooseJSONCSettings(t *testing.T) {
 				So(data, ShouldContainSubstring, "// user comment")
 				So(data, ShouldContainSubstring, `"hooks"`)
 				So(data, ShouldContainSubstring, `"mcpServers"`)
-				So(digestOf(t, res, "hook", "hooks"), ShouldNotBeEmpty)
-				So(digestOf(t, res, "mcp", "fs"), ShouldNotBeEmpty)
+				So(digestOf(t, res, "hook", geminiSettingsPath(home)), ShouldNotBeEmpty)
+				So(digestOf(t, res, "", geminiSettingsPath(home)), ShouldNotBeEmpty)
 			})
 		})
 	})

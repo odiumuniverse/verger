@@ -160,7 +160,7 @@ func TestCursorLooseGolden(t *testing.T) {
 			})
 
 			Convey("Then the RMA carries a file op per artifact and no host-install op", func() {
-				So(res.RMA, ShouldHaveLength, len(res.Artifacts))
+				assertArtifactsBackedByOps(t, res)
 
 				for _, op := range res.RMA {
 					So(op.Kind, ShouldNotEqual, receipt.OpHostInstall)

@@ -846,6 +846,46 @@ func assertConcurrentDryRun(t *testing.T, h host.Host, home, marker string, pkg 
 	})
 }
 
+// assertArtifactsBackedByOps pins the receipt invariant a loose plan must keep:
+// every artifact names a path some RMA op covers (pkg/apply resolves a document's
+// key op by the artifact path), and no two artifacts claim one path (a receipt
+// refuses that), however many keys a shared document carries.
+func assertArtifactsBackedByOps(t *testing.T, res host.Result) {
+	t.Helper()
+
+	covered := map[string]int{}
+	hostOps := 0
+
+	for _, op := range res.RMA {
+		if op.Path != "" {
+			covered[op.Path]++
+		}
+
+		if op.Kind == receipt.OpHostInstall {
+			hostOps++
+		}
+	}
+
+	seen := map[string]bool{}
+
+	for _, artifact := range res.Artifacts {
+		if seen[artifact.Path] {
+			t.Fatalf("two artifacts claim %s", artifact.Path)
+		}
+
+		seen[artifact.Path] = true
+
+		// A host-managed artifact (an MCP server added through the host CLI) is
+		// identified by a host URI and reversed by a host-install op, which
+		// carries a command instead of a path.
+		hostManaged := strings.Contains(artifact.Path, "://") && hostOps > 0
+
+		if covered[artifact.Path] == 0 && !hostManaged {
+			t.Fatalf("artifact %s (%s) has no RMA op", artifact.Path, artifact.Kind)
+		}
+	}
+}
+
 // assertCLIPolicyBlocked pins the `disableCommandPluginSources` verdict on the
 // native and synth strata of one adapter.
 func assertCLIPolicyBlocked(t *testing.T, home string, pkg host.Package, adapter func(*hostcli.ScriptRunner) host.Host) {

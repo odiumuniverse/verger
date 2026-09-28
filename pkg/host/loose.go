@@ -291,14 +291,22 @@ func (p *loosePlan) record(artifact receipt.Artifact, op receipt.Op) {
 }
 
 // addConfig records one shared config-document write backing several key
-// changes: a single step, one artifact and one RMA op per changed key, with
-// the previous value of every replaced key kept for the trash backup.
-func (p *loosePlan) addConfig(step looseStep, artifacts []receipt.Artifact, ops []receipt.Op, previous []any) {
+// changes: a single step, one artifact for the document and one RMA op per
+// changed key, with the previous value of every replaced key kept for the trash
+// backup.
+//
+// One artifact per document, not per key: an artifact is a path claim and a
+// receipt refuses two claims on one path (pkg/receipt Validate, "duplicate
+// artifact path"), while pkg/apply already resolves the key op of that path by
+// the artifact's path (configOpFor) and verifies the document's first key
+// against it. The per-key detail lives in the ops, keyed by path#keyPath.
+func (p *loosePlan) addConfig(step looseStep, artifact receipt.Artifact, ops []receipt.Op, previous []any) {
 	base := len(p.ops)
+
+	p.artifacts = append(p.artifacts, artifact)
 
 	for i, op := range ops {
 		p.ops = append(p.ops, op)
-		p.artifacts = append(p.artifacts, artifacts[i])
 
 		if op.Existed {
 			var value any
@@ -311,6 +319,17 @@ func (p *loosePlan) addConfig(step looseStep, artifacts []receipt.Artifact, ops 
 	}
 
 	p.steps = append(p.steps, step)
+}
+
+// recordConfig keeps a document this package already owns exactly as the
+// delivery would write it, with no side effect to run: the keys stay recorded so
+// the receipt keeps owning them (an update whose receipt lost the ownership
+// would reconcile the previous receipt's keys away, restoring a backup older
+// than the first delivery), and every op is pre-existing, so an inverse leaves
+// the values in place.
+func (p *loosePlan) recordConfig(artifact receipt.Artifact, ops []receipt.Op) {
+	p.artifacts = append(p.artifacts, artifact)
+	p.ops = append(p.ops, ops...)
 }
 
 // loosePlanner plans one loose delivery; all state lives in plan.
@@ -1076,6 +1095,8 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 	}
 
 	if len(changes) == 0 {
+		p.recordUnchanged(cfg.file, cfg.tomlDoc, cfg.edits, existing)
+
 		return nil
 	}
 
@@ -1086,16 +1107,10 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 		p.note("%s carries a resolved secret; mode is 0600", cfg.file)
 	}
 
-	artifacts := make([]receipt.Artifact, 0, len(changes))
 	ops := make([]receipt.Op, 0, len(changes))
 	replaced := make([]any, 0, len(changes))
 
 	for _, change := range changes {
-		pe := cfg.editFor(change.Path)
-
-		artifacts = append(artifacts, receipt.Artifact{
-			Kind: pe.kind, Name: pe.name, Path: cfg.file, Digest: change.Digest,
-		})
 		ops = append(ops, receipt.Op{
 			Kind: receipt.OpConfigKey, Path: cfg.file, KeyPath: change.Path, Digest: change.Digest, Existed: change.Existed,
 		})
@@ -1104,10 +1119,57 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 
 	p.plan.addConfig(
 		looseStep{kind: stepConfig, path: cfg.file, data: out, mode: mode, digest: changes[0].Digest},
-		artifacts, ops, replaced,
+		documentArtifact(cfg.file, cfg.editFor(changes[0].Path), changes[0].Digest), ops, replaced,
 	)
 
 	return nil
+}
+
+// recordUnchanged keeps a document's keys as owned when the delivery writes
+// nothing: the values already match what the package wants, so the receipt must
+// still record them, or a later update reconciles the ownership away and an
+// inverse restores a value that predates the delivery.
+func (p *loosePlanner) recordUnchanged(file string, tomlDoc bool, edits []pendingEdit, existing []byte) {
+	ops := make([]receipt.Op, 0, len(edits))
+
+	var (
+		first digest.Hash
+		pe    pendingEdit
+	)
+
+	for _, candidate := range edits {
+		current, exists, err := configMember(existing, candidate.edit.Path, tomlDoc)
+		if err != nil || !exists {
+			continue
+		}
+
+		sum := canonicalValueDigest(current)
+		if first == "" {
+			first, pe = sum, candidate
+		}
+
+		ops = append(ops, receipt.Op{
+			Kind: receipt.OpConfigKey, Path: file, KeyPath: candidate.edit.Path, Digest: sum, Existed: true,
+		})
+	}
+
+	if len(ops) == 0 {
+		return
+	}
+
+	p.plan.recordConfig(documentArtifact(file, pe, first), ops)
+}
+
+// documentArtifact is the one artifact a shared config document records: its
+// path is the document and its digest the value of the document's first recorded
+// key, which is the key pkg/apply resolves the ops of that path to.
+func documentArtifact(file string, first pendingEdit, sum digest.Hash) receipt.Artifact {
+	kind := artifactMCP
+	if first.kind != "" {
+		kind = first.kind
+	}
+
+	return receipt.Artifact{Kind: kind, Name: filepath.Base(file), Path: file, Digest: sum}
 }
 
 // editFor returns the pending edit of one key path.
@@ -1351,6 +1413,23 @@ func (p *loosePlanner) planMCPConfig() error {
 	}
 
 	prefix := mcpConfigPrefix(cfg.format)
+
+	if len(pending) == 0 {
+		// Every server is already configured exactly as this delivery wants it:
+		// the document is still this package's, so its keys are recorded (with
+		// no side effect) instead of being silently dropped from the receipt.
+		recorded := make([]pendingEdit, 0, len(edits))
+
+		for _, edit := range edits {
+			recorded = append(recorded, pendingEdit{
+				edit: edit, kind: artifactMCP, name: strings.TrimPrefix(edit.Path, prefix),
+			})
+		}
+
+		p.recordUnchanged(cfg.path, cfg.toml, recorded, existing)
+
+		return nil
+	}
 
 	for _, edit := range pending {
 		p.queueConfigEdit(cfg.path, cfg.toml, cfg.edit, pendingEdit{

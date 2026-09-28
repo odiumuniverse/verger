@@ -441,7 +441,7 @@ func TestLooseJSONCSettingsHooks(t *testing.T) {
 				So(data, ShouldContainSubstring, "// user comment")
 				So(data, ShouldContainSubstring, `"model": "opus"`)
 				So(data, ShouldContainSubstring, `"hooks"`)
-				So(digestOf(t, res, "hook", "hooks"), ShouldNotBeEmpty)
+				So(digestOf(t, res, "", filepath.Join(home, ".claude", "settings.json")), ShouldNotBeEmpty)
 			})
 		})
 	})

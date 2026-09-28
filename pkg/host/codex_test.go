@@ -335,7 +335,7 @@ func TestCodexLooseGolden(t *testing.T) {
 			})
 
 			Convey("Then the RMA mirrors every artifact in install order", func() {
-				So(res.RMA, ShouldHaveLength, len(res.Artifacts))
+				assertArtifactsBackedByOps(t, res)
 				So(res.Artifacts, ShouldNotBeEmpty)
 
 				ops := map[string]receipt.Op{}
