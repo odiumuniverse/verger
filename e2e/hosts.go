@@ -126,10 +126,14 @@ func hostSpecs() []hostSpec {
 			listArgs:        []string{"extensions", "list", "--output-format", "json"},
 			hooksFile:       ".gemini/settings.json",
 			fixtureManifest: "gemini-extension.json",
-			// The MCP server lands in the same document as the hooks, and the
-			// receipt records one artifact per document, so the MCP claim is
-			// asserted through the document (finding F3 in W3-E2E10-1.md).
-			canonKinds: []string{"skill", "agent", "command", "hook"},
+			// The MCP server lands in the same document as the hooks, so
+			// before F3 the receipt carried one artifact per document and the
+			// hooks edit won — the receipt had no `mcp` kind at all
+			// (finding F3 in W3-E2E10-1.md). The gemini MCP surface now
+			// claims each server individually, so `mcp` is a receipt kind of
+			// its own here and belongs in this list like every other host
+			// that has an mcpFile.
+			canonKinds: []string{"skill", "agent", "command", "hook", "mcp"},
 		},
 		{
 			id:      "agy",

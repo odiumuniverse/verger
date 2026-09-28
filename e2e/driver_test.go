@@ -75,6 +75,17 @@ type cellsDoc struct {
 	Cells []cellDoc `json:"cells"`
 }
 
+// driverFingerprint identifies the build of this file that is running. A leg
+// that logs its receipt kinds carries it, so a green run on one platform and
+// a red run on another can be compared without first suspecting the product:
+// different fingerprints mean different drivers, not different hosts.
+//
+// It is a hand-bumped constant rather than a checksum of the source on disk,
+// because a checksum would describe the TREE while the thing that decides a
+// leg is the BINARY — and those two diverging is exactly the failure this
+// exists to make visible. Bump it whenever this file's assertions change.
+const driverFingerprint = "e2e-driver-2026-09-29a"
+
 // TestMain builds the verger binary once per e2e run. Without E2E=1 nothing is
 // built and every scenario test skips itself with a reason.
 func TestMain(m *testing.M) {
@@ -1690,6 +1701,16 @@ func assertReceiptKinds(t *testing.T, doc receiptDoc, spec hostSpec) {
 	got := receiptKinds(doc)
 	want := slices.Clone(spec.canonKinds)
 	slices.Sort(want)
+
+	// Always log the observed kinds, on every platform and whether or not the
+	// assertions below pass. A kind-set difference between two platforms is
+	// the first question anyone asks, and it cannot be answered from a failure
+	// message when the other platform went green. The fingerprint says WHICH
+	// build of this file ran, so a stale driver can no longer be mistaken for
+	// a platform difference — which is not hypothetical: a Linux leg once went
+	// green against a driver source nine lines older than the tree and read
+	// exactly like a platform bug.
+	t.Logf("e2e: %s receipt kinds %v (spec expects %v) [%s]", spec.id, got, want, driverFingerprint)
 
 	for _, kind := range want {
 		if !slices.Contains(got, kind) {
