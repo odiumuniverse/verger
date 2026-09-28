@@ -89,7 +89,9 @@ func deviceID(path string) (uint64, error) {
 		return 0, fmt.Errorf("stat %s: not a unix stat", path)
 	}
 
-	return uint64(stat.Dev), nil //nolint:gosec // G115: device ids are small non-negative kernel values
+	// Stat_t.Dev is int32 on darwin and uint64 on linux: the conversion is
+	// needed on one platform and redundant on the other.
+	return uint64(stat.Dev), nil //nolint:gosec,unconvert // G115: device ids are small non-negative kernel values
 }
 
 // IsCrossDevice reports whether err is a cross-filesystem rename (EXDEV),

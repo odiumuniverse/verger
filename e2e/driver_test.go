@@ -136,8 +136,11 @@ func buildVerger() (string, error) {
 
 	bin := filepath.Join(dir, "verger")
 
+	// -buildvcs=false: in the CI container the checkout belongs to another
+	// uid, git refuses it ("dubious ownership") and VCS stamping fails the build.
+	//
 	//nolint:gosec // G204: fixed argv, the driver builds ./cmd/verger
-	cmd := exec.CommandContext(context.Background(), "go", "build", "-mod=vendor", "-o", bin, "./cmd/verger")
+	cmd := exec.CommandContext(context.Background(), "go", "build", "-mod=vendor", "-buildvcs=false", "-o", bin, "./cmd/verger")
 	cmd.Dir = root
 
 	out, err := cmd.CombinedOutput()
