@@ -1898,3 +1898,99 @@ func TestOmpMCPOneArtifactPerDocument(t *testing.T) {
 		})
 	})
 }
+
+// TestOmpPartialChangeKeepsUnchangedKeys pins the branch of a shared document
+// where some keys change and others already match: the unchanged keys must stay
+// owned by the receipt (with a pre-existing op of their own), or the same
+// reconcile that loses a whole document would drop them one by one.
+func TestOmpPartialChangeKeepsUnchangedKeys(t *testing.T) {
+	Convey("Given an applied omp delivery with a user's own MCP server", t, func() {
+		fakeOmp(t)
+		clearOmpEnv(t)
+
+		home := t.TempDir()
+		st := openStore(t)
+
+		deps := applyWorld(t, st, ownerMap{})
+		owner := receiptsOwner{receipts: deps.Receipts}
+		deps.Owned = owner
+
+		writeFixtureFile(t, filepath.Join(home, ".omp", "agent", "mcp.json"), `{
+  // the user's own comment
+  "mcpServers": {"mine": {"command": "mine"}},
+  "disabledServers": ["legacy"]
+}`, 0o600)
+
+		h := host.NewOmp(host.WithHome(home), host.WithRunner(newOmpCLI()),
+			host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(ompSecrets(t)), host.WithOwnership(owner))
+		deps.Hosts[host.Omp] = h
+
+		document := filepath.Join(home, ".omp", "agent", "mcp.json")
+
+		// The first version carries one server; the second adds another, so the
+		// update writes the document while the first server's key stays exactly
+		// as it is — the branch where some keys change and some do not.
+		first := ompPackage(t)
+		first.MCP = first.MCP[:1]
+
+		install := applyCell(t, deps, apply.Action{
+			Kind: apply.ActionInstall, Host: host.Omp,
+			Delivery: host.Delivery{Package: first, Strategy: host.Loose},
+		})
+		So(install.Status, ShouldEqual, apply.StatusCurrent)
+
+		rec, found, recErr := deps.Receipts.Get(first.ID, string(host.Omp), receipt.ScopeUser)
+		So(recErr, ShouldBeNil)
+		So(found, ShouldBeTrue)
+
+		second := ompPackage(t)
+
+		assertAll := func(stage string) {
+			doc := readTestFile(t, document)
+
+			for _, key := range []string{`"fs"`, `"web"`, `"mine"`, "disabledServers", "the user's own comment"} {
+				So(doc+" at "+stage, ShouldContainSubstring, key)
+			}
+		}
+
+		Convey("When a key is added and the other stays as it was", func() {
+			updated := applyCell(t, deps, apply.Action{
+				Kind: apply.ActionUpdate, Host: host.Omp, Previous: &rec,
+				Delivery: host.Delivery{Package: second, Strategy: host.Loose},
+			})
+			So(updated.Status, ShouldEqual, apply.StatusCurrent)
+
+			current, currentFound, currentErr := deps.Receipts.Get(first.ID, string(host.Omp), receipt.ScopeUser)
+			So(currentErr, ShouldBeNil)
+			So(currentFound, ShouldBeTrue)
+
+			assertAll("after a partial update")
+
+			Convey("Then a second update keeps both keys, and removal takes only the package's", func() {
+				again := applyCell(t, deps, apply.Action{
+					Kind: apply.ActionUpdate, Host: host.Omp, Previous: &current,
+					Delivery: host.Delivery{Package: second, Strategy: host.Loose},
+				})
+				So(again.Status, ShouldEqual, apply.StatusCurrent)
+
+				assertAll("after a repeat update")
+
+				latest, latestFound, latestErr := deps.Receipts.Get(first.ID, string(host.Omp), receipt.ScopeUser)
+				So(latestErr, ShouldBeNil)
+				So(latestFound, ShouldBeTrue)
+
+				removed := applyCell(t, deps, apply.Action{
+					Kind: apply.ActionRemove, Host: host.Omp, Previous: &latest, Cause: "user", Initiator: "omp",
+				})
+				So(removed.Status, ShouldEqual, apply.StatusCurrent)
+
+				doc := readTestFile(t, document)
+				So(doc, ShouldNotContainSubstring, `"fs"`)
+				So(doc, ShouldNotContainSubstring, `"web"`)
+				So(doc, ShouldContainSubstring, `"mine"`)
+				So(doc, ShouldContainSubstring, "disabledServers")
+				So(doc, ShouldContainSubstring, "the user's own comment")
+			})
+		})
+	})
+}

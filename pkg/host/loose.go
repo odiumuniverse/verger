@@ -290,10 +290,12 @@ func (p *loosePlan) record(artifact receipt.Artifact, op receipt.Op) {
 	p.ops = append(p.ops, op)
 }
 
-// addConfig records one shared config-document write backing several key
-// changes: a single step, one artifact for the document and one RMA op per
-// changed key, with the previous value of every replaced key kept for the trash
-// backup.
+// addConfig records one shared config-document write backing several keys: a
+// single step, one artifact for the document and one RMA op per key the delivery
+// owns. replaced carries the previous value of the first len(replaced) ops (the
+// keys this write changes); any op after that names a key the delivery owns but
+// did not have to change, and records no backup, so an inverse leaves it in
+// place instead of restoring a value.
 //
 // One artifact per document, not per key: an artifact is a path claim and a
 // receipt refuses two claims on one path (pkg/receipt Validate, "duplicate
@@ -308,13 +310,8 @@ func (p *loosePlan) addConfig(step looseStep, artifact receipt.Artifact, ops []r
 	for i, op := range ops {
 		p.ops = append(p.ops, op)
 
-		if op.Existed {
-			var value any
-			if i < len(previous) {
-				value = previous[i]
-			}
-
-			step.backups = append(step.backups, looseBackup{previous: value, opIndex: base + i})
+		if op.Existed && i < len(previous) {
+			step.backups = append(step.backups, looseBackup{previous: previous[i], opIndex: base + i})
 		}
 	}
 
@@ -1009,8 +1006,12 @@ type pendingConfig struct {
 	tomlDoc bool
 	edit    func([]byte, []render.Edit, render.Owned) ([]byte, []render.Change, error)
 	edits   []pendingEdit
-	owned   render.Owned
-	secret  bool
+	// recorded are keys this document owns without writing them: their value
+	// already matches, and they must still be recorded or the next receipt
+	// loses the ownership and an update reconciles them away.
+	recorded []pendingEdit
+	owned    render.Owned
+	secret   bool
 }
 
 // pendingEdit is one key edit plus the artifact identity it records.
@@ -1068,15 +1069,24 @@ func (p *loosePlanner) flushConfigs() error {
 	return nil
 }
 
-// flushConfig applies the accumulated edits of one document.
+// flushConfig applies the accumulated edits of one document, and records the
+// keys it owns without writing them.
 func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
-	if len(cfg.edits) == 0 {
+	if len(cfg.edits) == 0 && len(cfg.recorded) == 0 {
 		return nil
 	}
 
 	existing, err := readOptionalFile(cfg.file)
 	if err != nil {
 		return p.deliveryError(stepPlan, err)
+	}
+
+	// Nothing is written for a document whose keys this delivery only records,
+	// so a read-only file is not an obstacle to owning them.
+	if len(cfg.edits) == 0 {
+		p.recordUnchanged(cfg.file, cfg.tomlDoc, cfg.recorded, existing)
+
+		return nil
 	}
 
 	if info, statErr := os.Stat(cfg.file); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o200 == 0 {
@@ -1095,7 +1105,9 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 	}
 
 	if len(changes) == 0 {
-		p.recordUnchanged(cfg.file, cfg.tomlDoc, cfg.edits, existing)
+		owned := append(slices.Clone(cfg.edits), cfg.recorded...)
+
+		p.recordUnchanged(cfg.file, cfg.tomlDoc, owned, existing)
 
 		return nil
 	}
@@ -1117,12 +1129,47 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 		replaced = append(replaced, change.Previous)
 	}
 
+	// A key of this document that needed no change is still this package's: its
+	// op is recorded (with no backup) beside the changed ones, or the receipt
+	// would lose the ownership and an update would reconcile the key away.
+	ops = p.appendUnchanged(cfg, existing, changes, ops)
+
 	p.plan.addConfig(
 		looseStep{kind: stepConfig, path: cfg.file, data: out, mode: mode, digest: changes[0].Digest},
 		documentArtifact(cfg.file, cfg.editFor(changes[0].Path), changes[0].Digest), ops, replaced,
 	)
 
 	return nil
+}
+
+// appendUnchanged adds one pre-existing op per owned key the write did not have
+// to change.
+func (p *loosePlanner) appendUnchanged(cfg *pendingConfig, existing []byte, changes []render.Change, ops []receipt.Op) []receipt.Op {
+	changed := make(map[string]bool, len(changes))
+
+	for _, change := range changes {
+		changed[change.Path] = true
+	}
+
+	owned := append(slices.Clone(cfg.edits), cfg.recorded...)
+
+	for _, pe := range owned {
+		if changed[pe.edit.Path] {
+			continue
+		}
+
+		current, exists, err := configMember(existing, pe.edit.Path, cfg.tomlDoc)
+		if err != nil || !exists {
+			continue
+		}
+
+		ops = append(ops, receipt.Op{
+			Kind: receipt.OpConfigKey, Path: cfg.file, KeyPath: pe.edit.Path,
+			Digest: canonicalValueDigest(current), Existed: true,
+		})
+	}
+
+	return ops
 }
 
 // recordUnchanged keeps a document's keys as owned when the delivery writes
@@ -1414,29 +1461,27 @@ func (p *loosePlanner) planMCPConfig() error {
 
 	prefix := mcpConfigPrefix(cfg.format)
 
-	if len(pending) == 0 {
-		// Every server is already configured exactly as this delivery wants it:
-		// the document is still this package's, so its keys are recorded (with
-		// no side effect) instead of being silently dropped from the receipt.
-		recorded := make([]pendingEdit, 0, len(edits))
-
-		for _, edit := range edits {
-			recorded = append(recorded, pendingEdit{
-				edit: edit, kind: artifactMCP, name: strings.TrimPrefix(edit.Path, prefix),
-			})
-		}
-
-		p.recordUnchanged(cfg.path, cfg.toml, recorded, existing)
-
-		return nil
+	// Every server is this package's, whether or not this delivery has to write
+	// it: the ones already configured exactly as wanted are recorded without a
+	// write, the rest are written. Dropping the former would leave them
+	// unowned, and an update would reconcile them away one by one.
+	pendingPaths := make(map[string]bool, len(pending))
+	for _, edit := range pending {
+		pendingPaths[edit.Path] = true
 	}
 
-	for _, edit := range pending {
-		p.queueConfigEdit(cfg.path, cfg.toml, cfg.edit, pendingEdit{
-			edit: edit,
-			kind: artifactMCP,
-			name: strings.TrimPrefix(edit.Path, prefix),
-		})
+	document := p.configFor(cfg.path, cfg.toml, cfg.edit)
+
+	for _, edit := range edits {
+		pe := pendingEdit{edit: edit, kind: artifactMCP, name: strings.TrimPrefix(edit.Path, prefix)}
+
+		if pendingPaths[edit.Path] {
+			p.queueConfigEdit(cfg.path, cfg.toml, cfg.edit, pe)
+
+			continue
+		}
+
+		document.recorded = append(document.recorded, pe)
 	}
 
 	if secret && len(pending) > 0 {

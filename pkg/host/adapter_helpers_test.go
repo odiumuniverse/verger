@@ -846,19 +846,22 @@ func assertConcurrentDryRun(t *testing.T, h host.Host, home, marker string, pkg 
 	})
 }
 
-// assertArtifactsBackedByOps pins the receipt invariant a loose plan must keep:
-// every artifact names a path some RMA op covers (pkg/apply resolves a document's
-// key op by the artifact path), and no two artifacts claim one path (a receipt
-// refuses that), however many keys a shared document carries.
+// assertArtifactsBackedByOps pins the receipt invariants a loose plan must keep,
+// in both directions: every artifact names a path some RMA op covers (pkg/apply
+// resolves a document's key op by the artifact path), every op that names a path
+// is claimed by an artifact (an op without a claim is ownership the next receipt
+// silently loses), no two artifacts claim one path (a receipt refuses that), and
+// the artifact count is exactly the number of claimed paths however many keys a
+// shared document carries.
 func assertArtifactsBackedByOps(t *testing.T, res host.Result) {
 	t.Helper()
 
-	covered := map[string]int{}
+	opsByPath := map[string]int{}
 	hostOps := 0
 
 	for _, op := range res.RMA {
 		if op.Path != "" {
-			covered[op.Path]++
+			opsByPath[op.Path]++
 		}
 
 		if op.Kind == receipt.OpHostInstall {
@@ -866,23 +869,33 @@ func assertArtifactsBackedByOps(t *testing.T, res host.Result) {
 		}
 	}
 
-	seen := map[string]bool{}
+	artifactByPath := map[string]receipt.Artifact{}
 
 	for _, artifact := range res.Artifacts {
-		if seen[artifact.Path] {
-			t.Fatalf("two artifacts claim %s", artifact.Path)
+		if previous, claimed := artifactByPath[artifact.Path]; claimed {
+			t.Fatalf("two artifacts claim %s (%s and %s)", artifact.Path, previous.Kind, artifact.Kind)
 		}
 
-		seen[artifact.Path] = true
+		artifactByPath[artifact.Path] = artifact
 
 		// A host-managed artifact (an MCP server added through the host CLI) is
 		// identified by a host URI and reversed by a host-install op, which
 		// carries a command instead of a path.
 		hostManaged := strings.Contains(artifact.Path, "://") && hostOps > 0
 
-		if covered[artifact.Path] == 0 && !hostManaged {
+		if opsByPath[artifact.Path] == 0 && !hostManaged {
 			t.Fatalf("artifact %s (%s) has no RMA op", artifact.Path, artifact.Kind)
 		}
+	}
+
+	for path, count := range opsByPath {
+		if _, claimed := artifactByPath[path]; !claimed {
+			t.Fatalf("%d op(s) on %s but no artifact claims it", count, path)
+		}
+	}
+
+	if len(res.Artifacts) != len(artifactByPath) {
+		t.Fatalf("%d artifacts for %d claimed paths", len(res.Artifacts), len(artifactByPath))
 	}
 }
 
