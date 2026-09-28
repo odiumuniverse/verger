@@ -958,6 +958,7 @@ type cellDoc struct {
 	Status   string   `json:"status"`
 	Version  string   `json:"version,omitempty"`
 	Strategy string   `json:"strategy,omitempty"`
+	Level    string   `json:"level,omitempty"` // host maturity (DESIGN §10.3): experimental|beta|stable
 	Kind     string   `json:"kind,omitempty"`
 	Notes    []string `json:"notes,omitempty"`
 }

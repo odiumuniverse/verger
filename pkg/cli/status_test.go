@@ -25,7 +25,7 @@ func TestStatusJSONGolden(t *testing.T) {
 				So(err, ShouldBeNil)
 
 				want := fmt.Sprintf(
-					"{\"home\":%q,\"cells\":[{\"package\":\"local:caveman\",\"host\":\"claude\",\"scope\":\"user\",\"status\":\"current\",\"version\":\"1.2.3\",\"strategy\":\"loose\"}]}\n",
+					"{\"home\":%q,\"cells\":[{\"package\":\"local:caveman\",\"host\":\"claude\",\"scope\":\"user\",\"status\":\"current\",\"version\":\"1.2.3\",\"strategy\":\"loose\",\"level\":\"stable\"}]}\n",
 					w.homeDir,
 				)
 				So(stdout, ShouldEqual, want)

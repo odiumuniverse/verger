@@ -63,11 +63,12 @@ func (a *app) runStatus(ctx context.Context, outdatedOnly bool) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %-10s %s\n", "PACKAGE", "HOST", "SCOPE", "STATUS", "STRATEGY", "VERSION")
+	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-10s %-10s %s\n",
+		"PACKAGE", "HOST", "LEVEL", "SCOPE", "STATUS", "STRATEGY", "VERSION")
 
 	for _, cell := range doc.Cells {
-		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %-10s %s\n",
-			cell.Package, cell.Host, cell.Scope, cell.Status, cell.Strategy, cell.Version)
+		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-10s %-10s %s\n",
+			cell.Package, cell.Host, cell.Level, cell.Scope, cell.Status, cell.Strategy, cell.Version)
 	}
 
 	return nil
@@ -93,6 +94,7 @@ func (a *app) statusCells(paths scopePaths, outdatedOnly bool) (statusDoc, error
 		cell := cellDoc{
 			Package: record.Package, Host: record.Host, Scope: record.Scope,
 			Status: string(statusCurrent), Version: record.Version, Strategy: record.Strategy,
+			Level: hostMaturity(record.Host),
 		}
 
 		if lockCell, ok := lockDoc.Cell(record.Package, record.Host, record.Scope); ok && lockCell.Version != record.Version {
@@ -111,6 +113,7 @@ func (a *app) statusCells(paths scopePaths, outdatedOnly bool) (statusDoc, error
 		doc.Cells = append(doc.Cells, cellDoc{
 			Package: lockCell.Package, Host: lockCell.Host, Scope: lockCell.Scope,
 			Status: string(statusMissing), Version: lockCell.Version, Strategy: string(lockCell.Strategy),
+			Level: hostMaturity(lockCell.Host),
 			Notes: []string{"lock cell without a receipt"},
 		})
 	}
