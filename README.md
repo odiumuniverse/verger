@@ -37,11 +37,14 @@ by name instead of being quietly skipped.
 
 ## Install
 
-**macOS** — Homebrew:
+**macOS or Linux** — Homebrew:
 
 ```bash
 brew install odiumuniverse/tap/verger
 ```
+
+The formula serves the macOS build on macOS, and on Linux the native `arm64`
+or `amd64` one, so the same command works with Linuxbrew.
 
 **macOS or Linux** — Go, from a checkout or anywhere:
 
@@ -49,7 +52,7 @@ brew install odiumuniverse/tap/verger
 go install github.com/odiumuniverse/verger/cmd/verger@latest
 ```
 
-**Linux** — build from source:
+**macOS or Linux** — build from source (needs the Go toolchain):
 
 ```bash
 git clone https://github.com/odiumuniverse/verger
