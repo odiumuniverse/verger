@@ -63,7 +63,7 @@ func (a *app) runApprove(ctx context.Context, args []string) error {
 		return &UsageError{Cause: err}
 	}
 
-	fetched, err := fetchRef(ctx, client, ref)
+	fetched, err := client.Fetch(ctx, ref)
 	if err != nil {
 		return err
 	}

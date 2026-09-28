@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -255,4 +257,72 @@ func (r *runner) writeConfig(path string, data []byte) error {
 	}
 
 	return nil
+}
+
+// DriftReport names what changed in one receipt's documents since it was
+// written. It is per config key, never per document: a user who added their own
+// key or record to a document verger also writes changes nothing here, and only
+// the key that actually moved is reported (DRIFT-1, DRIFT-2).
+type DriftReport struct {
+	Package string
+	Host    string
+	Scope   string
+	// Keys are the config keys whose value moved, sorted.
+	Keys []string
+	// Paths are the documents that were read, sorted.
+	Paths []string
+}
+
+// Drifted reports whether anything moved.
+func (d DriftReport) Drifted() bool { return len(d.Keys) > 0 }
+
+// Note renders one report for a status row.
+func (d DriftReport) Note() string {
+	if !d.Drifted() {
+		return ""
+	}
+
+	return strings.Join(d.Keys, ", ") + " changed outside verger"
+}
+
+// ReceiptDrift compares one receipt against the documents it wrote, key by key.
+// A missing key is not drift (the artifact is gone, which the status matrix
+// reports as a missing cell), and a key whose value still matches is not drift,
+// whatever else the document now carries.
+func ReceiptDrift(record receipt.Receipt) (DriftReport, error) {
+	report := DriftReport{Package: record.Package, Host: record.Host, Scope: record.Scope}
+
+	keys := map[string]bool{}
+	paths := map[string]bool{}
+
+	for _, op := range record.RMA {
+		if op.Kind != receipt.OpConfigKey || op.Path == "" || op.KeyPath == "" {
+			continue
+		}
+
+		data, err := os.ReadFile(op.Path) //nolint:gosec // G304: the path comes from a receipt
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+
+		if err != nil {
+			return DriftReport{}, fmt.Errorf("read %s: %w", op.Path, err)
+		}
+
+		current, exists, err := configValueDigest(data, op.KeyPath)
+		if err != nil {
+			return DriftReport{}, fmt.Errorf("parse %s: %w", op.Path, err)
+		}
+
+		paths[op.Path] = true
+
+		if exists && current != op.Digest {
+			keys[op.Path+"#"+op.KeyPath] = true
+		}
+	}
+
+	report.Keys = slices.Sorted(maps.Keys(keys))
+	report.Paths = slices.Sorted(maps.Keys(paths))
+
+	return report, nil
 }

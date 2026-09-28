@@ -3,6 +3,8 @@ package verger
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"slices"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -67,9 +69,32 @@ func TestClientHosts(t *testing.T) {
 		client, err := Open(t.Context(), WithHome(t.TempDir()), WithStore(t.TempDir()))
 
 		Convey("When the client opens", func() {
-			Convey("Then Hosts is empty", func() {
+			Convey("Then the ten registered adapters are built (DESIGN §9.1)", func() {
 				So(err, ShouldBeNil)
-				So(client.Hosts(), ShouldBeEmpty)
+
+				ids := make([]host.ID, 0, len(client.Hosts()))
+
+				for _, adapter := range client.Hosts() {
+					ids = append(ids, adapter.ID())
+				}
+
+				// The set is what the spec fixes; the order is the
+				// registration order the CLI already used, so a status table
+				// rendered from it does not change.
+				slices.Sort(ids)
+
+				declared := slices.Clone(host.All())
+				slices.Sort(declared)
+
+				So(ids, ShouldResemble, declared)
+			})
+
+			Convey("Then building them created no home or store layout", func() {
+				So(err, ShouldBeNil)
+				// Both roots above are t.TempDir()s and exist by construction;
+				// what Open must not do is lay the home or the store out.
+				assertMissing(t, client.Home().StateDir())
+				assertMissing(t, filepath.Join(client.Store().Root(), "trash"))
 			})
 		})
 	})

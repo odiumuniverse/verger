@@ -7,19 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
-
-// fetchRef fetches one ref with a store-backed fetcher.
-func fetchRef(ctx context.Context, client *verger.Client, ref source.Ref) (*source.Fetched, error) {
-	fetcher, err := source.NewFetcher(source.WithStore(client.Store()))
-	if err != nil {
-		return nil, err
-	}
-
-	return fetcher.Fetch(ctx, ref)
-}
 
 // newUpdateCmd builds `verger update`: Ф1 re-applies the spec (no upstream
 // update checks until the source resolver, T3.1).
@@ -98,7 +87,8 @@ func newUnpinCmd(a *app) *cobra.Command {
 	return cmd
 }
 
-// runPin stores or clears one spec version pin.
+// runPin stores or clears one spec version pin through the facade; the CLI
+// only renders the answer.
 func (a *app) runPin(ctx context.Context, id, version string) error {
 	client, err := a.open(ctx)
 	if err != nil {
@@ -114,12 +104,8 @@ func (a *app) runPin(ctx context.Context, id, version string) error {
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	result, err := client.Pin(ctx, verger.PinOptions{Paths: paths, ID: id, Version: version, DryRun: a.dryRun})
 	if err != nil {
-		return err
-	}
-
-	if _, err := setSpecPin(doc, id, version); err != nil {
 		return err
 	}
 
@@ -129,19 +115,13 @@ func (a *app) runPin(ctx context.Context, id, version string) error {
 		return err
 	}
 
-	if err := client.Home().Ensure(); err != nil {
-		return err
-	}
-
-	if err := saveSpec(paths.specPath, doc); err != nil {
-		return err
-	}
-
 	if version == "" {
-		_, err = fmt.Fprintf(a.out, "unpinned %s\n", id)
-	} else {
-		_, err = fmt.Fprintf(a.out, "pinned %s to %s\n", id, version)
+		_, err = fmt.Fprintf(a.out, "unpinned %s\n", result.ID)
+
+		return err
 	}
+
+	_, err = fmt.Fprintf(a.out, "pinned %s to %s\n", result.ID, result.Version)
 
 	return err
 }

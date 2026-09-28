@@ -84,7 +84,7 @@ func (a *app) runSourceAdd(ctx context.Context, raw string) error {
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	doc, _, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func (a *app) runSourceAdd(ctx context.Context, raw string) error {
 		return err
 	}
 
-	if err := saveSpec(paths.specPath, doc); err != nil {
+	if err := saveSpec(paths.SpecPath, doc); err != nil {
 		return err
 	}
 
@@ -126,7 +126,7 @@ func (a *app) runSourceRm(ctx context.Context, name string) error {
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	doc, _, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func (a *app) runSourceRm(ctx context.Context, name string) error {
 		return err
 	}
 
-	if err := saveSpec(paths.specPath, doc); err != nil {
+	if err := saveSpec(paths.SpecPath, doc); err != nil {
 		return err
 	}
 
@@ -162,7 +162,7 @@ func (a *app) runSourceList(ctx context.Context) error {
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	doc, _, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return err
 	}

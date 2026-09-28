@@ -9,11 +9,13 @@ import (
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
 func TestReceiptOwnerArtifactDigest(t *testing.T) {
 	Convey("Given a receipt store with one recorded artifact", t, func() {
-		store := receipt.NewStore(filepath.Join(t.TempDir(), "receipts"))
+		receiptsDir := filepath.Join(t.TempDir(), "receipts")
+		store := receipt.NewStore(receiptsDir)
 		path := filepath.Join(t.TempDir(), "claude.json#mcpServers.github")
 		sum := digest.Bytes([]byte(`{"command":"gh"}`))
 
@@ -23,7 +25,7 @@ func TestReceiptOwnerArtifactDigest(t *testing.T) {
 			Artifacts: []receipt.Artifact{{Kind: "mcp", Name: "github", Path: path, Digest: sum}},
 		}), ShouldBeNil)
 
-		var owner host.PathOwner = receiptOwner{receipts: store}
+		var owner host.PathOwner = verger.NewOwnership(receiptsDir)
 
 		Convey("When the adapter asks for the recorded digest (NF-2)", func() {
 			digests, ok := owner.(host.ArtifactDigests)

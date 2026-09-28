@@ -95,7 +95,7 @@ func (a *app) runPropagateShow(ctx context.Context) error {
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	doc, _, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func (a *app) runPropagateSet(ctx context.Context, eventArg, value, kind, hostID
 		return err
 	}
 
-	doc, _, err := loadSpec(paths.specPath)
+	doc, _, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return err
 	}
@@ -262,7 +262,7 @@ func (a *app) runPropagateSet(ctx context.Context, eventArg, value, kind, hostID
 		return err
 	}
 
-	if err := saveSpec(paths.specPath, doc); err != nil {
+	if err := saveSpec(paths.SpecPath, doc); err != nil {
 		return err
 	}
 

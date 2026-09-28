@@ -122,8 +122,8 @@ func (a *app) checkKeyring(client *verger.Client) doctorCheck {
 }
 
 // checkReceipts verifies the receipt store integrity.
-func (a *app) checkReceipts(paths scopePaths) doctorCheck {
-	if _, err := receipt.NewStore(paths.receiptsDir).List(); err != nil {
+func (a *app) checkReceipts(paths verger.Paths) doctorCheck {
+	if _, err := receipt.NewStore(paths.ReceiptsDir).List(); err != nil {
 		return doctorCheck{Severity: severityError, Check: "receipts", Message: err.Error()}
 	}
 
@@ -131,10 +131,10 @@ func (a *app) checkReceipts(paths scopePaths) doctorCheck {
 }
 
 // checkSpecs parses the scope spec, the project spec and both locks.
-func (a *app) checkSpecs(client *verger.Client, paths scopePaths) []doctorCheck {
+func (a *app) checkSpecs(client *verger.Client, paths verger.Paths) []doctorCheck {
 	var checks []doctorCheck
 
-	for _, path := range doctorFiles(client.Home().SpecPath(), paths.specPath) {
+	for _, path := range doctorFiles(client.Home().SpecPath(), paths.SpecPath) {
 		doc, ok, err := loadSpec(path)
 
 		switch {
@@ -145,7 +145,7 @@ func (a *app) checkSpecs(client *verger.Client, paths scopePaths) []doctorCheck 
 		}
 	}
 
-	for _, path := range doctorFiles(client.Home().LockPath(), paths.lockPath) {
+	for _, path := range doctorFiles(client.Home().LockPath(), paths.LockPath) {
 		if _, err := loadLock(path); err != nil {
 			checks = append(checks, doctorCheck{Severity: severityError, Check: "lock", Message: err.Error()})
 		}

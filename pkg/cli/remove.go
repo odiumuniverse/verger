@@ -6,9 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/odiumuniverse/verger/pkg/apply"
-	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
 // newRemoveCmd builds `verger remove`.
@@ -28,7 +27,9 @@ func newRemoveCmd(a *app) *cobra.Command {
 	return cmd
 }
 
-// runRemove removes every receipt cell of one package and tombstones them.
+// runRemove removes every receipt cell of one package and tombstones them. The
+// plan and the execution both come from the facade (DESIGN §9.1); the CLI only
+// renders the plan, gates the confirmation and renders the report.
 //
 //nolint:gocyclo,cyclop // the command body is the documented removal flow (rule 5)
 func (a *app) runRemove(ctx context.Context, id string, cause receipt.Cause) error {
@@ -46,60 +47,20 @@ func (a *app) runRemove(ctx context.Context, id string, cause receipt.Cause) err
 		return err
 	}
 
-	receipts := receipt.NewStore(paths.receiptsDir)
+	adapters := a.hosts(client)
 
-	list, err := receipts.List()
+	plan, err := client.PlanRemove(ctx, id, verger.RemoveOptions{Paths: paths, Hosts: adapters, Cause: cause})
 	if err != nil {
 		return err
 	}
 
-	adapters := a.hosts(client)
+	if len(plan.Actions) == 0 {
+		_, err := fmt.Fprintf(a.out, "%s: no installed cell\n", id)
 
-	adapterByID := map[host.ID]host.Host{}
-
-	for _, adapter := range adapters {
-		adapterByID[adapter.ID()] = adapter
+		return err
 	}
 
-	var (
-		actions []apply.Action
-		cells   []cellDoc
-		notes   []string
-	)
-
-	for i := range list {
-		record := list[i]
-
-		if !matchesID(record.Package, id) {
-			continue
-		}
-
-		hostID := host.ID(record.Host)
-
-		if _, ok := adapterByID[hostID]; !ok {
-			notes = append(notes, fmt.Sprintf("%s: adapter %s is not available; left installed", record.Package, record.Host))
-
-			continue
-		}
-
-		actions = append(actions, apply.Action{
-			Kind: apply.ActionRemove, Host: hostID, Previous: &record, Cause: string(cause),
-		})
-		cells = append(cells, cellDoc{
-			Package: record.Package, Host: record.Host, Scope: record.Scope,
-			Status: statePlanned, Version: record.Version, Strategy: record.Strategy, Kind: string(apply.ActionRemove),
-		})
-	}
-
-	if len(actions) == 0 {
-		if _, err := fmt.Fprintf(a.out, "%s: no installed cell\n", id); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	if err := a.printPlan(cells); err != nil {
+	if err := a.printPlan(cliCells(plan.Cells)); err != nil {
 		return err
 	}
 
@@ -109,29 +70,12 @@ func (a *app) runRemove(ctx context.Context, id string, cause receipt.Cause) err
 		return err
 	}
 
-	if !a.dryRun {
-		if err := a.ensure(client, paths); err != nil {
-			return err
-		}
-
-		if err := removeSpecRecord(paths, id); err != nil {
-			return err
-		}
-	}
-
-	deps, err := a.applyDeps(client, adapters, paths)
+	report, err := client.Remove(ctx, plan, a.applyOptionsFacade())
 	if err != nil {
 		return err
 	}
 
-	report, err := apply.Run(ctx, deps, apply.Plan{Actions: actions}, a.applyOptions(client))
-	if err != nil {
-		return err
-	}
-
-	report.Notes = append(report.Notes, notes...)
-
-	return a.printReport(report, homeRoot(client))
+	return a.printReport(*report, homeRoot(client))
 }
 
 // newRestoreCmd builds `verger restore`.
@@ -150,59 +94,37 @@ func newRestoreCmd(a *app) *cobra.Command {
 	return cmd
 }
 
-// trashEntryDoc is the stable JSON shape of one restored trash entry.
-type trashEntryDoc struct {
-	Package  string `json:"package"`
-	Host     string `json:"host"`
-	Original string `json:"original"`
-	TrashID  string `json:"trash_id"`
-}
-
-// runRestore restores every trash entry tagged with the package id.
+// runRestore restores every trash entry tagged with the package id, through the
+// facade (DESIGN §9.1); the CLI only renders the result.
 func (a *app) runRestore(ctx context.Context, id string) error {
 	client, err := a.open(ctx)
 	if err != nil {
 		return err
 	}
 
-	entries, err := client.Store().Trash().List()
+	paths, err := a.paths(client)
 	if err != nil {
 		return err
 	}
 
-	var restored []trashEntryDoc
-
-	for _, entry := range entries {
-		if !matchesID(entry.Package, id) {
-			continue
-		}
-
-		if a.dryRun {
-			restored = append(restored, trashEntryDoc{Package: entry.Package, Host: entry.Host, Original: entry.Original, TrashID: entry.ID})
-
-			continue
-		}
-
-		if _, err := client.Store().Trash().Restore(ctx, entry.ID); err != nil {
-			return err
-		}
-
-		restored = append(restored, trashEntryDoc{Package: entry.Package, Host: entry.Host, Original: entry.Original, TrashID: entry.ID})
+	result, err := client.Restore(ctx, id, verger.RemoveOptions{Paths: paths, DryRun: a.dryRun})
+	if err != nil {
+		return err
 	}
 
 	if a.jsonOut {
 		return a.printJSON(struct {
-			Restored []trashEntryDoc `json:"restored"`
-		}{Restored: restored})
+			Restored []verger.RestoredEntry `json:"restored"`
+		}{Restored: result.Restored})
 	}
 
-	if len(restored) == 0 {
+	if len(result.Restored) == 0 {
 		_, err := fmt.Fprintf(a.out, "%s: nothing in the trash\n", id)
 
 		return err
 	}
 
-	for _, entry := range restored {
+	for _, entry := range result.Restored {
 		if _, err := fmt.Fprintf(a.out, "restored %s (%s)\n", entry.Original, entry.TrashID); err != nil {
 			return err
 		}

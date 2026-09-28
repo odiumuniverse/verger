@@ -943,3 +943,127 @@ func TestCrashReplayAfterReceipt(t *testing.T) {
 		})
 	})
 }
+
+// TestAdapterCheckedDocuments pins which documents pkg/apply stops checking by
+// bytes: a document whose records a receipt owns one by one is drift-checked by
+// the adapter that owns them, because a user may add their own records to the
+// same file and a byte digest would call that a drift on the package's records.
+func TestAdapterCheckedDocuments(t *testing.T) {
+	Convey("Given a receipt whose RMA claims records inside one document", t, func() {
+		ops := []receipt.Op{
+			{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/cordis.patch.yml"},
+			{Kind: receipt.OpRecord, Path: "dsh://patch/fs", Note: "/home/u/.dsh/cordis.patch.yml"},
+			{Kind: receipt.OpRecord, Path: "dsh://patch/web", Note: "/home/u/.dsh/cordis.patch.yml"},
+			{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/skills/alpha"},
+		}
+
+		Convey("When the documents are collected", func() {
+			checked := adapterCheckedDocuments(ops)
+
+			Convey("Then only the document the records live in is adapter-checked", func() {
+				So(checked, ShouldResemble, map[string]bool{"/home/u/.dsh/cordis.patch.yml": true})
+			})
+		})
+
+		Convey("When a receipt claims no record", func() {
+			plain := []receipt.Op{{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/cordis.patch.yml"}}
+
+			Convey("Then nothing is adapter-checked and every file keeps its byte check", func() {
+				So(adapterCheckedDocuments(plain), ShouldBeEmpty)
+			})
+		})
+	})
+}
+
+// TestDriftNoteSkipsAdapterChecked pins the drift verdict itself: an op inside an
+// adapter-checked document never blocks a delivery on its own, a record op never
+// blocks anything, and any other file op still blocks on drift.
+func TestDriftNoteSkipsAdapterChecked(t *testing.T) {
+	Convey("Given a drifted file inside an adapter-checked document", t, func() {
+		r := &runner{}
+
+		Convey("When the drift note is computed", func() {
+			Convey("Then the adapter owns the verdict and the file op does not block", func() {
+				checked := map[string]bool{"/home/u/.dsh/cordis.patch.yml": true}
+				op := receipt.Op{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/cordis.patch.yml"}
+
+				note, blocked := r.driftNote(op, checked)
+				So(blocked, ShouldBeFalse)
+				So(note, ShouldBeEmpty)
+			})
+
+			Convey("Then a record op never blocks", func() {
+				op := receipt.Op{Kind: receipt.OpRecord, Path: "dsh://patch/fs", Note: "/home/u/.dsh/cordis.patch.yml"}
+
+				note, blocked := r.driftNote(op, nil)
+				So(blocked, ShouldBeFalse)
+				So(note, ShouldBeEmpty)
+			})
+
+			Convey("Then a file outside that document is checked by bytes", func() {
+				path := filepath.Join(t.TempDir(), "SKILL.md")
+				So(os.WriteFile(path, []byte("changed\n"), 0o600), ShouldBeNil)
+
+				op := receipt.Op{Kind: receipt.OpWriteFile, Path: path, Digest: digest.Bytes([]byte("stale\n"))}
+				checked := map[string]bool{"/home/u/.dsh/cordis.patch.yml": true}
+
+				note, blocked := r.driftNote(op, checked)
+				So(blocked, ShouldBeTrue)
+				So(note, ShouldContainSubstring, "hands-off")
+			})
+		})
+	})
+}
+
+// TestVerifyArtifactSkipsHostCheckedKinds pins the two artifact kinds
+// verifyArtifact does not check by itself, and why. kindMCP predates the
+// patch-document work and is checked only here; kindPatchDocument is the DSH
+// home patch layer, whose records the owning adapter verifies one by one.
+func TestVerifyArtifactSkipsHostCheckedKinds(t *testing.T) {
+	Convey("Given an absolute artifact path that no op covers", t, func() {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "document")
+		So(os.WriteFile(path, []byte("x\n"), 0o600), ShouldBeNil)
+
+		intent := intentRecord{RMA: []receipt.Op{}}
+
+		Convey("When the artifact is a host-installed MCP server", func() {
+			Convey("Then only the host oracle can prove it, so the walk skips it", func() {
+				ok, checkable := verifyArtifact(intent, receipt.Artifact{
+					Kind: "mcp", Name: "fs", Path: "claude://mcp/fs", Digest: digest.Bytes([]byte("x")),
+				})
+
+				So(ok, ShouldBeTrue)
+				So(checkable, ShouldBeFalse)
+			})
+		})
+
+		Convey("When the artifact is a real file of another kind", func() {
+			Convey("Then the walk checks it by bytes and a wrong digest is drift", func() {
+				ok, checkable := verifyArtifact(intent, receipt.Artifact{
+					Kind: "skill", Name: "alpha", Path: path, Digest: digest.Bytes([]byte("stale")),
+				})
+
+				So(checkable, ShouldBeTrue)
+				So(ok, ShouldBeFalse)
+			})
+		})
+	})
+}
+
+// TestAdapterCheckedDocumentsSkipsOnlyItsDocument pins that the drift walk's
+// exemption is scoped to the document the records live in, never to every file
+// op of a delivery.
+func TestAdapterCheckedDocumentsSkipsOnlyItsDocument(t *testing.T) {
+	Convey("Given a receipt with records in one document and a skill tree op", t, func() {
+		ops := []receipt.Op{
+			{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/cordis.patch.yml"},
+			{Kind: receipt.OpRecord, Path: "dsh://patch/fs", Note: "/home/u/.dsh/cordis.patch.yml"},
+			{Kind: receipt.OpCopyTree, Path: "/home/u/.dsh/skills/alpha"},
+		}
+
+		Convey("Then only the patch document is exempt", func() {
+			So(adapterCheckedDocuments(ops), ShouldResemble, map[string]bool{"/home/u/.dsh/cordis.patch.yml": true})
+		})
+	})
+}

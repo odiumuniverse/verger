@@ -15,7 +15,7 @@ import (
 // must be able to tell "not implemented yet" from "install the CLI".
 func TestUnavailableHostsExplainsTheCause(t *testing.T) {
 	Convey("Given a requested host without a registered adapter", t, func() {
-		err := unavailableHostsError(
+		err := verger.UnavailableHostsError(
 			map[string]bool{"agy": true},
 			map[string]bool{"claude": true, "codex": true},
 			nil,
@@ -31,7 +31,7 @@ func TestUnavailableHostsExplainsTheCause(t *testing.T) {
 	})
 
 	Convey("Given a registered adapter the machine does not detect", t, func() {
-		err := unavailableHostsError(
+		err := verger.UnavailableHostsError(
 			map[string]bool{"codex": true},
 			map[string]bool{"claude": true, "codex": true},
 			nil,
@@ -47,7 +47,7 @@ func TestUnavailableHostsExplainsTheCause(t *testing.T) {
 	})
 
 	Convey("Given a requested host the user excluded", t, func() {
-		err := unavailableHostsError(
+		err := verger.UnavailableHostsError(
 			map[string]bool{"omp": true},
 			map[string]bool{"omp": true},
 			map[string]bool{"omp": true},
@@ -61,7 +61,7 @@ func TestUnavailableHostsExplainsTheCause(t *testing.T) {
 	})
 
 	Convey("Given requested hosts of every kind at once", t, func() {
-		err := unavailableHostsError(
+		err := verger.UnavailableHostsError(
 			map[string]bool{"omp": true, "kilo": true, "gemini": true},
 			map[string]bool{"omp": true, "gemini": true},
 			map[string]bool{"omp": true},
@@ -129,15 +129,13 @@ func TestAdapterIDsCoversTheFactory(t *testing.T) {
 		client, err := verger.Open(context.Background())
 		So(err, ShouldBeNil)
 
-		ids := adapterIDs(newApp(Options{}).hosts(client))
+		ids := verger.AdapterIDs(newApp(Options{}).hosts(client))
 
 		Convey("When the adapters are built", func() {
 			Convey("Then every landed adapter is in the registry the message reads", func() {
-				for _, id := range []host.ID{host.Claude, host.Codex, host.Gemini, host.Omp} {
+				for _, id := range host.All() {
 					So(ids[string(id)], ShouldBeTrue)
 				}
-
-				So(ids[string(host.Agy)], ShouldBeFalse)
 			})
 		})
 	})

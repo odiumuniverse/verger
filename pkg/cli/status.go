@@ -1,14 +1,12 @@
 package cli
 
 import (
-	"cmp"
 	"context"
 	"fmt"
-	"slices"
 
 	"github.com/spf13/cobra"
 
-	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
 // statusDoc is the stable JSON document of `verger status`.
@@ -48,7 +46,7 @@ func (a *app) runStatus(ctx context.Context, outdatedOnly bool) error {
 		return err
 	}
 
-	doc, err := a.statusCells(paths, outdatedOnly)
+	doc, err := a.statusCells(client, ctx, paths, outdatedOnly)
 	if err != nil {
 		return err
 	}
@@ -74,90 +72,20 @@ func (a *app) runStatus(ctx context.Context, outdatedOnly bool) error {
 	return nil
 }
 
-// statusCells merges receipts and lock cells into the stable matrix.
-func (a *app) statusCells(paths scopePaths, outdatedOnly bool) (statusDoc, error) {
-	receipts := receipt.NewStore(paths.receiptsDir)
-
-	list, err := receipts.List()
+// statusCells merges receipts and lock cells into the stable matrix through the
+// facade (DESIGN §9.1); the CLI only converts the document into its own JSON
+// shape and its own level column.
+func (a *app) statusCells(client *verger.Client, ctx context.Context, paths verger.Paths, outdatedOnly bool) (statusDoc, error) {
+	doc, err := client.Status(ctx, verger.StatusOptions{Paths: paths, OutdatedOnly: outdatedOnly})
 	if err != nil {
 		return statusDoc{}, err
 	}
 
-	lockDoc, err := loadLock(paths.lockPath)
-	if err != nil {
-		return statusDoc{}, err
-	}
-
-	doc := statusDoc{Home: paths.root, Cells: []cellDoc{}}
-
-	for _, record := range list {
-		cell := cellDoc{
-			Package: record.Package, Host: record.Host, Scope: record.Scope,
-			Status: string(statusCurrent), Version: record.Version, Strategy: record.Strategy,
-			Level: hostMaturity(record.Host),
-		}
-
-		if lockCell, ok := lockDoc.Cell(record.Package, record.Host, record.Scope); ok && lockCell.Version != record.Version {
-			cell.Status = string(statusSkew)
-			cell.Notes = []string{"lock has " + lockCell.Version}
-		}
-
-		doc.Cells = append(doc.Cells, cell)
-	}
-
-	for _, lockCell := range lockDoc.Cells {
-		if _, ok := findCell(list, lockCell.Package, lockCell.Host, lockCell.Scope); ok {
-			continue
-		}
-
-		doc.Cells = append(doc.Cells, cellDoc{
-			Package: lockCell.Package, Host: lockCell.Host, Scope: lockCell.Scope,
-			Status: string(statusMissing), Version: lockCell.Version, Strategy: string(lockCell.Strategy),
-			Level: hostMaturity(lockCell.Host),
-			Notes: []string{"lock cell without a receipt"},
-		})
-	}
-
-	slices.SortFunc(doc.Cells, func(left, right cellDoc) int {
-		return cmp.Or(
-			cmp.Compare(left.Package, right.Package),
-			cmp.Compare(left.Host, right.Host),
-			cmp.Compare(left.Scope, right.Scope),
-		)
-	})
-
-	if outdatedOnly {
-		doc.Cells = slices.DeleteFunc(doc.Cells, func(cell cellDoc) bool {
-			return cell.Status != string(statusSkew) && cell.Status != string(statusMissing)
-		})
-
-		if doc.Cells == nil {
-			doc.Cells = []cellDoc{}
-		}
-	}
-
-	return doc, nil
-}
-
-// findCell locates one receipt by key.
-func findCell(list []receipt.Receipt, pkg, hostID, scope string) (receipt.Receipt, bool) {
-	for _, record := range list {
-		if record.Package == pkg && record.Host == hostID && record.Scope == scope {
-			return record, true
-		}
-	}
-
-	return receipt.Receipt{}, false
+	return statusDoc{Home: doc.Home, Cells: cliCells(doc.Cells)}, nil
 }
 
 // Cell status and severity values reused by the CLI documents.
 const (
-	statusCurrent = "current"
-	statusMissing = "missing"
-	statusSkew    = "skew"
-
-	statePlanned = "planned"
-
 	severityOK      = "ok"
 	severityWarning = "warning"
 	severityError   = "error"

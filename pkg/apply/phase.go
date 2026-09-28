@@ -455,8 +455,22 @@ func (r *runner) removeCommitted(event receipt.Event, pkg, hostID, scope string)
 func (r *runner) verifyArtifacts(intent intentRecord) (bool, bool) {
 	verifiable := false
 
+	// A document the receipt claims record by record is checked record by
+	// record: comparing the whole document against one digest would call a
+	// user's own added record a drift on verger's records and freeze the cell
+	// (DRIFT-2).
+	perRecord := adapterCheckedDocuments(intent.RMA)
+
 	for _, artifact := range intent.Artifacts {
 		ok, checkable := verifyArtifact(intent, artifact)
+
+		// A document claimed record by record is verified by those records; the
+		// whole-document comparison below is exactly the coarse check that would
+		// call a user's own added record a drift (DRIFT-2).
+		if checkable && perRecord[artifact.Path] {
+			continue
+		}
+
 		if !checkable {
 			continue
 		}
@@ -474,7 +488,8 @@ func (r *runner) verifyArtifacts(intent intentRecord) (bool, bool) {
 // verifyArtifact checks one journaled artifact against the disk; checkable is
 // false for artifacts only the host itself can confirm.
 func verifyArtifact(intent intentRecord, artifact receipt.Artifact) (bool, bool) {
-	if artifact.Path == "" || !filepath.IsAbs(artifact.Path) || artifact.Kind == kindMCP {
+	if artifact.Path == "" || !filepath.IsAbs(artifact.Path) ||
+		artifact.Kind == kindMCP || artifact.Kind == kindPatchDocument {
 		return true, false
 	}
 
@@ -506,8 +521,17 @@ func verifyArtifact(intent intentRecord, artifact receipt.Artifact) (bool, bool)
 }
 
 // kindMCP names host-install MCP artifacts, whose presence only the host
-// oracle can prove.
+// oracle can prove. It is checked here and nowhere else, so no test claims it.
 const kindMCP = "mcp"
+
+// kindPatchDocument names a host config document whose records the adapter owns
+// by id (the DSH home patch layer). The bytes on disk are not verger's alone — a
+// user may add their own records — so only the adapter can tell whether
+// verger's own records still hold the values it wrote; a byte digest of the
+// whole file would report a foreign edit as drift on the package's records.
+// pkg/apply skips it for that reason, and the drift walk skips the document's
+// file op (adapterCheckedDocuments); both are pinned by tests.
+const kindPatchDocument = "patch-document"
 
 // configOpFor finds the config-key op of one artifact path.
 func configOpFor(ops []receipt.Op, path string) (receipt.Op, bool) {
@@ -907,10 +931,12 @@ func (r *runner) finishRemove(action Action, outcome rmaOutcome) error {
 // driftNotes compares the previous receipt against the disk and reports every
 // mismatch; an empty result means the cell is safe to touch.
 func (r *runner) driftNotes(prev receipt.Receipt) []string {
+	adapterChecked := adapterCheckedDocuments(prev.RMA)
+
 	var notes []string
 
 	for _, op := range prev.RMA {
-		if note, blocked := r.driftNote(op); blocked {
+		if note, blocked := r.driftNote(op, adapterChecked); blocked {
 			notes = append(notes, note)
 		}
 	}
@@ -918,15 +944,37 @@ func (r *runner) driftNotes(prev receipt.Receipt) []string {
 	return notes
 }
 
+// adapterCheckedDocuments returns the document paths whose records a receipt
+// owns one by one (kindPatchDocument). Their bytes are not verger's alone — a
+// user may add their own records to the same file — so a byte digest would call
+// a foreign edit drift on the package's own records. The adapter that owns the
+// records checks them itself, per record, and reports hands-off on the one that
+// moved.
+func adapterCheckedDocuments(ops []receipt.Op) map[string]bool {
+	documents := map[string]bool{}
+
+	for _, op := range ops {
+		if op.Kind == receipt.OpRecord && op.Note != "" {
+			documents[op.Note] = true
+		}
+	}
+
+	return documents
+}
+
 // driftNote checks one receipt operation against the disk; blocked is true when
 // the artifact must not be touched.
-func (r *runner) driftNote(op receipt.Op) (string, bool) {
+func (r *runner) driftNote(op receipt.Op, adapterChecked map[string]bool) (string, bool) {
 	switch op.Kind {
-	case receipt.OpHostInstall:
+	case receipt.OpHostInstall, receipt.OpRecord:
 		return "", false
 	case receipt.OpConfigKey:
 		return r.driftConfigNote(op)
 	default:
+		if adapterChecked[op.Path] {
+			return "", false
+		}
+
 		return r.driftEntryNote(op)
 	}
 }
@@ -1088,6 +1136,10 @@ func (r *runner) execRMAOp(hostID host.ID, ref rmaRef, op receipt.Op, cause stri
 		return note, "", handsOff, err
 	case receipt.OpWriteFile, receipt.OpCopyTree, receipt.OpSymlink, receipt.OpHardlink:
 		return r.undoEntry(ref, op, cause, mode)
+	case receipt.OpRecord:
+		// A record op claims a value inside a document the package's own
+		// file op reverses; there is nothing to undo on its own.
+		return "", "", false, nil
 	default:
 		return "", "", false, fmt.Errorf("unknown rma op %q", op.Kind)
 	}
@@ -1262,7 +1314,8 @@ func (r *runner) resolveBackups(ops []receipt.Op, prev *receipt.Receipt, pkg, ho
 	out := slices.Clone(ops)
 
 	for i, op := range out {
-		if !op.Existed || op.Backup != "" || op.Kind == receipt.OpHostInstall || op.Kind == receipt.OpConfigKey {
+		if !op.Existed || op.Backup != "" || op.Kind == receipt.OpHostInstall ||
+			op.Kind == receipt.OpConfigKey || op.Kind == receipt.OpRecord {
 			continue
 		}
 

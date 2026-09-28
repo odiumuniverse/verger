@@ -7,9 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/odiumuniverse/verger/pkg/apply"
-	"github.com/odiumuniverse/verger/pkg/host"
-	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/spec"
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
@@ -42,15 +39,11 @@ func newInstallCmd(a *app) *cobra.Command {
 	return cmd
 }
 
-// installPkg is one fetched package of an install run.
-type installPkg struct {
-	ref   source.Ref
-	pkg   host.Package
-	allow bool
-}
-
 // runInstall fetches the refs, resolves targets, asks the hooks question and
-// applies the plan.
+// runInstall fetches the refs, resolves targets, asks the hooks question and
+// applies the plan. The planning and the execution both come from the facade
+// (DESIGN §9.1); the CLI parses flags, prints the plan, gates the confirmation
+// and renders the report.
 //
 //nolint:gocyclo,cyclop // the command body is the documented install flow (rules 2–4)
 func (a *app) runInstall(ctx context.Context, args []string) error {
@@ -64,50 +57,22 @@ func (a *app) runInstall(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if err := a.requireTrust(client, paths); err != nil {
-		return err
-	}
-
-	refs, err := source.ParseAll(args)
+	plan, err := client.Plan(ctx, verger.PlanOptions{
+		Paths:  paths,
+		Refs:   args,
+		Filter: a.hostFilter(),
+		Pin:    a.pinFlag,
+	})
 	if err != nil {
-		return &UsageError{Cause: err}
+		return a.translatePlanError(err)
 	}
 
-	agentRefs, fetchRefs := splitRefs(refs)
-	if len(agentRefs) > 0 {
-		if len(fetchRefs) > 0 {
-			return &UsageError{Cause: errors.New("install cannot mix agent refs (host:ref) with package refs")}
-		}
-
-		return a.adoptRefs(ctx, client, paths, agentRefs)
+	// An agent ref (host:ref) is an adopt, not a fetch.
+	if len(plan.Adopts) > 0 {
+		return a.runAdoptPlan(ctx, client, plan)
 	}
 
-	for _, ref := range fetchRefs {
-		if ref.Kind == source.KindMCP {
-			return &NotAvailableError{Feature: "mcp: refs", Hint: "mcp: refs resolve through the official MCP Registry in the source resolver (T3.1)"}
-		}
-	}
-
-	adapters, err := a.targets(client, a.hosts(client))
-	if err != nil {
-		return err
-	}
-
-	if len(adapters) == 0 {
-		return errors.New("no detected hosts; pass --hosts to target one explicitly")
-	}
-
-	hooksMode, err := a.hooksMode(paths, spec.HooksMode(a.hooksFlag))
-	if err != nil {
-		return err
-	}
-
-	packages, err := a.fetchInstallPackages(ctx, client, fetchRefs, paths, adapters)
-	if err != nil {
-		return err
-	}
-
-	if err := a.printPlan(a.plannedCells(packages, adapters)); err != nil {
+	if err := a.printPlan(cliCells(plan.Cells)); err != nil {
 		return err
 	}
 
@@ -117,139 +82,52 @@ func (a *app) runInstall(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// The hooks question comes after the plan and before any write (rule 4):
-	// a detached stdin without -y stops here with ErrConfirmationRequired.
-	for i := range packages {
-		allow, err := a.hooksDecision(client, packages[i].pkg, hooksMode)
-		if err != nil {
-			return err
-		}
+	opts := a.applyOptionsFacade()
 
-		packages[i].allow = allow
-	}
-
-	actions, err := a.installActions(ctx, client, packages, adapters)
+	flagMode, err := a.hooksMode(paths, spec.HooksMode(a.hooksFlag))
 	if err != nil {
 		return err
 	}
 
-	if !a.dryRun {
-		if err := a.ensure(client, paths); err != nil {
-			return err
-		}
-
-		if err := a.recordInstall(paths, packages); err != nil {
-			return err
-		}
-	}
-
-	deps, err := a.applyDeps(client, adapters, paths)
+	planHooks, err := verger.HooksModeFromSpec(paths, verger.LibraryHooksMode(flagMode))
 	if err != nil {
 		return err
 	}
 
-	report, err := apply.Run(ctx, deps, apply.Plan{Actions: actions}, a.applyOptions(client))
+	opts.Hooks = planHooks
+
+	report, err := client.Install(ctx, plan, opts)
 	if err != nil {
 		return err
 	}
 
-	return a.printReport(report, homeRoot(client))
+	return a.printReport(*report, homeRoot(client))
 }
 
-// fetchInstallPackages fetches every ref into one host package.
-func (a *app) fetchInstallPackages(ctx context.Context, client *verger.Client, refs []source.Ref, paths scopePaths, adapters []host.Host) ([]installPkg, error) {
-	fetcher, err := source.NewFetcher(source.WithStore(client.Store()))
-	if err != nil {
-		return nil, err
+// translatePlanError renders a facade planning failure with the CLI's own error
+// types, so the message and the exit code stay what they were.
+func (a *app) translatePlanError(err error) error {
+	usage, ok := errors.AsType[*verger.UsageError](err)
+	if ok {
+		return &UsageError{Cause: usage}
 	}
 
-	var packages []installPkg
-
-	for _, ref := range refs {
-		fetched, err := fetcher.Fetch(ctx, ref)
-		if err != nil {
-			return nil, err
-		}
-
-		defer func() { _ = fetched.Cleanup() }()
-
-		version := firstNonEmpty(a.pinFlag, fetched.Package.Version)
-		fetched.Package.Version = version
-
-		pkg, err := buildHostPackage(client, fetched, adapters[0].ID(), version, paths.name, paths.project)
-		if err != nil {
-			return nil, err
-		}
-
-		packages = append(packages, installPkg{ref: ref, pkg: pkg})
+	unavailable, ok := errors.AsType[*verger.HostUnavailableError](err)
+	if ok {
+		return unavailable
 	}
 
-	return packages, nil
-}
-
-// plannedCells renders the display plan of one install run without writes.
-func (a *app) plannedCells(packages []installPkg, adapters []host.Host) []cellDoc {
-	var planned []cellDoc
-
-	for _, item := range packages {
-		for _, adapter := range adapters {
-			strategy, note := a.pickStrategy(item.pkg, adapter.ID(), item.ref.Kind)
-
-			cell := cellDoc{
-				Package: item.pkg.ID, Host: string(adapter.ID()), Scope: paths2Scope(item.pkg.Scope),
-				Status: statePlanned, Version: item.pkg.Version, Strategy: string(strategy), Kind: string(apply.ActionInstall),
-			}
-
-			if note != "" {
-				cell.Notes = append(cell.Notes, note)
-			}
-
-			planned = append(planned, cell)
-		}
+	check, ok := errors.AsType[*verger.CheckFailedError](err)
+	if ok {
+		return &LockedError{Reason: check.Error()}
 	}
 
-	return planned
-}
-
-// installActions builds one install action per package and host.
-func (a *app) installActions(ctx context.Context, client *verger.Client, packages []installPkg, adapters []host.Host) ([]apply.Action, error) {
-	var actions []apply.Action
-
-	for _, item := range packages {
-		for _, adapter := range adapters {
-			strategy, _ := a.pickStrategy(item.pkg, adapter.ID(), item.ref.Kind)
-
-			pkg, _, err := a.prepareDelivery(ctx, client, item.pkg, strategy)
-			if err != nil {
-				return nil, err
-			}
-
-			delivery := host.Delivery{
-				Package:    pkg,
-				Strategy:   strategy,
-				AllowHooks: item.allow,
-				DryRun:     a.dryRun,
-			}
-
-			actions = append(actions, apply.Action{Kind: apply.ActionInstall, Host: adapter.ID(), Delivery: delivery})
-		}
-	}
-
-	return actions, nil
-}
-
-// paths2Scope renders one scope value.
-func paths2Scope(scope string) string {
-	if scope == "" {
-		return "user"
-	}
-
-	return scope
+	return err
 }
 
 // hooksMode resolves the effective hooks mode: the flag wins, then the spec
 // default, then ask.
-func (a *app) hooksMode(paths scopePaths, flag spec.HooksMode) (spec.HooksMode, error) {
+func (a *app) hooksMode(paths verger.Paths, flag spec.HooksMode) (spec.HooksMode, error) {
 	switch flag {
 	case "":
 		break
@@ -259,7 +137,7 @@ func (a *app) hooksMode(paths scopePaths, flag spec.HooksMode) (spec.HooksMode, 
 		return "", &UsageError{Cause: fmt.Errorf("--hooks: unknown mode %q", flag)}
 	}
 
-	doc, ok, err := loadSpec(paths.specPath)
+	doc, ok, err := loadSpec(paths.SpecPath)
 	if err != nil {
 		return "", err
 	}
@@ -269,56 +147,4 @@ func (a *app) hooksMode(paths scopePaths, flag spec.HooksMode) (spec.HooksMode, 
 	}
 
 	return spec.HooksAsk, nil
-}
-
-// splitRefs separates agent refs (host:ref) from fetchable refs.
-func splitRefs(refs []source.Ref) ([]source.Ref, []source.Ref) {
-	var agents, fetchable []source.Ref
-
-	for _, ref := range refs {
-		if ref.Kind == source.KindAgent {
-			agents = append(agents, ref)
-
-			continue
-		}
-
-		fetchable = append(fetchable, ref)
-	}
-
-	return agents, fetchable
-}
-
-// recordInstall writes the fetched sources and packages into the spec (D3).
-func (a *app) recordInstall(paths scopePaths, packages []installPkg) error {
-	doc, _, err := loadSpec(paths.specPath)
-	if err != nil {
-		return err
-	}
-
-	changed := false
-
-	for _, item := range packages {
-		changed = addSpecSource(doc, item.ref) || changed
-		changed = addSpecPackage(doc, item.pkg.ID, a.pinFlag) || changed
-	}
-
-	if !changed {
-		return nil
-	}
-
-	return saveSpec(paths.specPath, doc)
-}
-
-// removeSpecRecord deletes one package entry from the spec.
-func removeSpecRecord(paths scopePaths, id string) error {
-	doc, ok, err := loadSpec(paths.specPath)
-	if err != nil {
-		return err
-	}
-
-	if !ok || removeSpecPackage(doc, id) == 0 {
-		return nil
-	}
-
-	return saveSpec(paths.specPath, doc)
 }

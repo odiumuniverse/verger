@@ -45,7 +45,7 @@ func (a *app) runPack(ctx context.Context, raw string) error {
 		return &UsageError{Cause: err}
 	}
 
-	fetched, err := fetchRef(ctx, client, ref)
+	fetched, err := client.Fetch(ctx, ref)
 	if err != nil {
 		return err
 	}

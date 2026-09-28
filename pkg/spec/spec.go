@@ -55,8 +55,11 @@ type Spec struct {
 	Schema    int       `toml:"schema"`
 	Defaults  Defaults  `toml:"defaults,omitempty"`
 	Propagate Propagate `toml:"propagate,omitempty"`
-	Sources   []Source  `toml:"source,omitempty"`
-	Packages  []Package `toml:"package,omitempty"`
+	// Hosts is the per-host feature switch table (U2): every behaviour is on by
+	// default, and a host switches one off without touching any other host.
+	Hosts    map[string]HostSettings `toml:"hosts,omitempty"`
+	Sources  []Source                `toml:"source,omitempty"`
+	Packages []Package               `toml:"package,omitempty"`
 
 	raw map[string]any
 }
@@ -68,6 +71,46 @@ type Defaults struct {
 	Cooldown Duration  `toml:"cooldown,omitempty"`
 
 	raw map[string]any
+}
+
+// HostSettings are the per-host switches. Every field is on by default; a
+// `false` switches that one behaviour off for that host only (U2).
+type HostSettings struct {
+	// Enabled false takes a host out of every delivery. It is the coarse
+	// switch; the rest are finer.
+	Enabled *bool `toml:"enabled,omitempty"`
+	// Runtime false keeps a host's JavaScript runtime delivery off while its
+	// file delivery stays on (the W3 runtime shim channel).
+	Runtime *bool `toml:"runtime,omitempty"`
+	// Hooks false never delivers hooks to this host.
+	Hooks *bool `toml:"hooks,omitempty"`
+}
+
+// Enabled reports whether the host takes part at all; an absent table means yes.
+func (h HostSettings) EnabledOrDefault() bool {
+	if h.Enabled == nil {
+		return true
+	}
+
+	return *h.Enabled
+}
+
+// RuntimeOn reports whether the host's runtime channel is on; default yes.
+func (h HostSettings) RuntimeOn() bool {
+	if h.Runtime == nil {
+		return true
+	}
+
+	return *h.Runtime
+}
+
+// HooksOn reports whether hooks may be delivered to the host; default yes.
+func (h HostSettings) HooksOn() bool {
+	if h.Hooks == nil {
+		return true
+	}
+
+	return *h.Hooks
 }
 
 // HooksMode is the default answer to the hooks consent question.

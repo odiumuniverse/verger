@@ -3,13 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
-	"slices"
 
 	"github.com/spf13/cobra"
-
-	"github.com/odiumuniverse/verger/pkg/lock"
-	"github.com/odiumuniverse/verger/pkg/receipt"
-	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
 // whyDoc is the stable JSON document of `verger why`.
@@ -40,7 +35,8 @@ func newWhyCmd(a *app) *cobra.Command {
 	return cmd
 }
 
-// runWhy explains one cell without writing.
+// runWhy builds the explanation for one package on one host through the facade
+// (DESIGN §9.1); the CLI only renders what the facade reports.
 func (a *app) runWhy(ctx context.Context, id, hostID string) error {
 	client, err := a.open(ctx)
 	if err != nil {
@@ -52,63 +48,16 @@ func (a *app) runWhy(ctx context.Context, id, hostID string) error {
 		return err
 	}
 
-	doc := whyDoc{Package: id, Host: hostID, Scope: paths.name, Reasons: []string{}, Blockers: []string{}}
-
-	receipts := receipt.NewStore(paths.receiptsDir)
-
-	list, err := receipts.List()
+	explained, err := client.Why(ctx, paths, id, hostID)
 	if err != nil {
 		return err
 	}
 
-	record, hasReceipt := findCell(list, id, hostID, paths.name)
-
-	lockDoc, err := loadLock(paths.lockPath)
-	if err != nil {
-		return err
-	}
-
-	lockCell, hasLock := lockDoc.Cell(id, hostID, paths.name)
-
-	whyCell(&doc, record, hasReceipt, lockCell, hasLock)
-
-	doc.Reasons = append(doc.Reasons, a.whySpecReasons(paths, id)...)
-
-	if err := a.appendHooksReason(client, id, &doc); err != nil {
-		return err
-	}
-
-	slices.Sort(doc.Reasons)
-
-	return a.printWhy(doc)
-}
-
-// whyCell fills the receipt/lock state of one explanation.
-func whyCell(doc *whyDoc, record receipt.Receipt, hasReceipt bool, lockCell lock.Cell, hasLock bool) {
-	switch {
-	case hasReceipt:
-		doc.Status = statusCurrent
-		doc.Version = record.Version
-		doc.Strategy = record.Strategy
-		doc.Reasons = append(doc.Reasons, fmt.Sprintf("strategy %s from the %s receipt", record.Strategy, record.Scope))
-
-		if record.Version != "" {
-			doc.Reasons = append(doc.Reasons, "version "+record.Version)
-		}
-
-		if hasLock && lockCell.Version != record.Version {
-			doc.Status = statusSkew
-			doc.Blockers = append(doc.Blockers, "the lock cell wants "+lockCell.Version)
-		}
-	case hasLock:
-		doc.Status = statusMissing
-		doc.Version = lockCell.Version
-		doc.Strategy = string(lockCell.Strategy)
-		doc.Blockers = append(doc.Blockers, "the lock has a cell but no receipt: run `verger install` or `verger remove`")
-	default:
-		doc.Status = statusMissing
-		doc.Blockers = append(doc.Blockers, "no receipt and no lock cell for this package/host")
-	}
+	return a.printWhy(whyDoc{
+		Package: explained.Package, Host: explained.Host, Scope: explained.Scope,
+		Status: explained.Status, Version: explained.Version, Strategy: explained.Strategy,
+		Reasons: explained.Reasons, Blockers: explained.Blockers,
+	})
 }
 
 // printWhy renders the explanation as JSON or text.
@@ -132,56 +81,6 @@ func (a *app) printWhy(doc whyDoc) error {
 	for _, blocker := range doc.Blockers {
 		_, _ = fmt.Fprintf(a.out, "  blocker: %s\n", blocker)
 	}
-
-	return nil
-}
-
-// whySpecReasons reports the spec entry state of one package.
-func (a *app) whySpecReasons(paths scopePaths, id string) []string {
-	doc, ok, err := loadSpec(paths.specPath)
-	if err != nil || !ok {
-		return nil
-	}
-
-	for _, entry := range doc.Packages {
-		if entry.ID != id {
-			continue
-		}
-
-		reasons := []string{"spec: desired"}
-
-		if entry.Version != "" {
-			reasons = append(reasons, "pinned to "+entry.Version)
-		}
-
-		if entry.Disabled {
-			reasons = append(reasons, "disabled in the spec")
-		}
-
-		if entry.AdoptedFrom != "" {
-			reasons = append(reasons, "adopted from "+entry.AdoptedFrom)
-		}
-
-		return reasons
-	}
-
-	return []string{"spec: not declared"}
-}
-
-// appendHooksReason reports the hooks consent state of one package.
-func (a *app) appendHooksReason(client *verger.Client, id string, doc *whyDoc) error {
-	store, err := a.consentStore(client)
-	if err != nil {
-		return err
-	}
-
-	if record, ok := store.Hooks(id); ok {
-		doc.Reasons = append(doc.Reasons, "hooks approved at "+record.Version)
-
-		return nil
-	}
-
-	doc.Reasons = append(doc.Reasons, "hooks: no approval recorded")
 
 	return nil
 }

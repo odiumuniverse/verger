@@ -31,7 +31,15 @@ type Client struct {
 	store   *store.Store
 	secrets *secret.Store
 	logger  embedlog.Logger
-	hosts   []host.Host
+
+	// configured is the adapter list a caller injected with WithHosts. An empty
+	// list means "build the registered adapters" (DESIGN §9.1), so a front end
+	// that only calls Open still gets all ten over this client's store.
+	configured []host.Host
+	// adapters is the built list, memoized so Targets and every operation see
+	// the same instances (an adapter is stateless, but the receipt-backed
+	// ownership source it carries is one receipt store).
+	adapters []host.Host
 
 	mu     sync.Mutex
 	closed bool
@@ -147,7 +155,10 @@ func Open(ctx context.Context, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{home: h, store: st, secrets: secrets, logger: logger, hosts: hosts}, nil
+	client := &Client{home: h, store: st, secrets: secrets, logger: logger, configured: hosts}
+	client.adapters = client.buildAdapters()
+
+	return client, nil
 }
 
 // resolveHome applies WithHome or discovery.
@@ -255,9 +266,17 @@ func (c *Client) Secrets() *secret.Store {
 	return c.secrets
 }
 
-// Hosts returns the configured host adapters; ownership stays with the client.
+// Hosts returns the host adapters this client delivers to: the list a caller
+// injected with WithHosts, else the ten registered adapters built over this
+// client's store, trash, ownership and secrets. Ownership stays with the client.
 func (c *Client) Hosts() []host.Host {
-	return slices.Clone(c.hosts)
+	return slices.Clone(c.adapters)
+}
+
+// Logger returns the logger this client was opened with; an operation reports
+// progress through it when the caller passed no event channel.
+func (c *Client) Logger() embedlog.Logger {
+	return c.logger
 }
 
 // OpenError.Option values: which Open step failed.
