@@ -49,3 +49,40 @@ make fmt lint test    # what CI runs
 make build            # bin/verger
 make mod              # go mod tidy + vendor
 ```
+
+## Release
+
+Pushing a tag is the whole procedure:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` (tags `v*`, `contents: write`, `macos-latest`)
+then:
+
+1. builds `./cmd/verger` for darwin/arm64 and darwin/amd64 with
+   `-ldflags "-X main.version=<tag without v>"`, merges them with `lipo`, and
+   code-signs the merged binary — `MACOS_SIGN_P12` / `MACOS_SIGN_P12_PASSWORD` /
+   `MACOS_SIGN_KEYCHAIN_PASSWORD` when they are set, otherwise ad-hoc
+   (`com.odiumuniverse.verger` is the identifier);
+2. packs `dist/verger-<version>-darwin-universal.tar.gz`, whose archive root holds
+   the bare `verger` binary — exactly what `bin.install "verger"` expects;
+3. creates the GitHub release for the tag (or reuses it) and uploads the tarball
+   with `--clobber`;
+4. clones `odiumuniverse/homebrew-tap` with `secrets.TAP_TOKEN`, rewrites
+   `Formula/verger.rb` — creating it from a template on the first tag, since a
+   formula is never seeded with a placeholder sha256 — commits as
+   `github-actions[bot]` and pushes. The tap is written only by this step;
+   the tag's artifact is the single source of the url and sha256.
+
+Required repository secret: `TAP_TOKEN`, a token that may push to
+`odiumuniverse/homebrew-tap` (contents: write). Without it the bump step fails
+immediately with `TAP_TOKEN is not set`. The three `MACOS_SIGN_*` secrets are
+optional and only switch the build from ad-hoc to a stable signature.
+
+The tap's formula is therefore never hand-edited and never holds a version that
+was not released: `brew install odiumuniverse/tap/verger` trails the newest tag
+by one workflow run.
+
