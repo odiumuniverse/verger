@@ -46,39 +46,6 @@ jobs:
             rm -f signing.p12
           } || echo "::warning::could not import the signing identity; releases fall back to ad-hoc signing"
 
-      # Each tarball carries a bare `verger` at its root because the formula
-      # does `bin.install "verger"`. The linux binaries cross-compile from the
-      # mac runner: CGO_ENABLED=0 means no cgo, so no cross toolchain is needed
-      # and the result is static. They are NOT signed — a codesign signature is
-      # meaningless off darwin and codesign would reject it.
-      - name: Build every artifact
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p build/darwin-arm64 build/darwin-amd64 dist
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-arm64/verger ./cmd/verger
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-amd64/verger ./cmd/verger
-          lipo -create -output dist/verger build/darwin-arm64/verger build/darwin-amd64/verger
-          # Sign after lipo: merging architectures invalidates an earlier signature, and
-          # the identifier must be set because codesign would default a Go binary to a.out.
-          if codesign --force --sign "odiumuniverse code signing" --timestamp=none --identifier com.odiumuniverse.verger dist/verger 2>/dev/null; then
-            codesign --verify --strict dist/verger
-            echo "signed dist/verger"
-          else
-            echo "::warning::no signing identity; dist/verger stays ad-hoc signed"
-          fi
-          tar -czf "dist/verger-${version}-darwin-universal.tar.gz" -C dist verger
-          rm -f dist/verger
-
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
-          tar -czf "dist/verger-${version}-linux-amd64.tar.gz" -C dist verger
-          rm -f dist/verger
-
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
-          tar -czf "dist/verger-${version}-linux-arm64.tar.gz" -C dist verger
-          rm -f dist/verger
-
-          ls -l dist
-
       # The man pages come from the same cobra tree the binary is built from,
       # so a flag cannot exist in one and not the other. Generated here rather
       # than committed, because a checked-in page rots the moment a flag moves.
@@ -95,6 +62,49 @@ jobs:
         run: |
           man -l dist/man/verger.1 > /dev/null || groff -man -Tascii dist/man/verger.1 > /dev/null
           echo "man renders"
+
+      # Each tarball carries a bare `verger` at its root, because the formula
+      # does `bin.install "verger"`, and a `man/` directory beside it, because
+      # the formula does `man1.install Dir["man/*.1"]`. The man pages have to
+      # be inside the per-platform tarball, not only in the separate
+      # verger-man archive: brew installs from the platform tarball, so a page
+      # that lives only in the other archive is a page no brew user gets.
+      # The linux binaries cross-compile from the mac runner: CGO_ENABLED=0
+      # means no cgo, so no cross toolchain is needed and the result is static.
+      # They are NOT signed — a codesign signature is meaningless off darwin
+      # and codesign would reject it.
+
+      - name: Build every artifact
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p build/darwin-arm64 build/darwin-amd64 dist
+          # A platform tarball without a page is a packaging bug, not a
+          # downstream problem, so it fails here rather than in a user's brew.
+          test -f dist/man/verger.1 || { echo "::error::dist/man/verger.1 is missing; every platform tarball carries it"; exit 1; }
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-arm64/verger ./cmd/verger
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o build/darwin-amd64/verger ./cmd/verger
+          lipo -create -output dist/verger build/darwin-arm64/verger build/darwin-amd64/verger
+          # Sign after lipo: merging architectures invalidates an earlier signature, and
+          # the identifier must be set because codesign would default a Go binary to a.out.
+          if codesign --force --sign "odiumuniverse code signing" --timestamp=none --identifier com.odiumuniverse.verger dist/verger 2>/dev/null; then
+            codesign --verify --strict dist/verger
+            echo "signed dist/verger"
+          else
+            echo "::warning::no signing identity; dist/verger stays ad-hoc signed"
+          fi
+          tar -czf "dist/verger-${version}-darwin-universal.tar.gz" -C dist verger man
+          rm -f dist/verger
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
+          tar -czf "dist/verger-${version}-linux-amd64.tar.gz" -C dist verger man
+          rm -f dist/verger
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=vendor -ldflags "-X main.version=${version}" -o dist/verger ./cmd/verger
+          tar -czf "dist/verger-${version}-linux-arm64.tar.gz" -C dist verger man
+          rm -f dist/verger
+
+          ls -l dist
+
 
       - name: Pack the man pages
         run: |
@@ -167,6 +177,15 @@ jobs:
           mkdir -p unpack
           tar -xzf "$tarball" -C unpack
           test -x unpack/verger || { echo "::error::the tarball has no executable verger at its root"; exit 1; }
+          # The page must be IN the platform tarball, not only in the separate
+          # verger-man archive: brew installs the platform tarball, so this is
+          # the check that decides whether a brew user actually gets a manpage.
+          # Listing the archive first, then the unpacked tree, catches both a
+          # tarball that never had it and one that has it at the wrong depth.
+          tar -tzf "$tarball" | grep -qx 'man/verger.1' \
+            || { echo "::error::${{ matrix.asset }} tarball has no man/verger.1 at its expected path"; tar -tzf "$tarball"; exit 1; }
+          test -s unpack/man/verger.1 \
+            || { echo "::error::unpacked man/verger.1 is missing or empty"; exit 1; }
           got="$(unpack/verger version)"
           echo "verger version on ${{ matrix.runner }}: ${got}"
           case "$got" in
@@ -261,11 +280,20 @@ jobs:
 
               def install
                 bin.install "verger"
+                # The man page ships inside the platform tarball, so a brew
+                # install gets it without a second download. Dir[] because
+                # gendocs may add subcommand pages later and they should land
+                # without another edit here.
+                man1.install Dir["man/*.1"]
                 generate_completions_from_executable(bin/"verger", "completion", shells: [:bash, :zsh, :fish])
               end
 
               test do
                 assert_match version.to_s, shell_output("#{bin}/verger version")
+                # `brew test` is the only place a missing man1.install shows up
+                # as a failure rather than as a user typing `man verger` and
+                # getting nothing.
+                assert_predicate man1/"verger.1", :exist?
               end
             end
           FORMULA
