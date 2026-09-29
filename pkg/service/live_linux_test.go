@@ -13,6 +13,12 @@ import (
 // and never would install into a real login session.
 type execRunner struct{}
 
+// G204 is a false positive: every caller in manager.go passes a literal
+// ("launchctl", "systemctl") as the program name, and the args are this
+// package's own unit paths. Runner exists as a seam so a test can drive it
+// without a real service manager, so pinning the name here would defeat it.
+//
+//nolint:gosec // name is a literal from this package; args are its own unit paths
 func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
@@ -39,11 +45,11 @@ func TestLiveSystemdUserInstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("home: %v", err)
 	}
+
 	spec := WatchSpec("/bin/true", home, home+"/.verger")
 	run := execRunner{}
 
-	path, ierr := Install(ctx, spec, run)
-	err = ierr
+	path, err := Install(ctx, spec, run)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

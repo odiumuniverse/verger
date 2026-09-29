@@ -21,6 +21,12 @@ type carriedHome struct {
 	paths  Paths
 	client *Client
 	target string
+	// host is the adapter the first machine delivered through. The cloned
+	// client has to be given it explicitly: a fresh Open with no adapters
+	// falls back to detecting the agents installed on whatever machine is
+	// running the test, so the test would pass only where an agent happens
+	// to be installed — and fail on a clean CI box.
+	host host.Host
 }
 
 func newCarriedHome(t *testing.T) *carriedHome {
@@ -43,7 +49,7 @@ func newCarriedHome(t *testing.T) *carriedHome {
 	_, err = client.Install(t.Context(), plan, ApplyOptions{Now: fixedClock})
 	So(err, ShouldBeNil)
 
-	return &carriedHome{paths: paths, client: client, target: target}
+	return &carriedHome{paths: paths, client: client, target: target, host: world.fake}
 }
 
 // carryTo copies only the portable part into a fresh home and opens a client
@@ -63,7 +69,7 @@ func (c *carriedHome) carryTo(t *testing.T) *Client {
 
 	So(os.MkdirAll(filepath.Join(dir, "state"), 0o700), ShouldBeNil)
 
-	client, err := Open(t.Context(), WithHome(dir))
+	client, err := Open(t.Context(), WithHome(dir), WithHosts(c.host))
 	So(err, ShouldBeNil)
 
 	t.Cleanup(func() { _ = client.Close() })
