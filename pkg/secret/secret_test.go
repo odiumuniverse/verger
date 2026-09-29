@@ -784,3 +784,36 @@ func fileExists(path string) bool {
 
 	return err == nil
 }
+
+// TestStoreBackendSwitch pins verger secret backend file|keyring: the Store
+// can switch between file and keyring backends.
+func TestStoreBackendSwitch(t *testing.T) {
+	Convey("Given a file-backed store", t, func() {
+		dir := t.TempDir()
+		store, err := secret.Load(filepath.Join(dir, "secrets.json"))
+		So(err, ShouldBeNil)
+
+		Convey("When SetBackend switches to keyring", func() {
+			err := store.SetBackend(secret.BackendKeyring)
+			So(err, ShouldBeNil)
+
+			Convey("Then the backend is keyring", func() {
+				So(store.Backend(), ShouldEqual, secret.BackendKeyring)
+			})
+		})
+
+		Convey("When SetBackend switches to file", func() {
+			err := store.SetBackend(secret.BackendFile)
+			So(err, ShouldBeNil)
+
+			Convey("Then the backend is file", func() {
+				So(store.Backend(), ShouldEqual, secret.BackendFile)
+			})
+		})
+
+		Convey("When SetBackend is called with an invalid backend", func() {
+			err := store.SetBackend("invalid")
+			So(err, ShouldNotBeNil)
+		})
+	})
+}
