@@ -103,7 +103,7 @@ jobs:
         run: |
           mandoc -T lint -W warning dist/man/*.1
           mandoc -T ascii dist/man/verger.1 > /dev/null
-          echo "mandoc: all $(ls dist/man/*.1 | wc -l | tr -d ' ') pages lint clean and verger.1 renders"
+          echo "mandoc: $(find dist/man -name '*.1' | wc -l | tr -d ' ') pages lint clean and verger.1 renders"
 
       # Each tarball carries a bare `verger` at its root, because the formula
       # does `bin.install "verger"`, and a `man/` directory beside it, because
@@ -256,6 +256,31 @@ jobs:
             [ -n "$out" ] || { echo "::error::verger completion $shell is empty"; exit 1; }
           done
 
+  # The publish job is skipped on a dispatch, which is the point of a dispatch
+  # — and that is exactly why a broken publish step used to survive until the
+  # first real tag. This job runs on every dispatch and does the one thing that
+  # fails when publish is misconfigured: talking to the GitHub API. Read only,
+  # so it can never create, edit or upload anything.
+  publish-preflight:
+    # Needs nothing: it is cheap, it does not build, and it must be able to
+    # report a broken publish even when the build is the thing that is red.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Read the release API the way publish will
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Same env publish uses, on purpose: a preflight that does not set
+          # GH_REPO would pass while publish, which never checks the repo out,
+          # fails with "not a git repository". The point is to exercise the
+          # exact call publish makes, not a tidier version of it.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release list --limit 1
+          echo "gh can reach ${GH_REPO} without a checkout; publish will too"
+
   publish:
     needs: [build, smoke]
     # A dispatch run proves the pipeline without publishing: no GitHub release
@@ -296,6 +321,10 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # The publish job never checks the repository out, so there is no
+          # git remote in $GITHUB_WORKSPACE for gh to infer. Without this, gh
+          # falls back to the cwd and fails with "not a git repository".
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --generate-notes
