@@ -144,8 +144,11 @@ func TestRMAIdempotency(t *testing.T) {
 				f.mu.Unlock()
 
 				// The second run converges through the journal: the removal
-				// intent is replayed from the tombstone, so the adapter is not
-				// called again (no duplicate side effects).
+				// intent is replayed from the tombstone, so in this world the
+				// adapter is not called again. The claim is about *this*
+				// run's shape, not about the executor in general: a first
+				// removal that appended an EventLock takes a different path,
+				// and whether it too converges is not what this asserts.
 				So(uninstalls, ShouldEqual, 1)
 			})
 		})
