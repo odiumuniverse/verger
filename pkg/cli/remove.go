@@ -21,7 +21,7 @@ func newRemoveCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	addDeliverFlags(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
 	return cmd
@@ -89,6 +89,10 @@ func newRestoreCmd(a *app) *cobra.Command {
 		},
 	}
 
+	// `restore` puts back every trash entry tagged with the id — the trash is
+	// not organised by host, so a host filter would silently do nothing.
+	// `-y` goes with the write flags because restore is gated on a
+	// confirmation like any other write.
 	addWriteFlags(cmd, a)
 
 	return cmd
@@ -96,6 +100,12 @@ func newRestoreCmd(a *app) *cobra.Command {
 
 // runRestore restores every trash entry tagged with the package id, through the
 // facade (DESIGN §9.1); the CLI only renders the result.
+// restoreDoc is the `verger restore --json` document.
+type restoreDoc struct {
+	Schema   schemaRef              `json:"schema"`
+	Restored []verger.RestoredEntry `json:"restored"`
+}
+
 func (a *app) runRestore(ctx context.Context, id string) error {
 	client, err := a.open(ctx)
 	if err != nil {
@@ -107,15 +117,18 @@ func (a *app) runRestore(ctx context.Context, id string) error {
 		return err
 	}
 
+	// Restore is a mutating operation: it goes through the confirmer.
+	if err := a.requireConfirmation(); err != nil {
+		return err
+	}
+
 	result, err := client.Restore(ctx, id, verger.RemoveOptions{Paths: paths, DryRun: a.dryRun})
 	if err != nil {
 		return err
 	}
 
 	if a.jsonOut {
-		return a.printJSON(struct {
-			Restored []verger.RestoredEntry `json:"restored"`
-		}{Restored: result.Restored})
+		return a.printJSON(restoreDoc{Schema: schemaOf(schemaRemove), Restored: result.Restored})
 	}
 
 	if len(result.Restored) == 0 {

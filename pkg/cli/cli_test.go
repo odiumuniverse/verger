@@ -18,6 +18,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/fsutil"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/secret"
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
@@ -155,6 +156,15 @@ type world struct {
 	hosts []host.Host
 	tty   bool
 	in    string
+	// secrets is optional: a test that needs a specific secrets store
+	// (a fake keyring, say) sets it, and options() injects it in place of the
+	// one the facade would build.
+	secrets *secret.Store
+	// keyringProbe and buildKeyring are the secrets-backend seams. They are
+	// nil unless a test sets them, and options() only passes them on when
+	// they are, so an ordinary test keeps the production behaviour.
+	keyringProbe *fakeProbe
+	buildKeyring func(secret.Runner, string) (secret.Keyring, error)
 
 	out bytes.Buffer
 	err bytes.Buffer
@@ -201,7 +211,7 @@ func newWorld(t *testing.T) *world {
 
 // options renders the CLI options of one test run.
 func (w *world) options() Options {
-	return Options{
+	opts := Options{
 		Version: "test",
 		Out:     &w.out,
 		Err:     &w.err,
@@ -212,6 +222,17 @@ func (w *world) options() Options {
 			verger.WithHosts(w.hosts...),
 		},
 	}
+
+	if w.secrets != nil {
+		opts.openOpts = append(opts.openOpts, verger.WithSecrets(w.secrets))
+	}
+
+	if w.keyringProbe != nil {
+		opts.keyringProbe = w.keyringProbe
+		opts.buildKeyring = w.buildKeyring
+	}
+
+	return opts
 }
 
 // run executes one command line and returns the combined streams and error.
@@ -307,7 +328,16 @@ func (w *world) fixtureIn(t *testing.T, dir string) {
 func (w *world) noHooksFixture(t *testing.T) string {
 	t.Helper()
 
-	dir := filepath.Join(w.root, "nohooks")
+	return w.noHooksFixtureIn(t, w.root)
+}
+
+// noHooksFixtureIn writes the same package inside dir. A spec that points at
+// it needs it next to the spec: a relative source resolves against the
+// spec's own directory, not against the process working directory.
+func (w *world) noHooksFixtureIn(t *testing.T, dir string) string {
+	t.Helper()
+
+	dir = filepath.Join(dir, "nohooks")
 
 	writeWorldFile(t, filepath.Join(dir, ".claude-plugin", "plugin.json"), `{
   "name": "nohooks",
@@ -397,9 +427,8 @@ func snapshot(t *testing.T, root string) map[string]string {
 func TestCommandTree(t *testing.T) {
 	required := []string{
 		"install", "remove", "status", "sync", "adopt", "why", "doctor", "update",
-		"pin", "restore", "secret", "source", "marketplace", "trust", "untrust",
-		"approve", "revoke", "propagate", "watch", "pack", "lint",
-		"self-update", "version",
+		"pin", "restore", "secret", "source", "trust", "untrust",
+		"approve", "revoke", "propagate", "pack", "lint", "version",
 	}
 
 	Convey("Given the verger command tree", t, func() {
@@ -536,4 +565,61 @@ func fileExists(path string) bool {
 	_, err := os.Lstat(path)
 
 	return err == nil
+}
+
+// TestHelpHasNoPhaseMarkers pins API-REQ 4/5: the CLI help must not carry
+// "(Ф1…)" or "not available in Ф1" markers — every command is either
+// implemented or removed from the tree.
+func TestHelpHasNoPhaseMarkers(t *testing.T) {
+	Convey("Given the command tree", t, func() {
+		root := NewRootCmd(Options{})
+
+		Convey("When every command's help is rendered", func() {
+			for _, cmd := range root.Commands() {
+				buf := &bytes.Buffer{}
+				cmd.SetOut(buf)
+				cmd.SetErr(buf)
+
+				_ = cmd.Help()
+
+				Convey("Then "+cmd.Name()+" carries no phase marker", func() {
+					So(buf.String(), ShouldNotContainSubstring, "(Ф1")
+					So(buf.String(), ShouldNotContainSubstring, "not available in Ф1")
+				})
+			}
+		})
+	})
+}
+
+// TestMutatingVerbsTakeTheHostFilter replaces the earlier
+// TestRestoreUnpinHostFlags, which asserted that `restore` and `unpin`
+// accepted --hosts/--except. Both were wrong: neither ever passed a filter
+// to the facade (`runRestore` builds `RemoveOptions{Paths, DryRun}` and
+// `runPin` builds `PinOptions` with no Filter at all), so the flags were
+// accepted and ignored. They have been removed, and this test pins the
+// honest set instead of the old one.
+func TestMutatingVerbsTakeTheHostFilter(t *testing.T) {
+	Convey("Given the command tree", t, func() {
+		root := NewRootCmd(Options{})
+
+		Convey("When the verbs that filter are inspected", func() {
+			for _, name := range []string{"install", "remove", "sync", "update", "adopt"} {
+				cmd, _, err := root.Find([]string{name})
+				So(err, ShouldBeNil)
+				So(cmd.Flags().Lookup("hosts"), ShouldNotBeNil)
+				So(cmd.Flags().Lookup("except"), ShouldNotBeNil)
+			}
+		})
+
+		Convey("When the verbs that cannot filter are inspected", func() {
+			// The trash is not organised by host and a spec entry has no
+			// per-host cells, so neither can narrow the work.
+			for _, name := range []string{"restore", "unpin", "pin"} {
+				cmd, _, err := root.Find([]string{name})
+				So(err, ShouldBeNil)
+				So(cmd.Flags().Lookup("hosts"), ShouldBeNil)
+				So(cmd.Flags().Lookup("except"), ShouldBeNil)
+			}
+		})
+	})
 }

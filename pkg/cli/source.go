@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -46,7 +47,7 @@ func newSourceCmd(a *app) *cobra.Command {
 	}
 
 	for _, sub := range []*cobra.Command{addCmd, rmCmd} {
-		addWriteFlags(sub, a)
+		addDryRunFlag(sub, a)
 		sub.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 	}
 
@@ -59,8 +60,16 @@ func newSourceCmd(a *app) *cobra.Command {
 
 // sourceDoc is the stable JSON shape of one source.
 type sourceDoc struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
+	Schema schemaRef `json:"schema"`
+	Name   string    `json:"name"`
+	URL    string    `json:"url"`
+}
+
+// sourceListDoc is the `source list --json` document: the envelope names the
+// document, the entries name the sources.
+type sourceListDoc struct {
+	Schema  schemaRef   `json:"schema"`
+	Sources []sourceDoc `json:"sources"`
 }
 
 // runSourceAdd appends one source to the spec.
@@ -89,7 +98,7 @@ func (a *app) runSourceAdd(ctx context.Context, raw string) error {
 		return err
 	}
 
-	addSpecSource(doc, ref)
+	addSpecSourceAt(doc, ref, filepath.Dir(paths.SpecPath))
 
 	if a.dryRun {
 		_, err := fmt.Fprintf(a.out, "source: would add %s\n", raw)
@@ -174,9 +183,7 @@ func (a *app) runSourceList(ctx context.Context) error {
 	}
 
 	if a.jsonOut {
-		return a.printJSON(struct {
-			Sources []sourceDoc `json:"sources"`
-		}{Sources: sources})
+		return a.printJSON(sourceListDoc{Schema: schemaOf(schemaSource), Sources: sources})
 	}
 
 	for _, src := range sources {

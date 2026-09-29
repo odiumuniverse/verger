@@ -10,12 +10,11 @@ import (
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
-// newUpdateCmd builds `verger update`: Ф1 re-applies the spec (no upstream
-// update checks until the source resolver, T3.1).
+// newUpdateCmd builds `verger update`: re-apply the spec.
 func newUpdateCmd(a *app) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "update [id]",
-		Short: "Re-apply spec packages (Ф1: no upstream update checks yet)",
+		Short: "Re-apply spec packages",
 		Args:  usageArgs(cobra.MaximumNArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 1 {
@@ -26,7 +25,7 @@ func newUpdateCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	addDeliverFlags(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
 	return cmd
@@ -64,7 +63,11 @@ func newPinCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	// `pin` edits the spec, not a host's files, and it asks nothing: so it
+	// takes --dry-run alone, with no --force (nobody's copy to overwrite), no
+	// -y (no prompt to skip) and no host filter (a spec entry has no
+	// per-host cells).
+	addDryRunFlag(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
 	return cmd
@@ -81,7 +84,9 @@ func newUnpinCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	// As with `pin`: the spec is the only thing written, nothing asks, and
+	// a spec entry has no per-host cells to filter.
+	addDryRunFlag(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
 	return cmd

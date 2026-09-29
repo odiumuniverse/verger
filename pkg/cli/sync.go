@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -24,7 +26,7 @@ func newSyncCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	addDeliverFlags(cmd, a)
 	cmd.Flags().BoolVar(&locked, "locked", false, "fail when the result would change the lock")
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
@@ -64,6 +66,7 @@ func (a *app) runSync(ctx context.Context, locked bool) error {
 		Check:  locked,
 		Hooks:  verger.LibraryHooksMode(hooksMode),
 		DryRun: a.dryRun,
+		Force:  a.force,
 		Confirm: func() verger.Confirmer {
 			return a.applyOptionsFacade().Confirm
 		}(),
@@ -73,6 +76,13 @@ func (a *app) runSync(ctx context.Context, locked bool) error {
 	// stops here (§1.3).
 	plan, err := client.SyncPlan(ctx, opts)
 	if err != nil {
+		// An absent spec is an empty desired state, not a mistake: there is
+		// nothing to reconcile and the machine already matches it, so the run
+		// succeeds with or without -y.
+		if a.emptyState(err, paths) {
+			return a.renderEmptySync()
+		}
+
 		return a.translatePlanError(err)
 	}
 
@@ -98,4 +108,37 @@ func (a *app) runSync(ctx context.Context, locked bool) error {
 	}
 
 	return a.printReport(*report, homeRoot(client))
+}
+
+// renderEmptySync reports a scope with nothing to reconcile. An empty state
+// is still a result: `--json` gets a document, so a consumer never has to
+// parse prose to learn the run succeeded.
+func (a *app) renderEmptySync() error {
+	if a.jsonOut {
+		return a.printJSON(reportDoc{Schema: schemaOf(schemaReport), Cells: []cellDoc{}})
+	}
+
+	fmt.Fprintln(a.out, "nothing to sync")
+
+	return nil
+}
+
+// emptyState reports whether err means "this scope has no spec at all",
+// which is an empty desired state rather than a mistake. A spec that exists
+// but does not parse is a real error and returns false.
+func (a *app) emptyState(err error, paths verger.Paths) bool {
+	if _, ok := errors.AsType[*verger.UsageError](err); !ok {
+		return false
+	}
+
+	return !specExists(paths.SpecPath)
+}
+
+// specExists reports whether the scope's spec document is present. It
+// separates "no spec yet" (an empty desired state) from "a spec that does
+// not parse" (a real error).
+func specExists(path string) bool {
+	_, err := os.Stat(path)
+
+	return err == nil
 }

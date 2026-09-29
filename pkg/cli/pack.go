@@ -21,16 +21,18 @@ func newPackCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	// `pack` writes into a build directory it names itself; nothing asks.
+	addDryRunFlag(cmd, a)
 
 	return cmd
 }
 
 // packResultDoc is the stable JSON shape of one pack run.
 type packResultDoc struct {
-	Dir     string `json:"dir"`
-	Package string `json:"package"`
-	Version string `json:"version"`
+	Schema  schemaRef `json:"schema"`
+	Dir     string    `json:"dir"`
+	Package string    `json:"package"`
+	Version string    `json:"version"`
 }
 
 // runPack renders one local package into the store synth dir.
@@ -73,7 +75,7 @@ func (a *app) runPack(ctx context.Context, raw string) error {
 		return err
 	}
 
-	doc := packResultDoc{Dir: result.Dir, Package: pkg.ID, Version: pkg.Version}
+	doc := packResultDoc{Schema: schemaOf(schemaPack), Dir: result.Dir, Package: pkg.ID, Version: pkg.Version}
 
 	if a.jsonOut {
 		return a.printJSON(doc)

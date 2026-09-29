@@ -25,7 +25,7 @@ func TestStatusJSONGolden(t *testing.T) {
 				So(err, ShouldBeNil)
 
 				want := fmt.Sprintf(
-					"{\"home\":%q,\"cells\":[{\"package\":\"local:caveman\",\"host\":\"claude\",\"scope\":\"user\",\"status\":\"current\",\"version\":\"1.2.3\",\"strategy\":\"loose\",\"level\":\"stable\"}]}\n",
+					"{\"schema\":{\"name\":\"verger.status\",\"version\":1},\"home\":%q,\"cells\":[{\"package\":\"local:caveman\",\"host\":\"claude\",\"scope\":\"user\",\"status\":\"delivered\",\"detail\":\"current\",\"version\":\"1.2.3\",\"strategy\":\"loose\",\"level\":\"stable\"}]}\n",
 					w.homeDir,
 				)
 				So(stdout, ShouldEqual, want)
@@ -52,7 +52,7 @@ func TestStatusJSONGolden(t *testing.T) {
 		outdated, outdatedErr := w.run("status", "--outdated-only", "--json")
 
 		Convey("When status runs", func() {
-			Convey("Then the lock-only cell is missing and --outdated-only filters", func() {
+			Convey("Then the lock-only cell is skipped and --outdated-only filters", func() {
 				So(err, ShouldBeNil)
 				So(all, ShouldContainSubstring, `"package":"local:caveman"`)
 				So(all, ShouldContainSubstring, `"package":"ghost"`)
@@ -60,7 +60,7 @@ func TestStatusJSONGolden(t *testing.T) {
 				So(outdatedErr, ShouldBeNil)
 				So(outdated, ShouldNotContainSubstring, `"package":"local:caveman"`)
 				So(outdated, ShouldContainSubstring, `"package":"ghost"`)
-				So(outdated, ShouldContainSubstring, `"status":"missing"`)
+				So(outdated, ShouldContainSubstring, `"status":"skipped"`)
 			})
 		})
 	})
@@ -83,6 +83,7 @@ func TestWhyJSON(t *testing.T) {
 					Package  string   `json:"package"`
 					Host     string   `json:"host"`
 					Status   string   `json:"status"`
+					Detail   string   `json:"detail"`
 					Version  string   `json:"version"`
 					Strategy string   `json:"strategy"`
 					Reasons  []string `json:"reasons"`
@@ -92,7 +93,10 @@ func TestWhyJSON(t *testing.T) {
 				So(json.Unmarshal([]byte(stdout), &doc), ShouldBeNil)
 				So(doc.Package, ShouldEqual, "local:caveman")
 				So(doc.Host, ShouldEqual, "claude")
-				So(doc.Status, ShouldEqual, "current")
+				// `why` speaks the same vocabulary as `status` and `report`,
+				// with the exact internal code beside it.
+				So(doc.Status, ShouldEqual, "delivered")
+				So(doc.Detail, ShouldEqual, "current")
 				So(doc.Version, ShouldEqual, "1.2.3")
 				So(doc.Strategy, ShouldEqual, "loose")
 				So(doc.Reasons, ShouldNotBeEmpty)
@@ -110,7 +114,10 @@ func TestWhyJSON(t *testing.T) {
 		Convey("When why runs", func() {
 			Convey("Then it reports the missing cell without failing the run", func() {
 				So(err, ShouldBeNil)
-				So(stdout, ShouldContainSubstring, `"status":"missing"`)
+				// A cell with no receipt reads as `skipped`; `detail` is what
+				// says it is `missing` rather than `skew`.
+				So(stdout, ShouldContainSubstring, `"status":"skipped"`)
+				So(stdout, ShouldContainSubstring, `"detail":"missing"`)
 			})
 		})
 	})
@@ -126,20 +133,20 @@ func TestDoctorJSON(t *testing.T) {
 			Convey("Then it reports checks and stays read-only", func() {
 				So(err, ShouldBeNil)
 
-				var checks []struct {
-					Severity string `json:"severity"`
-					Check    string `json:"check"`
-					Message  string `json:"message"`
-				}
+				var doc doctorDoc
 
-				So(json.Unmarshal([]byte(stdout), &checks), ShouldBeNil)
-				So(checks, ShouldNotBeEmpty)
+				So(json.Unmarshal([]byte(stdout), &doc), ShouldBeNil)
+				So(doc.Schema.Name, ShouldEqual, "verger.doctor")
+				So(doc.Schema.Version, ShouldEqual, 1)
+				So(doc.Findings, ShouldNotBeEmpty)
+
+				checks := doc.Findings
 
 				names := map[string]bool{}
 
 				for _, check := range checks {
-					names[check.Check] = true
-					So(check.Severity, ShouldBeIn, []string{"ok", "warning", "error"})
+					names[check.Subject] = true
+					So(check.Severity, ShouldBeIn, []string{"info", "warning", "error"})
 				}
 
 				So(names, ShouldContainKey, "home")

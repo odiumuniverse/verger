@@ -26,14 +26,15 @@ func newLintCmd(a *app) *cobra.Command {
 
 // lintDoc is the stable JSON shape of one lint run.
 type lintDoc struct {
-	Root       string   `json:"root"`
-	Package    string   `json:"package,omitempty"`
-	Version    string   `json:"version,omitempty"`
-	Formats    []string `json:"formats"`
-	Components int      `json:"components"`
-	MCP        int      `json:"mcp"`
-	Hooks      int      `json:"hooks"`
-	Warnings   []string `json:"warnings,omitempty"`
+	Schema     schemaRef `json:"schema"`
+	Root       string    `json:"root"`
+	Package    string    `json:"package,omitempty"`
+	Version    string    `json:"version,omitempty"`
+	Formats    []string  `json:"formats"`
+	Components int       `json:"components"`
+	MCP        int       `json:"mcp"`
+	Hooks      int       `json:"hooks"`
+	Warnings   []string  `json:"warnings,omitempty"`
 }
 
 // runLint parses one local payload and reports its shape.
@@ -69,6 +70,7 @@ func (a *app) runLint(raw string) error {
 	}
 
 	doc := lintDoc{
+		Schema:     schemaOf(schemaLint),
 		Root:       ref.Path,
 		Package:    idString(pkg),
 		Version:    pkg.Version,

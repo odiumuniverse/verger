@@ -11,8 +11,9 @@ import (
 
 // statusDoc is the stable JSON document of `verger status`.
 type statusDoc struct {
-	Home  string    `json:"home"`
-	Cells []cellDoc `json:"cells"`
+	Schema schemaRef `json:"schema"`
+	Home   string    `json:"home"`
+	Cells  []cellDoc `json:"cells"`
 }
 
 // newStatusCmd builds `verger status`.
@@ -61,15 +62,55 @@ func (a *app) runStatus(ctx context.Context, outdatedOnly bool) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-10s %-10s %s\n",
-		"PACKAGE", "HOST", "LEVEL", "SCOPE", "STATUS", "STRATEGY", "VERSION")
+	notes := newFootnotes()
+
+	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-12s %s\n",
+		"PACKAGE", "HOST", "LEVEL", "SCOPE", "STATUS", "DETAIL")
 
 	for _, cell := range doc.Cells {
-		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-10s %-10s %s\n",
-			cell.Package, cell.Host, cell.Level, cell.Scope, cell.Status, cell.Strategy, cell.Version)
+		st := humanState(cell.Status, cell.Detail)
+		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-12s %-8s %-12s %s%s\n",
+			cell.Package, cell.Host, cell.Level, cell.Scope, st.word, strategyPhrase(cell.Strategy), notes.mark(cell.Status, cell.Detail))
+	}
+
+	notes.write(a.out)
+
+	// Per-host switches (U2): show runtime and other host-level toggles.
+	if switches := a.hostSwitches(client, paths); len(switches) > 0 {
+		fmt.Fprintln(a.out, "\nper-host switches")
+		_, _ = fmt.Fprintf(a.out, "%-8s %-12s %s\n", "HOST", "SWITCH", "VALUE")
+
+		for _, sw := range switches {
+			_, _ = fmt.Fprintf(a.out, "%-8s %-12s %v\n", sw.Host, sw.Switch, sw.Value)
+		}
 	}
 
 	return nil
+}
+
+// hostSwitch is one per-host feature toggle shown in `verger status`.
+type hostSwitch struct {
+	Host   string
+	Switch string
+	Value  bool
+}
+
+// hostSwitches reads the per-host switches from the spec.
+func (a *app) hostSwitches(client *verger.Client, paths verger.Paths) []hostSwitch {
+	doc, ok, err := loadSpec(paths.SpecPath)
+	if err != nil || !ok {
+		return nil
+	}
+
+	var switches []hostSwitch
+
+	for id, host := range doc.Hosts {
+		if host.Runtime != nil {
+			switches = append(switches, hostSwitch{Host: id, Switch: "runtime", Value: *host.Runtime})
+		}
+	}
+
+	return switches
 }
 
 // statusCells merges receipts and lock cells into the stable matrix through the
@@ -81,12 +122,15 @@ func (a *app) statusCells(client *verger.Client, ctx context.Context, paths verg
 		return statusDoc{}, err
 	}
 
-	return statusDoc{Home: doc.Home, Cells: cliCells(doc.Cells)}, nil
+	return statusDoc{Schema: schemaOf(schemaStatus), Home: doc.Home, Cells: cliCells(doc.Cells)}, nil
 }
 
 // Cell status and severity values reused by the CLI documents.
 const (
-	severityOK      = "ok"
+	// The severity vocabulary is `info | warning | error` (W7-UX-SPEC §3.2).
+	// `ok` is gone: a check that passes is not a finding, it is the absence of
+	// one. This matches what the sibling tool emits, so one parser reads both.
+	severityInfo    = "info"
 	severityWarning = "warning"
 	severityError   = "error"
 )

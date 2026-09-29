@@ -70,7 +70,7 @@ func (a *app) hosts(client *verger.Client) []host.Host {
 	return client.Hosts()
 }
 
-// loadLock reads a lock document; a missing file is an empty lock.
+// loadLock delegates to the facade: the facade resolves lock documents.
 func loadLock(path string) (*lock.Lock, error) {
 	return verger.LoadLock(path)
 }
@@ -180,19 +180,16 @@ func saveSpec(path string, doc *spec.Spec) error {
 	return verger.SaveSpec(path, doc)
 }
 
-// sourceName derives a stable source name from one ref.
-// sourceName derives a stable source name from one ref. delegates to the facade (DESIGN §9.1): the logic now lives in
-// pkg/verger so a second front end gets the same answer.
+// sourceName delegates to the facade: the facade derives source names.
 func sourceName(ref source.Ref) string {
 	return verger.SourceName(ref)
 }
 
-// addSpecSource records one fetched ref as a spec source; an existing source
-// with the same URL is kept as-is.
-// addSpecSource records one fetched ref as a spec source. delegates to the facade (DESIGN §9.1): the logic now lives in
-// pkg/verger so a second front end gets the same answer.
-func addSpecSource(doc *spec.Spec, ref source.Ref) bool {
-	return verger.AddSpecSource(doc, ref)
+// addSpecSourceAt records one fetched ref, storing a local path relative to
+// the spec's own directory when it lives under it, so a vault cloned to
+// another machine still resolves its sources.
+func addSpecSourceAt(doc *spec.Spec, ref source.Ref, specDir string) bool {
+	return verger.AddSpecSourceAt(doc, ref, specDir)
 }
 
 // removeSpecSource drops every source with the name.
@@ -202,30 +199,10 @@ func removeSpecSource(doc *spec.Spec, name string) int {
 	return verger.RemoveSpecSource(doc, name)
 }
 
-// buildHostPackage converts one fetched payload into one host delivery
-// package.
+// buildHostPackage delegates to the facade: a payload a front end fetches
+// itself resolves into the same host.Package the library resolves.
 func buildHostPackage(client *verger.Client, fetched *source.Fetched, id host.ID, version, scope, projectRoot string) (host.Package, error) {
-	meta := fetched.Package
-
-	dataDir, err := client.Store().PackageDataPath(idString(meta), string(id))
-	if err != nil {
-		return host.Package{}, err
-	}
-
-	pkg := host.Package{
-		ID:          idString(meta),
-		Version:     firstNonEmpty(version, meta.Version),
-		Format:      meta.Format,
-		Root:        fetched.Root,
-		Components:  meta.Components,
-		MCP:         meta.MCP,
-		Hooks:       meta.Hooks,
-		Scope:       scope,
-		ProjectRoot: projectRoot,
-		DataDir:     dataDir,
-	}
-
-	return pkg, nil
+	return verger.BuildHostPackage(client, fetched, id, version, scope, projectRoot)
 }
 
 // idString renders the canonical id of one parsed manifest package.
@@ -237,29 +214,10 @@ func idString(meta *manifest.Package) string {
 	return meta.Name
 }
 
-// firstNonEmpty returns the first non-empty value.
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-
-	return ""
-}
-
-// packInput builds the chimera input of one host package.
+// packInput delegates to the facade: a caller that previews a synth strategy
+// renders exactly what the library would.
 func packInput(pkg host.Package, root string) (pack.Input, error) {
-	owner, name := splitID(pkg.ID)
-	if owner == "" || name == "" {
-		return pack.Input{}, errors.New("the package id needs owner/name")
-	}
-
-	return pack.Input{
-		ID: pkg.ID, Name: name, Owner: owner, Version: pkg.Version,
-		Description: "", License: "", Format: pkg.Format,
-		Root: root, Components: pkg.Components, MCP: pkg.MCP, Hooks: pkg.Hooks,
-	}, nil
+	return verger.PackInput(pkg, root)
 }
 
 // splitID splits one owner/name id.
@@ -273,7 +231,45 @@ func splitID(id string) (string, string) {
 
 // secretsStore returns the facade secrets store.
 func (a *app) secretsStore(client *verger.Client) *secret.Store {
-	return client.Secrets()
+	store, ok := client.Secrets().(*secret.Store)
+	if !ok {
+		return nil
+	}
+
+	return store
+}
+
+// schemaRef names a document and its version. Every `--json` document carries
+// one as its first field (W7-UX-SPEC §2.1), so a consumer can tell what it is
+// reading instead of inferring it from the shape.
+//
+// Within a major the promise is additive: a field may be added and a new
+// optional enum value may appear, but nothing is removed, renamed or
+// retyped, and a consumer must ignore fields it does not know.
+type schemaRef struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+}
+
+// The document names, one per `--json` surface. They are tool-scoped, because
+// a status matrix and a lint report are different documents.
+const (
+	schemaStatus    = "verger.status"
+	schemaReport    = "verger.report"
+	schemaPlan      = "verger.plan"
+	schemaWhy       = "verger.why"
+	schemaDoctor    = "verger.doctor"
+	schemaLint      = "verger.lint"
+	schemaPack      = "verger.pack"
+	schemaPropagate = "verger.propagate"
+	schemaSource    = "verger.source"
+	schemaRemove    = "verger.remove"
+	schemaSecret    = "verger.secret"
+)
+
+// schemaOf builds the first field of one document.
+func schemaOf(name string) schemaRef {
+	return schemaRef{Name: name, Version: 1}
 }
 
 // printJSON writes one compact JSON document with a trailing newline.
@@ -289,16 +285,31 @@ func (a *app) printJSON(value any) error {
 }
 
 // cellDoc is the stable JSON shape of one applied cell.
+//
+// `Status` is the user-facing word (W7-UX-SPEC §1.1) and `Detail` keeps the
+// exact internal code, because the two are not one-to-one: `missing` and
+// `skew` are both `skipped` to a user, and a consumer that has to tell them
+// apart must not have to parse a footnote to do it. `removed` is an outcome
+// rather than a state, so it keeps its own detail instead of collapsing
+// into `delivered`.
 type cellDoc struct {
 	Package  string   `json:"package"`
 	Host     string   `json:"host"`
 	Scope    string   `json:"scope"`
 	Status   string   `json:"status"`
+	Detail   string   `json:"detail,omitempty"`
 	Version  string   `json:"version,omitempty"`
 	Strategy string   `json:"strategy,omitempty"`
 	Level    string   `json:"level,omitempty"` // host maturity (DESIGN §10.3): experimental|beta|stable
 	Kind     string   `json:"kind,omitempty"`
 	Notes    []string `json:"notes,omitempty"`
+	// Backup is where a forced run kept the user's own copy before
+	// overwriting it. It is reported rather than printed inline because it
+	// is the one path a user needs after the fact and cannot guess.
+	Backup string `json:"backup,omitempty"`
+	// Restored says the cell came from the lock, not from work on this
+	// machine, so its status is `restored` rather than `delivered`.
+	Restored bool `json:"restored,omitempty"`
 }
 
 // cliCells converts facade cells into the CLI's own document cells, so the
@@ -307,9 +318,11 @@ func cliCells(cells []verger.Cell) []cellDoc {
 	out := make([]cellDoc, 0, len(cells))
 
 	for _, cell := range cells {
+		word, detail := cellState(cell.Status, cell.Notes)
 		out = append(out, cellDoc{
 			Package: cell.Package, Host: cell.Host, Scope: cell.Scope,
-			Status: cell.Status, Version: cell.Version, Strategy: cell.Strategy,
+			Status: word, Detail: detail,
+			Version: cell.Version, Strategy: cell.Strategy,
 			Level: cell.Level, Kind: cell.Kind, Notes: cell.Notes,
 		})
 	}
@@ -317,23 +330,32 @@ func cliCells(cells []verger.Cell) []cellDoc {
 	return out
 }
 
-// reportDoc is the stable JSON shape of one executed plan.
+// reportDoc is the `verger plan` / `verger install` / `verger sync` /
+// `verger remove` document. The envelope names it; the cells keep the
+// internal vocabulary, because `--json` does not translate (W7-UX-SPEC §1.1
+// gives the words to humans, §2.2 defers changing what JSON emits).
 type reportDoc struct {
-	Cells []cellDoc `json:"cells"`
-	Notes []string  `json:"notes,omitempty"`
-	Home  string    `json:"home,omitempty"`
+	Schema schemaRef `json:"schema"`
+	Cells  []cellDoc `json:"cells"`
+	Notes  []string  `json:"notes,omitempty"`
+	Home   string    `json:"home,omitempty"`
 }
 
 // reportDocFrom converts one apply report.
 func reportDocFrom(report apply.Report) reportDoc {
-	doc := reportDoc{Notes: report.Notes}
+	doc := reportDoc{Schema: schemaOf(schemaReport), Notes: report.Notes}
 
 	for _, cell := range report.Cells {
+		word, detail := cellState(string(cell.Status), cell.Notes)
+		if cell.Restored {
+			word, detail = wordRestored, "restored from lock"
+		}
+
 		doc.Cells = append(doc.Cells, cellDoc{
 			Package: cell.Package, Host: string(cell.Host), Scope: cell.Scope,
-			Status: string(cell.Status), Version: cell.Version,
+			Status: word, Detail: detail, Version: cell.Version,
 			Strategy: string(cell.Strategy), Kind: string(cell.Kind),
-			Notes: cell.Notes,
+			Notes: cell.Notes, Backup: cell.Backup, Restored: cell.Restored,
 		})
 	}
 
@@ -354,7 +376,18 @@ func (a *app) printReport(report apply.Report, homePath string) error {
 	return failedCells(report)
 }
 
-// failedCells collects the failed and skewed cells of one report.
+// failedCells turns a finished report into the run's verdict.
+//
+// A `skipped` cell is not a failure: the delivery ran and wrote nothing on
+// purpose, because the package had nothing for that host or all of it was
+// already there. It prints as `skipped` with its reason and the run exits 0.
+//
+// The one exception is a package that produced no file anywhere. If every cell
+// for a package is `skipped`, the ref resolved to something verger had nothing
+// to install, and reporting success would be a lie the user cannot see
+// through — nothing is on disk and the exit says it worked. That is reported
+// as a usage error (exit 2): the invocation named a package, and what it
+// named was empty.
 func failedCells(report apply.Report) error {
 	var failed []string
 
@@ -364,11 +397,43 @@ func failedCells(report apply.Report) error {
 		}
 	}
 
-	if len(failed) == 0 {
+	if len(failed) != 0 {
+		return &ApplyFailedError{Cells: failed}
+	}
+
+	return emptyPackages(report)
+}
+
+// emptyPackages reports the packages whose every cell was skipped, which means
+// the delivery wrote nothing for them on any host.
+func emptyPackages(report apply.Report) error {
+	total := map[string]int{}
+	skipped := map[string]int{}
+
+	for _, cell := range report.Cells {
+		total[cell.Package]++
+		if cell.Status == apply.StatusSkipped {
+			skipped[cell.Package]++
+		}
+	}
+
+	empty := make([]string, 0, len(total))
+
+	for pkg, count := range total {
+		if skipped[pkg] == count {
+			empty = append(empty, pkg)
+		}
+	}
+
+	if len(empty) == 0 {
 		return nil
 	}
 
-	return &ApplyFailedError{Cells: failed}
+	slices.Sort(empty)
+
+	return &UsageError{Cause: fmt.Errorf(
+		"produced no files for any host: %s; the package is empty, or has nothing for this machine",
+		strings.Join(empty, ", "))}
 }
 
 // renderReport writes one apply report as JSON or a table.
@@ -386,16 +451,32 @@ func (a *app) renderReport(report apply.Report, homePath string) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %-10s %s\n", "PACKAGE", "HOST", "SCOPE", "STATUS", "STRATEGY", "VERSION")
+	notes := newFootnotes()
+
+	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-12s %s\n", "PACKAGE", "HOST", "SCOPE", "STATUS", "DETAIL")
 
 	for _, cell := range report.Cells {
-		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %-10s %s\n",
-			cell.Package, cell.Host, cell.Scope, cell.Status, cell.Strategy, cell.Version)
+		word, detail := cellState(string(cell.Status), cell.Notes)
+		if cell.Restored {
+			word, detail = wordRestored, "restored from lock"
+		}
+
+		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-12s %s%s\n",
+			cell.Package, cell.Host, cell.Scope, word, strategyPhrase(string(cell.Strategy)), notes.mark(word, detail))
 
 		for _, note := range cell.Notes {
 			_, _ = fmt.Fprintf(a.out, "  %s\n", note)
 		}
+
+		// A forced run overwrote someone's file. The backup path is the one
+		// thing they cannot reconstruct afterwards, so it goes on screen
+		// where the cell is, not into a footnote.
+		if cell.Backup != "" {
+			_, _ = fmt.Fprintf(a.out, "  your previous version is kept at %s\n", cell.Backup)
+		}
 	}
+
+	notes.write(a.out)
 
 	for _, note := range report.Notes {
 		_, _ = fmt.Fprintf(a.out, "note: %s\n", note)
@@ -416,11 +497,11 @@ func (a *app) printPlan(cells []cellDoc) error {
 		return err
 	}
 
-	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %s\n", "PACKAGE", "HOST", "SCOPE", "STRATEGY", "VERSION")
+	_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-24s %s\n", "PACKAGE", "HOST", "SCOPE", "WILL BE", "VERSION")
 
 	for _, cell := range cells {
-		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-10s %s\n",
-			cell.Package, cell.Host, cell.Scope, cell.Strategy, cell.Version)
+		_, _ = fmt.Fprintf(a.out, "%-24s %-8s %-8s %-24s %s\n",
+			cell.Package, cell.Host, cell.Scope, strategyPhrase(cell.Strategy), cell.Version)
 	}
 
 	return nil
@@ -450,7 +531,7 @@ func marshalJSON(value any) ([]byte, error) {
 // command goes through it, so `-y` and the TTY prompt mean the same thing to
 // the library as they do to the CLI.
 func (a *app) applyOptionsFacade() verger.ApplyOptions {
-	opts := verger.ApplyOptions{DryRun: a.dryRun, Now: a.now}
+	opts := verger.ApplyOptions{DryRun: a.dryRun, Now: a.now, Force: a.force}
 
 	if a.yes {
 		// -y accepts defaults and never resolves a destructive conflict

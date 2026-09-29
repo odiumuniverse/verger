@@ -30,7 +30,7 @@ func newAdoptCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	addDeliverFlags(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 
 	return cmd

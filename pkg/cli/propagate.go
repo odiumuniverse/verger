@@ -47,7 +47,8 @@ func newPropagateCmd(a *app) *cobra.Command {
 
 	setCmd.Flags().StringVar(&kind, "kind", "", "scope the rule to one component kind")
 	setCmd.Flags().StringVar(&hostID, "host", "", "scope the rule to one host")
-	addWriteFlags(setCmd, a)
+	// A propagation rule is written as given; nothing asks first.
+	addDryRunFlag(setCmd, a)
 
 	showCmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
 	setCmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
@@ -59,9 +60,10 @@ func newPropagateCmd(a *app) *cobra.Command {
 
 // propagateDoc is the stable JSON shape of the policy.
 type propagateDoc struct {
-	Rules map[string]string            `json:"rules"`
-	Kind  map[string]map[string]string `json:"kind,omitempty"`
-	Host  map[string]map[string]string `json:"host,omitempty"`
+	Schema schemaRef                    `json:"schema"`
+	Rules  map[string]string            `json:"rules"`
+	Kind   map[string]map[string]string `json:"kind,omitempty"`
+	Host   map[string]map[string]string `json:"host,omitempty"`
 }
 
 // propagationEvents lists every §5.7 event in the display order.
@@ -101,9 +103,10 @@ func (a *app) runPropagateShow(ctx context.Context) error {
 	}
 
 	out := propagateDoc{
-		Rules: policyModes(doc.Propagate),
-		Kind:  map[string]map[string]string{},
-		Host:  map[string]map[string]string{},
+		Schema: schemaOf(schemaPropagate),
+		Rules:  policyModes(doc.Propagate),
+		Kind:   map[string]map[string]string{},
+		Host:   map[string]map[string]string{},
 	}
 
 	for _, event := range propagationEvents {

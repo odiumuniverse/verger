@@ -21,7 +21,9 @@ func newApproveCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	// `approve` asks nothing, so there is no -y to skip: it records the hash
+	// the user just named. --dry-run is the only preview it has.
+	addDryRunFlag(cmd, a)
 
 	return cmd
 }
@@ -37,7 +39,8 @@ func newRevokeCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	// As with `approve`, there is no prompt to skip.
+	addDryRunFlag(cmd, a)
 
 	return cmd
 }

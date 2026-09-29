@@ -11,10 +11,40 @@ import (
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
-// addWriteFlags registers -y/--dry-run on one write command.
+// addWriteFlags registers -y/--dry-run on one write command. Every verb that
+// can change a machine gets these two and nothing else.
 func addWriteFlags(cmd *cobra.Command, a *app) {
 	cmd.Flags().BoolVarP(&a.yes, "yes", "y", false, "accept defaults; never resolve destructive conflicts")
 	cmd.Flags().BoolVar(&a.dryRun, "dry-run", false, "plan without writing")
+}
+
+// addDryRunFlag registers --dry-run alone, for the verbs that write a
+// record but never ask anything. There is no confirmation in
+// `approve`/`revoke`/`pin` to skip, so offering -y there would promise a
+// prompt that does not exist.
+func addDryRunFlag(cmd *cobra.Command, a *app) {
+	cmd.Flags().BoolVar(&a.dryRun, "dry-run", false, "plan without writing")
+}
+
+// addForceFlag registers --force on the verbs that can actually overwrite a
+// file a person edited: install, remove, adopt, sync and update. It is a
+// separate helper on purpose. A flag that is accepted and then ignored is
+// worse than a missing flag — the reader concludes the overwrite was
+// authorised when nothing was overwritten.
+func addForceFlag(cmd *cobra.Command, a *app) {
+	// The help says what it costs: the old file is kept, and the report
+	// names where. It is deliberately not part of -y, which must never
+	// resolve a destructive conflict (rule 14).
+	cmd.Flags().BoolVar(&a.force, "force", false, "overwrite files you edited; the previous version is kept and reported")
+}
+
+// addDeliverFlags is the set every verb that delivers packages gets: the
+// write flags, the force flag, and the host filter.
+func addDeliverFlags(cmd *cobra.Command, a *app) {
+	addWriteFlags(cmd, a)
+	addForceFlag(cmd, a)
+	cmd.Flags().StringSliceVar(&a.hostsFlag, "hosts", nil, "only these hosts (comma separated)")
+	cmd.Flags().StringSliceVar(&a.exceptFlag, "except", nil, "exclude these hosts")
 }
 
 // newInstallCmd builds `verger install`.
@@ -28,10 +58,8 @@ func newInstallCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(cmd, a)
+	addDeliverFlags(cmd, a)
 
-	cmd.Flags().StringSliceVar(&a.hostsFlag, "hosts", nil, "only these hosts (comma separated)")
-	cmd.Flags().StringSliceVar(&a.exceptFlag, "except", nil, "exclude these hosts")
 	cmd.Flags().StringVar(&a.hooksFlag, "hooks", "", "hooks decision: ask|yes|no")
 	cmd.Flags().StringVar(&a.pinFlag, "pin", "", "pin the version")
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")

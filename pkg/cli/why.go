@@ -9,10 +9,16 @@ import (
 
 // whyDoc is the stable JSON document of `verger why`.
 type whyDoc struct {
-	Package  string   `json:"package"`
-	Host     string   `json:"host"`
-	Scope    string   `json:"scope"`
+	Schema  schemaRef `json:"schema"`
+	Package string    `json:"package"`
+	Host    string    `json:"host"`
+	Scope   string    `json:"scope"`
+	// Status is the user-facing word and Detail the exact internal code, the
+	// same pair every other document carries: `why` exists to explain a
+	// cell, and a cell explained in a vocabulary nothing else uses is not an
+	// explanation a reader can match up with `status`.
 	Status   string   `json:"status"`
+	Detail   string   `json:"detail,omitempty"`
 	Version  string   `json:"version,omitempty"`
 	Strategy string   `json:"strategy,omitempty"`
 	Reasons  []string `json:"reasons"`
@@ -53,9 +59,13 @@ func (a *app) runWhy(ctx context.Context, id, hostID string) error {
 		return err
 	}
 
+	word, detail := cellState(explained.Status, explained.Blockers)
+
 	return a.printWhy(whyDoc{
+		Schema:  schemaOf(schemaWhy),
 		Package: explained.Package, Host: explained.Host, Scope: explained.Scope,
-		Status: explained.Status, Version: explained.Version, Strategy: explained.Strategy,
+		Status: word, Detail: detail,
+		Version: explained.Version, Strategy: explained.Strategy,
 		Reasons: explained.Reasons, Blockers: explained.Blockers,
 	})
 }

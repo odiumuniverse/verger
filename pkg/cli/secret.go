@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/odiumuniverse/verger/pkg/secret"
 	"github.com/spf13/cobra"
 )
 
@@ -67,10 +68,35 @@ func newSecretCmd(a *app) *cobra.Command {
 		},
 	}
 
-	addWriteFlags(setCmd, a)
-	addWriteFlags(rmCmd, a)
+	backendCmd := &cobra.Command{
+		Use:   "backend [file|keyring|auto]",
+		Short: "Show the storage backend, or switch to the named one",
+		Long: "With no argument, prints the backend in use and whether a keychain\n" +
+			"is available here.\n\n" +
+			"file    keeps values in a document under the verger home\n" +
+			"keyring keeps them in the platform keychain\n" +
+			"auto    uses the keyring when one is available, and file otherwise\n\n" +
+			"Switching carries every value across; no value is printed and none is\n" +
+			"dropped. On a machine with no keychain — a headless Linux box, a\n" +
+			"container, CI — use `verger secret backend file`.",
+		Args: usageArgs(cobra.MaximumNArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			want := ""
+			if len(args) == 1 {
+				want = args[0]
+			}
 
-	cmd.AddCommand(setCmd, rmCmd, listCmd)
+			return a.runSecretBackend(cmd.Context(), want)
+		},
+	}
+
+	// A keychain read is not a question, and `secret set` reads its value
+	// from stdin: -y would have nothing to skip.
+	addDryRunFlag(setCmd, a)
+	addDryRunFlag(rmCmd, a)
+	addDryRunFlag(backendCmd, a)
+
+	cmd.AddCommand(setCmd, rmCmd, listCmd, backendCmd)
 
 	return cmd
 }
@@ -153,6 +179,12 @@ func (a *app) runSecretRm(ctx context.Context, name string) error {
 }
 
 // runSecretList prints the stored names only.
+// secretListDoc is the `verger secret list --json` document.
+type secretListDoc struct {
+	Schema schemaRef `json:"schema"`
+	Names  []string  `json:"names"`
+}
+
 func (a *app) runSecretList(ctx context.Context) error {
 	client, err := a.open(ctx)
 	if err != nil {
@@ -162,9 +194,14 @@ func (a *app) runSecretList(ctx context.Context) error {
 	names := a.secretsStore(client).Names()
 
 	if a.jsonOut {
-		return a.printJSON(struct {
-			Names []string `json:"names"`
-		}{Names: names})
+		// An empty list is `[]`, never `null`: a consumer iterating the
+		// names should not have to null-check, and the rest of the CLI
+		// already emits empty slices.
+		if names == nil {
+			names = []string{}
+		}
+
+		return a.printJSON(secretListDoc{Schema: schemaOf(schemaSecret), Names: names})
 	}
 
 	for _, name := range names {
@@ -174,4 +211,132 @@ func (a *app) runSecretList(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// secretBackendDoc is the `verger secret backend --json` document.
+type secretBackendDoc struct {
+	Schema      schemaRef `json:"schema"`
+	Backend     string    `json:"backend"`
+	Changed     bool      `json:"changed,omitempty"`
+	Requested   string    `json:"requested,omitempty"`
+	Keyring     bool      `json:"keyring_available"`
+	Unavailable string    `json:"keyring_unavailable,omitempty"`
+	Names       []string  `json:"names"`
+}
+
+// runSecretBackend prints the backend in use and whether a keychain is
+// available, or switches to the named one.
+//
+// Two rules shape it. The availability question is answered by the probe, not
+// by opening a keychain: on macOS an isolated HOME makes the keychain look
+// missing and the OS answers with a modal "Reset To Defaults", so anything
+// that asks the keychain a question can put a dialog on a stranger's screen.
+// +// And a switch to `keyring` on a machine with no keychain returns pR's typed
+// error unwrapped, so it classifies as exit 6 with the fix command already in
+// the message.
+func (a *app) runSecretBackend(ctx context.Context, want string) error {
+	client, err := a.open(ctx)
+	if err != nil {
+		return err
+	}
+
+	store := a.secretsStore(client)
+	current := store.Backend()
+	available, reason := a.keyringProbe.Available()
+
+	// The names travel with the answer: a switch re-uploads every value, and a
+	// user who cannot see what will be carried across will not press the key.
+	names := store.Names()
+	if names == nil {
+		names = []string{}
+	}
+
+	if want == "" {
+		return a.printBackend(current, "", false, available, reason, names)
+	}
+
+	// Resolve before touching the store: `auto` is decided by the probe, and an
+	// explicit `keyring` on a machine without one is refused here rather than
+	// half-applied and written to later.
+	req := secret.BackendRequest{
+		Want:    want,
+		Dir:     client.Home().StateDir(),
+		Service: secret.DefaultService,
+		Probe:   a.keyringProbe,
+		Shell:   a.buildKeyring,
+	}
+
+	_, resolved, err := secret.SelectBackend(req)
+	if err != nil {
+		// Two different failures, kept apart on purpose. An unknown name is a
+		// bad argument: the user typed something verger does not have, and
+		// that is exit 2. A keyring that is not there is a fact about the
+		// machine, and pR's typed error classifies as exit 6 with the fix
+		// command already in its message — wrapping it would turn a missing
+		// keychain into a usage error and hide both the class and the way out.
+		if _, unknown := errors.AsType[*secret.UnknownBackendError](err); unknown {
+			return &UsageError{Cause: err}
+		}
+
+		return err
+	}
+
+	// A dry run and a no-op switch both stop here: the answer is the same, and
+	// neither should move a value.
+	if a.dryRun {
+		return a.printBackend(resolved, want, resolved != current, available, reason, names)
+	}
+
+	if resolved == current {
+		return a.printBackend(resolved, want, false, available, reason, names)
+	}
+
+	if err := store.SetBackend(resolved); err != nil {
+		return err
+	}
+
+	if err := client.Home().Ensure(); err != nil {
+		return err
+	}
+
+	if err := store.Save(); err != nil {
+		return err
+	}
+
+	return a.printBackend(resolved, want, true, available, reason, names)
+}
+
+// printBackend renders one backend answer as JSON or as two lines of prose.
+func (a *app) printBackend(backend, requested string, changed, available bool, reason string, names []string) error {
+	if a.jsonOut {
+		return a.printJSON(secretBackendDoc{
+			Schema: schemaOf(schemaSecret), Backend: backend, Changed: changed,
+			Requested: requested, Keyring: available, Unavailable: reason, Names: names,
+		})
+	}
+
+	switch {
+	case requested == "":
+		if _, err := fmt.Fprintf(a.out, "%s\n", backend); err != nil {
+			return err
+		}
+	case !changed:
+		if _, err := fmt.Fprintf(a.out, "secrets backend: already %s\n", backend); err != nil {
+			return err
+		}
+	default:
+		if _, err := fmt.Fprintf(a.out, "secrets backend: %s (%d carried over)\n", backend, len(names)); err != nil {
+			return err
+		}
+	}
+
+	if available {
+		_, err := fmt.Fprintln(a.out, "a keychain is available on this machine")
+
+		return err
+	}
+
+	_, err := fmt.Fprintf(a.out, "no keychain here (%s); values are kept in the file backend\n", reason)
+
+	return err
 }

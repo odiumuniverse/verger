@@ -69,7 +69,7 @@ func TestInstallAppliesWithYes(t *testing.T) {
 				So(doc.Cells[0].Package, ShouldEqual, "local:caveman")
 				So(doc.Cells[0].Host, ShouldEqual, "claude")
 				So(doc.Cells[0].Scope, ShouldEqual, "user")
-				So(doc.Cells[0].Status, ShouldEqual, "current")
+				So(doc.Cells[0].Status, ShouldEqual, "delivered")
 				So(doc.Cells[0].Version, ShouldEqual, "1.2.3")
 				So(doc.Cells[0].Strategy, ShouldEqual, "loose")
 				So(doc.Cells[0].Kind, ShouldEqual, "install")
@@ -195,7 +195,7 @@ func TestInstallHooksModesAndDryRun(t *testing.T) {
 			Convey("Then nothing is written and the plan is reported", func() {
 				So(err, ShouldBeNil)
 				So(snapshot(t, w.root), ShouldResemble, before)
-				So(stdout, ShouldContainSubstring, `"status":"current"`)
+				So(stdout, ShouldContainSubstring, `"status":"delivered"`)
 			})
 		})
 	})
@@ -333,7 +333,7 @@ func TestRemoveAndRestore(t *testing.T) {
 			Convey("Then the artifact is trashed and a tombstone written", func() {
 				So(err, ShouldBeNil)
 				So(fileExists(target), ShouldBeFalse)
-				So(stdout, ShouldContainSubstring, `"status":"current"`)
+				So(stdout, ShouldContainSubstring, `"status":"delivered"`)
 
 				receipts := receipt.NewStore(filepath.Join(w.homeDir, "state", "receipts"))
 				_, ok, getErr := receipts.Get("local:caveman", "claude", receipt.ScopeUser)
@@ -396,7 +396,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 		w.mustRun(t, "install", w.fixture(t), "-y")
 		w.mustRun(t, "remove", "caveman", "-y")
 
-		stdout, err := w.run("restore", "caveman", "--json")
+		stdout, err := w.run("restore", "caveman", "-y", "--json")
 
 		Convey("When restore runs", func() {
 			Convey("Then the artifact is back from the trash", func() {
@@ -414,7 +414,11 @@ func TestSyncReconcilesSpec(t *testing.T) {
 		w.chdir(t, w.root)
 
 		target := w.target(t, "SKILL.md", "# installed\n")
-		w.fixtureIn(t, w.root)
+		// The spec and the package it points at belong together: a relative
+		// source resolves against the spec's own directory, so a fixture
+		// parked elsewhere only worked while the process happened to sit
+		// there. That accident is what broke the vault case.
+		w.fixtureIn(t, w.homeDir)
 
 		writeWorldFile(t, filepath.Join(w.homeDir, "verger.toml"), `schema = 1
 
@@ -432,7 +436,10 @@ id = "local:caveman"
 			Convey("Then the missing package is installed from the spec", func() {
 				So(err, ShouldBeNil)
 				So(readWorldFile(t, target), ShouldEqual, "# installed\n")
-				So(stdout, ShouldContainSubstring, `"status":"current"`)
+				// The cell arrived from the lock with no receipt of its own, so
+				// it is `restored`, not `delivered`: nothing was installed
+				// from a fetch on this machine.
+				So(stdout, ShouldContainSubstring, `"status":"restored"`)
 
 				parsed, err := lock.ParseFile(filepath.Join(w.homeDir, "verger.lock"))
 				So(err, ShouldBeNil)
@@ -446,7 +453,8 @@ id = "local:caveman"
 		w.chdir(t, w.root)
 
 		target := w.target(t, "SKILL.md", "# installed\n")
-		w.fixtureIn(t, w.root)
+		// Next to the spec, which is what a relative source means.
+		w.fixtureIn(t, w.homeDir)
 
 		specPath := filepath.Join(w.homeDir, "verger.toml")
 		writeWorldFile(t, specPath, `schema = 1
@@ -478,7 +486,8 @@ id = "local:caveman"
 		w := newWorld(t)
 		w.chdir(t, w.root)
 		w.target(t, "SKILL.md", "# installed\n")
-		w.fixtureIn(t, w.root)
+		// Next to the spec, which is what a relative source means.
+		w.fixtureIn(t, w.homeDir)
 
 		writeWorldFile(t, filepath.Join(w.homeDir, "verger.toml"), `schema = 1
 
@@ -508,7 +517,8 @@ func TestSyncNoTTYRequiresConfirmation(t *testing.T) {
 		w.chdir(t, w.root)
 
 		target := w.target(t, "SKILL.md", "# installed\n")
-		w.noHooksFixture(t)
+		// Next to the spec, which is what a relative source means.
+		w.noHooksFixtureIn(t, w.homeDir)
 
 		writeWorldFile(t, filepath.Join(w.homeDir, "verger.toml"), `schema = 1
 
@@ -729,30 +739,6 @@ id = "caveman"
 				So(readWorldFile(t, filepath.Join(w.homeDir, "verger.toml")), ShouldNotContainSubstring, `version = '2.0.0'`)
 			})
 		})
-	})
-}
-
-func TestUnavailableCommandsAreTypedStubs(t *testing.T) {
-	cases := [][]string{
-		{"watch"},
-		{"self-update"},
-		{"marketplace", "list"},
-	}
-
-	Convey("Given Ф3/Ф2 commands", t, func() {
-		for _, args := range cases {
-			Convey("When "+strings.Join(args, " ")+" runs", func() {
-				w := newWorld(t)
-
-				_, err := w.run(args...)
-
-				Convey("Then it reports a typed not-available error", func() {
-					target, ok := errors.AsType[*NotAvailableError](err)
-					So(ok, ShouldBeTrue)
-					So(target.Feature, ShouldNotBeEmpty)
-				})
-			})
-		}
 	})
 }
 
