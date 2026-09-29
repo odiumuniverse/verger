@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
+	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
@@ -320,6 +321,130 @@ func ExampleEject() {
 	if _, err := verger.Eject(ctx, from, to); err != nil {
 		fmt.Println(strings.SplitN(err.Error(), ":", 2)[0])
 	}
+}
+
+// Move a client's home to a fresh target, bound to the client so a second
+// front end never opens two clients by hand. A refusal is an *EjectError, so
+// a caller matches the type instead of the text.
+func ExampleClient_Eject() {
+	client, ctx, err := exampleClient()
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = client.Close() }()
+
+	target, err := os.MkdirTemp("", "verger-eject")
+	if err != nil {
+		return
+	}
+
+	if err := client.Eject(ctx, filepath.Join(target, "home")); err != nil {
+		ejected, ok := errors.AsType[*verger.EjectError](err)
+		fmt.Println("eject refused:", ejected.Target, ok)
+	}
+}
+
+// Record a hook approval explicitly, by (package, host, content hash), so the
+// consent store is the only record and the answer is reproducible. The
+// returned key is the approval's own identity.
+func ExampleClient_ApproveHooksFor() {
+	client, _, err := exampleClient()
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = client.Close() }()
+
+	sum := digest.Bytes([]byte("# the hook body\n"))
+
+	key, err := client.ApproveHooksFor("acme/caveman", "claude", sum)
+	if err != nil {
+		approval, ok := errors.AsType[*verger.HookApprovalError](err)
+		fmt.Println("approval refused:", approval.Package, approval.Host, ok)
+
+		return
+	}
+
+	fmt.Println("approved under:", key)
+}
+
+// Drop a package from the spec while leaving its files and receipts alone:
+// Uninstall is the destructive counterpart. dryRun answers the question
+// without writing.
+func ExampleClient_Unregister() {
+	client, ctx, err := exampleClient()
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = client.Close() }()
+
+	paths, err := client.Paths(verger.User, "")
+	if err != nil {
+		return
+	}
+
+	// A package the spec never declared is a caller mistake, reported as
+	// *UsageError, so a front end exits with its usage code.
+	if err := client.Unregister(ctx, paths, "acme/caveman", false); err != nil {
+		_, ok := errors.AsType[*verger.UsageError](err)
+		fmt.Println("not declared:", ok)
+	}
+}
+
+// Undo a host-native registration verger did not create itself — beadle's old
+// directory marketplace — by running the inverse RMA through the host, so no
+// front end unregisters by hand. A host this build does not know is a
+// *UsageError.
+func ExampleClient_UnregisterHost() {
+	client, ctx, err := exampleClient()
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = client.Close() }()
+
+	if err := client.UnregisterHost(ctx, "claude", "acme"); err != nil {
+		_, ok := errors.AsType[*verger.UsageError](err)
+		fmt.Println("no such host:", ok)
+	}
+}
+
+// memoryStore is the smallest thing that satisfies verger.SecretsStore: a
+// second front end hands the facade its own store and keeps one source of
+// secrets. beadle passes a keyring-backed store here.
+type memoryStore struct{ values map[string]string }
+
+func (m *memoryStore) Get(name string) (string, bool) { v, ok := m.values[name]; return v, ok }
+func (m *memoryStore) Set(name, value string)         { m.values[name] = value }
+func (m *memoryStore) Delete(name string) bool        { delete(m.values, name); return true }
+func (m *memoryStore) Save() error                    { return nil }
+func (m *memoryStore) Names() []string                { return nil }
+func (m *memoryStore) Changed() bool                  { return false }
+func (m *memoryStore) Path() string                   { return "memory" }
+
+// WithSecrets injects a store the facade drives instead of the default file
+// at <home>/state/secrets.json, so a second front end keeps one source of
+// secrets.
+func ExampleWithSecrets() {
+	store := &memoryStore{values: map[string]string{}}
+
+	client, _, err := exampleClient()
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = client.Close() }()
+
+	other, err := verger.Open(context.Background(), verger.WithSecrets(store))
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = other.Close() }()
+
+	_ = other.Secrets()
 }
 
 // Confirmer is the only way a library operation can ask anything: the CLI

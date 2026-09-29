@@ -3,14 +3,18 @@ package verger
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
+	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/lock"
 	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/source"
 )
 
 // Cell statuses shared by the status matrix and an execution report.
@@ -63,11 +67,29 @@ type StatusOptions struct {
 
 // Status merges receipts and lock cells into the stable matrix. It is the same
 // data `status --json` prints, with no rendering.
-func (c *Client) Status(_ context.Context, opts StatusOptions) (StatusDocument, error) {
+func (c *Client) Status(ctx context.Context, opts StatusOptions) (StatusDocument, error) {
+	if err := ctx.Err(); err != nil {
+		return StatusDocument{}, err
+	}
+
+	// A lock or spec written by a newer verger is reported before the matrix
+	// is built: reporting "nothing changed" over a home this build cannot
+	// read is the silent failure this gate exists to stop.
+	if err := c.checkSchemaVersions(opts.Paths); err != nil {
+		return StatusDocument{}, err
+	}
+
 	if opts.Paths.ReceiptsDir == "" {
 		// A zero Paths has no receipts dir to read; answering with an empty
 		// matrix would look like "nothing installed" instead of "no scope".
 		return StatusDocument{}, &UsageError{Cause: errors.New("status needs a resolved scope: call Client.Paths first")}
+	}
+	// A spec whose sources cannot be read is not a spec that declares
+	// nothing. `sync` already refuses on one; `status` answering "no
+	// cells" over it is the read-only command confirming, with a green
+	// answer, the very thing the user came to find out about.
+	if err := checkSpecSources(opts.Paths); err != nil {
+		return StatusDocument{}, err
 	}
 
 	receipts := receipt.NewStore(opts.Paths.ReceiptsDir)
@@ -84,40 +106,9 @@ func (c *Client) Status(_ context.Context, opts StatusOptions) (StatusDocument, 
 
 	doc := StatusDocument{Home: opts.Paths.Root, Cells: []Cell{}}
 
-	for _, record := range list {
-		cell := Cell{
-			Package: record.Package, Host: record.Host, Scope: record.Scope,
-			Status: StatusCurrent, Version: record.Version, Strategy: record.Strategy,
-			Level: HostMaturity(record.Host),
-		}
+	doc.Cells = append(doc.Cells, c.receiptCells(ctx, list, lockDoc)...)
 
-		if lockCell, ok := lockDoc.Cell(record.Package, record.Host, record.Scope); ok && lockCell.Version != record.Version {
-			cell.Status = StatusSkew
-			cell.Notes = []string{"lock has " + lockCell.Version}
-		}
-
-		drift, err := apply.ReceiptDrift(record)
-		if err != nil {
-			return StatusDocument{}, err
-		}
-
-		markDrift(&cell, drift)
-
-		doc.Cells = append(doc.Cells, cell)
-	}
-
-	for _, lockCell := range lockDoc.Cells {
-		if _, ok := findReceipt(list, lockCell.Package, lockCell.Host, lockCell.Scope); ok {
-			continue
-		}
-
-		doc.Cells = append(doc.Cells, Cell{
-			Package: lockCell.Package, Host: lockCell.Host, Scope: lockCell.Scope,
-			Status: StatusMissing, Version: lockCell.Version, Strategy: string(lockCell.Strategy),
-			Level: HostMaturity(lockCell.Host),
-			Notes: []string{"lock cell without a receipt"},
-		})
-	}
+	doc.Cells = append(doc.Cells, lockOnlyCells(lockDoc, list)...)
 
 	slices.SortFunc(doc.Cells, func(left, right Cell) int {
 		return cmp.Or(
@@ -140,16 +131,161 @@ func (c *Client) Status(_ context.Context, opts StatusOptions) (StatusDocument, 
 	return doc, nil
 }
 
+// receiptCells turns the receipt store into matrix cells, one per record.
+func (c *Client) receiptCells(ctx context.Context, list []Receipt, lockDoc *lock.Lock) []Cell {
+	cells := make([]Cell, 0, len(list))
+
+	for _, record := range list {
+		cell := Cell{
+			Package: record.Package, Host: record.Host, Scope: record.Scope,
+			Status: StatusCurrent, Version: record.Version, Strategy: record.Strategy,
+			Level: HostMaturity(record.Host),
+		}
+
+		if lockCell, ok := lockDoc.Cell(record.Package, record.Host, record.Scope); ok && lockCell.Version != record.Version {
+			cell.Status = StatusSkew
+			cell.Notes = []string{"lock has " + lockCell.Version}
+		}
+
+		// Drift is checked first on purpose: a file that is present but has
+		// moved is the user's own edit and must stay hands-off, which says
+		// more than "missing" and must not be overwritten.
+		markDrift(ctx, &cell, c.mcpProbe(record.Host), record)
+
+		// A receipt survives a clone; the files it names do not. Without
+		// this the cell reads "current" about a package this machine never
+		// received, and `verger sync` has nothing to do about it.
+		if cell.Status == StatusCurrent && !ReceiptFilesPresent(record) {
+			cell.Status = StatusMissing
+			cell.Notes = append(cell.Notes, "receipt is here but the delivered files are not")
+		}
+
+		cells = append(cells, cell)
+	}
+
+	return cells
+}
+
+// lockOnlyCells reports the cells a lock names that no receipt backs. They
+// are what makes a status honest about a home that was cloned: the lock came
+// across, the packages did not.
+func lockOnlyCells(lockDoc *lock.Lock, list []Receipt) []Cell {
+	var cells []Cell
+
+	for _, lockCell := range lockDoc.Cells {
+		if _, ok := findReceipt(list, lockCell.Package, lockCell.Host, lockCell.Scope); ok {
+			continue
+		}
+
+		cells = append(cells, Cell{
+			Package: lockCell.Package, Host: lockCell.Host, Scope: lockCell.Scope,
+			Status: StatusMissing, Version: lockCell.Version, Strategy: string(lockCell.Strategy),
+			Level: HostMaturity(lockCell.Host),
+			Notes: []string{"lock cell without a receipt"},
+		})
+	}
+
+	return cells
+}
+
+// checkSpecSources resolves every local source a spec declares, and reports
+// the first one it cannot. It is deliberately source-level rather than
+// package-level: the question status is answering is "can this spec be read
+// at all", and a source that does not parse is a fact no amount of reading
+// receipts will change.
+//
+// A spec that is absent is not a failure. An empty home is the ordinary
+// first-run state, and answering "no cells" about it is the truth.
+func checkSpecSources(paths Paths) error {
+	if paths.SpecPath == "" {
+		return nil
+	}
+
+	doc, ok, err := LoadSpec(paths.SpecPath)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		return nil
+	}
+
+	dir := filepath.Dir(paths.SpecPath)
+
+	for _, src := range doc.Sources {
+		if !isLocalSourceURL(src.URL) {
+			continue
+		}
+
+		if _, err := source.ParseSource(src.URL, dir); err != nil {
+			return &UsageError{Cause: fmt.Errorf("source %s: %w", src.Name, err)}
+		}
+	}
+
+	return nil
+}
+
 // markDrift marks one cell hands-off when a delivered value moved (DRIFT-1):
 // the check is per config key, so a key the user added to the same document
-// changes nothing here.
-func markDrift(cell *Cell, drift apply.DriftReport) {
-	if !drift.Drifted() {
+// changes nothing here. A CLI-managed MCP server is compared against the
+// host's own reported value through probe.
+func markDrift(ctx context.Context, cell *Cell, probe apply.DriftProbe, record receipt.Receipt) {
+	drift, err := apply.ReceiptDrift(ctx, record, probe)
+	if err != nil || !drift.Drifted() {
 		return
 	}
 
 	cell.Status = StatusHandsOff
 	cell.Notes = append(cell.Notes, drift.Note())
+}
+
+// mcpProbe builds the drift probe of one host, bound to the adapters this client
+// holds. A host whose oracle cannot probe CLI-managed MCP servers answers
+// Unknown, which the drift walk skips.
+func (c *Client) mcpProbe(id string) apply.DriftProbe {
+	adapters := c.Hosts()
+	byID := make(map[host.ID]host.Host, len(adapters))
+
+	for _, h := range adapters {
+		byID[h.ID()] = h
+	}
+
+	return mcpDriftProbe{hosts: byID, id: host.ID(id)}
+}
+
+// mcpDriftProbe adapts the host adapters to apply.DriftProbe.
+type mcpDriftProbe struct {
+	hosts map[host.ID]host.Host
+	id    host.ID
+}
+
+// MCPDigest implements apply.DriftProbe.
+func (p mcpDriftProbe) MCPDigest(ctx context.Context, name string) (apply.MCPDrift, error) {
+	h, ok := p.hosts[p.id]
+	if !ok {
+		return apply.MCPDrift{Unknown: true}, nil
+	}
+
+	prober, ok := h.Oracle().(host.MCPProber)
+	if !ok {
+		return apply.MCPDrift{Unknown: true}, nil
+	}
+
+	server, err := prober.MCPGet(ctx, name)
+	if err != nil {
+		if errors.Is(err, host.ErrServerNotFound) {
+			return apply.MCPDrift{Gone: true}, nil
+		}
+
+		return apply.MCPDrift{}, err
+	}
+
+	data, err := json.Marshal(server)
+	if err != nil {
+		return apply.MCPDrift{}, err
+	}
+
+	return apply.MCPDrift{Sum: digest.Bytes(data)}, nil
 }
 
 // findReceipt locates one receipt by key.
@@ -177,7 +313,11 @@ type WhyDocument struct {
 
 // Why explains one package on one host: what the receipt and the lock say, what
 // the spec says, and what the consent gate is waiting for.
-func (c *Client) Why(_ context.Context, paths Paths, pkgID, hostID string) (WhyDocument, error) {
+func (c *Client) Why(ctx context.Context, paths Paths, pkgID, hostID string) (WhyDocument, error) {
+	if err := ctx.Err(); err != nil {
+		return WhyDocument{}, err
+	}
+
 	doc := WhyDocument{
 		Package: pkgID, Host: hostID, Scope: string(paths.Scope),
 		Reasons: []string{}, Blockers: []string{},

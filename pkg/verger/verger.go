@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vmkteam/embedlog"
 
@@ -25,11 +26,23 @@ import (
 	"github.com/odiumuniverse/verger/pkg/store"
 )
 
+// SecretsStore is the secrets interface the client needs; *secret.Store
+// implements it, and so can beadle's own store.
+type SecretsStore interface {
+	Get(string) (string, bool)
+	Set(string, string)
+	Delete(string) bool
+	Save() error
+	Names() []string
+	Changed() bool
+	Path() string
+}
+
 // Client is an open facade over one resolved home and machine store.
 type Client struct {
 	home    *home.Home
 	store   *store.Store
-	secrets *secret.Store
+	secrets SecretsStore
 	logger  embedlog.Logger
 
 	// configured is the adapter list a caller injected with WithHosts. An empty
@@ -47,16 +60,18 @@ type Client struct {
 
 // config carries the option values of one Open call.
 type config struct {
-	homePath   string
-	homeSet    bool
-	storeRoot  string
-	storeSet   bool
-	secrets    *secret.Store
-	secretsSet bool
-	logger     embedlog.Logger
-	loggerSet  bool
-	hosts      []host.Host
-	hostsSet   bool
+	homePath          string
+	homeSet           bool
+	storeRoot         string
+	storeSet          bool
+	secrets           SecretsStore
+	secretsSet        bool
+	logger            embedlog.Logger
+	loggerSet         bool
+	hosts             []host.Host
+	hostsSet          bool
+	trashRetention    time.Duration
+	trashRetentionSet bool
 }
 
 // Option configures Open.
@@ -80,6 +95,22 @@ func WithLogger(log embedlog.Logger) Option {
 	}
 }
 
+// WithTrashRetention sets how long a replaced file stays recoverable in the
+// store's trash. A value <= 0 is ignored rather than meaning "keep nothing":
+// a zero window makes every replaced artifact unrecoverable the moment a
+// purge runs, and a caller who meant "use the default" said so by not
+// calling this at all.
+func WithTrashRetention(d time.Duration) Option {
+	return func(c *config) {
+		if d <= 0 {
+			return
+		}
+
+		c.trashRetention = d
+		c.trashRetentionSet = true
+	}
+}
+
 // WithStore overrides the machine store root (DESIGN §3.1); `~` is expanded.
 // Empty and whitespace-only roots are rejected by Open with
 // *OpenError{Option: OptionStore}, never at option-construction time.
@@ -93,7 +124,7 @@ func WithStore(root string) Option {
 // WithSecrets injects the secrets store (DESIGN §9.1); beadle passes its own
 // keyring-backed store. A nil store is rejected by Open with
 // *OpenError{Option: OptionSecrets}, never at option-construction time.
-func WithSecrets(s *secret.Store) Option {
+func WithSecrets(s SecretsStore) Option {
 	return func(c *config) {
 		c.secrets = s
 		c.secretsSet = true
@@ -196,7 +227,7 @@ func resolveStore(cfg config) (*store.Store, error) {
 		root = cfg.storeRoot
 	}
 
-	st, err := store.Open(root)
+	st, err := store.Open(root, storeOpts(cfg)...)
 	if err != nil {
 		return nil, &OpenError{Option: OptionStore, Value: root, Cause: err}
 	}
@@ -204,8 +235,21 @@ func resolveStore(cfg config) (*store.Store, error) {
 	return st, nil
 }
 
+// storeOpts renders the settings the store itself owns. Only options a
+// caller actually set are passed, so an unset one keeps the store's own
+// default rather than a facade's copy of it.
+func storeOpts(cfg config) []store.Option {
+	var opts []store.Option
+
+	if cfg.trashRetentionSet {
+		opts = append(opts, store.WithTrashRetention(cfg.trashRetention))
+	}
+
+	return opts
+}
+
 // resolveSecrets applies WithSecrets or loads <home>/state/secrets.json.
-func resolveSecrets(cfg config, h *home.Home) (*secret.Store, error) {
+func resolveSecrets(cfg config, h *home.Home) (SecretsStore, error) {
 	if cfg.secretsSet {
 		if cfg.secrets == nil {
 			return nil, &OpenError{Option: OptionSecrets, Cause: errors.New("nil secrets store")}
@@ -262,7 +306,7 @@ func (c *Client) Store() *store.Store {
 }
 
 // Secrets returns the resolved secrets store; ownership stays with the client.
-func (c *Client) Secrets() *secret.Store {
+func (c *Client) Secrets() SecretsStore {
 	return c.secrets
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/host"
@@ -31,6 +33,10 @@ type SyncOptions struct {
 	DryRun bool
 	// Confirm answers the executor's questions; nil declines them.
 	Confirm Confirmer
+	// Force has the meaning of ApplyOptions.Force: it overwrites files the
+	// user has edited, keeping their copy under state/backups. Without it a
+	// hands-off cell is left alone and the run says so.
+	Force bool
 }
 
 // SyncPlan is what a reconcile would do, as data.
@@ -48,6 +54,12 @@ type SyncPlan struct {
 	// removals a reconcile implies without walking Plan.Actions.
 	Install []PlannedPackage
 	Remove  []Receipt
+
+	// fail is the first thing the spec asked for that this run could not
+	// get. It is not a note: a spec naming an undeliverable package is a
+	// mistake, and a run that says "nothing to do" and exits 0 about one
+	// looks exactly like a run that had nothing to do.
+	fail error
 }
 
 // SyncPlan plans a reconcile without writing or asking: it reads the spec,
@@ -55,6 +67,13 @@ type SyncPlan struct {
 // caller renders Plan.Cells, confirms through its own Confirmer, and then calls
 // Sync — or, once satisfied, runs the plan itself through Apply.
 func (c *Client) SyncPlan(ctx context.Context, opts SyncOptions) (*SyncPlan, error) {
+	// A lock or spec written by a newer verger is reported before anything
+	// else, including "no spec at …": a build that cannot read the file has
+	// no business planning against it or writing over it.
+	if err := c.checkSchemaVersions(opts.Paths); err != nil {
+		return nil, err
+	}
+
 	if err := c.RequireTrust(opts.Paths); err != nil {
 		return nil, err
 	}
@@ -103,6 +122,14 @@ func (c *Client) SyncPlan(ctx context.Context, opts SyncOptions) (*SyncPlan, err
 		return nil, err
 	}
 
+	// A package the spec named and this run could not get is reported, not
+	// planned around. Returning the plan here would print "nothing to do"
+	// and exit 0, which is the answer a spec with a broken source deserves
+	// least.
+	if plan.fail != nil {
+		return nil, plan.fail
+	}
+
 	return plan, nil
 }
 
@@ -135,12 +162,39 @@ func (c *Client) Sync(ctx context.Context, opts SyncOptions) (*SyncPlan, *apply.
 		Confirm:  opts.Confirm,
 		DryRun:   opts.DryRun,
 		Switches: plan.Switches,
+		Force:    opts.Force,
 	})
 	if err != nil {
 		return plan, nil, err
 	}
 
+	// A cell the executor refused is not a quiet success. Returning the
+	// report and no error is what made `verger sync` answer "done" over a
+	// file it had just declined to overwrite, which is the one answer a
+	// script must never be able to read.
+	if refused := refusedCells(report); len(refused) > 0 {
+		return plan, report, &HandsOffError{Cells: refused}
+	}
+
 	return plan, report, nil
+}
+
+// refusedCells lists the cells the executor left alone: the user's own edits,
+// and nothing else.
+func refusedCells(report *apply.Report) []string {
+	if report == nil {
+		return nil
+	}
+
+	var refused []string
+
+	for _, cell := range report.Cells {
+		if cell.Status == apply.StatusHandsOff {
+			refused = append(refused, cell.Package+"@"+string(cell.Host))
+		}
+	}
+
+	return refused
 }
 
 // planSync fetches every spec package that is not installed yet and plans the
@@ -156,7 +210,33 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 
 	installed := map[string]bool{}
 
+	// receipted is "this machine has a record of doing it", which is not the
+	// same question as "the files are here and match". A package with a
+	// drifted file has a receipt and is not a restore; a package with none
+	// arrived from the lock and is.
+	receipted := map[string]bool{}
+
 	for _, record := range list {
+		receipted[record.Package] = true
+
+		// A receipt whose files are not on this disk is not an install: it
+		// is what a cloned machine inherits, and treating it as one is why
+		// `verger sync` used to answer "nothing to do" about packages that
+		// had never been delivered here.
+		if !ReceiptFilesPresent(record) {
+			continue
+		}
+
+		// A receipt whose files have moved is the user's own edit. Treating
+		// the package as installed would make sync a silent no-op over that
+		// work, so it is planned as an install and the executor's hands-off
+		// guard is what refuses it — that is where the conflict and its
+		// exit code come from.
+		drift, driftErr := apply.ReceiptDrift(context.Background(), record, nil)
+		if driftErr != nil || drift.Drifted() {
+			continue
+		}
+
 		installed[record.Package] = true
 	}
 
@@ -181,7 +261,7 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 			continue
 		}
 
-		syncInstall(ctx, c, fetcher, plan, adapters, entry, installed, desired, opts, switches)
+		syncInstall(ctx, c, fetcher, plan, adapters, entry, installed, receipted, desired, opts, switches)
 	}
 
 	syncRemovals(plan, list, desired, adapterByID, opts)
@@ -199,7 +279,7 @@ func syncWants(opts SyncOptions, id string) bool {
 // for every adapter.
 func syncInstall(
 	ctx context.Context, c *Client, fetcher *source.Fetcher, plan *SyncPlan,
-	adapters []host.Host, entry spec.Package, installed, desired map[string]bool,
+	adapters []host.Host, entry spec.Package, installed, receipted, desired map[string]bool,
 	opts SyncOptions, switches Switches,
 ) {
 	if entry.Disabled {
@@ -209,27 +289,52 @@ func syncInstall(
 		return
 	}
 
+	// Resolve the package before anything is compared against the lock. A
+	// spec may name it in a spelling the delivery will not keep — an
+	// `owner/name` id from a marketplace source becomes `local:<name>` — and
+	// comparing the spec's own string against the lock then reads one
+	// declared package as two: one to remove, one to install, both over the
+	// same files.
+	fetched, ref, fetchErr := c.fetchSpecPackage(ctx, fetcher, plan.spec(), entry.ID, specDirOf(plan))
+	if fetchErr != nil {
+		if plan.fail == nil {
+			plan.fail = fetchErr
+		}
+
+		return
+	}
+
+	if fetched != nil {
+		defer func() { _ = fetched.Cleanup() }()
+
+		if fetched.Package.ID != "" {
+			entry.ID = fetched.Package.ID
+		}
+	}
+
 	desired[entry.ID] = true
 
 	if installed[entry.ID] {
 		return
 	}
 
+	// No receipt for this package on this machine means what we are about to
+	// write comes from the lock, not from anything done here. The executor
+	// cannot tell the two apart on its own, so the plan says which it is.
+	restored := !receipted[entry.ID]
+
 	targets := switches.Filter(adapters, ExceptFor(plan.spec(), entry.ID))
+
+	targets = propagateTargetsFor(plan.spec(), targets, &entry)
 	if len(targets) == 0 {
 		desired[entry.ID] = true
 
 		return
 	}
 
-	fetched, ref, note := c.fetchSpecPackage(ctx, fetcher, plan.spec(), entry.ID)
 	if fetched == nil {
-		plan.Notes = append(plan.Notes, entry.ID+": "+note)
-
 		return
 	}
-
-	defer func() { _ = fetched.Cleanup() }()
 
 	version := firstNonEmpty(entry.Version, fetched.Package.Version)
 	fetched.Package.Version = version
@@ -241,8 +346,8 @@ func syncInstall(
 		return
 	}
 
-	plan.Install = append(plan.Install, PlannedPackage{Ref: ref, Package: pkg})
-	plan.Packages = append(plan.Packages, PlannedPackage{Ref: ref, Package: pkg})
+	plan.Install = append(plan.Install, PlannedPackage{Ref: ref, Package: pkg, Restored: restored})
+	plan.Packages = append(plan.Packages, PlannedPackage{Ref: ref, Package: pkg, Restored: restored})
 
 	for _, adapter := range targets {
 		strategy, strategyNote := PickStrategy(pkg, adapter.ID(), ref.Kind)
@@ -293,6 +398,30 @@ func syncRemovals(plan *SyncPlan, list []Receipt, desired map[string]bool, adapt
 	}
 }
 
+// propagateTargetsFor narrows one event's hosts by the effective [propagate]
+// policy. ModeOrigin keeps the package at the first adapter, ModeAsk skips
+// until something confirms, and the default — ModeAll — is every adapter.
+// It is a function of its own because the three cases read as policy and not
+// as part of planning a delivery.
+func propagateTargetsFor(doc *spec.Spec, targets []host.Host, entry *spec.Package) []host.Host {
+	filtered := make([]host.Host, 0, len(targets))
+
+	for i, adapter := range targets {
+		switch doc.EffectiveMode(spec.EventInstall, "", string(adapter.ID()), entry) {
+		case spec.ModeOrigin:
+			if i == 0 {
+				filtered = append(filtered, adapter)
+			}
+		case spec.ModeAsk:
+			// Skip unless confirmed; confirmation is a separate concern.
+		default:
+			filtered = append(filtered, adapter)
+		}
+	}
+
+	return filtered
+}
+
 // spec returns the document a reconcile read.
 func (s *SyncPlan) spec() *spec.Spec {
 	if s.specDoc == nil {
@@ -302,39 +431,92 @@ func (s *SyncPlan) spec() *spec.Spec {
 	return s.specDoc
 }
 
-// fetchSpecPackage resolves one spec id through the declared sources: the first
-// local source whose payload carries the id wins.
-func (c *Client) fetchSpecPackage(ctx context.Context, fetcher *source.Fetcher, doc *spec.Spec, id string) (*source.Fetched, source.Ref, string) {
+// fetchSpecPackage resolves one spec id through the declared sources. A local
+// source is a directory, which is either one package or a catalog of them;
+// either way the id decides which is wanted.
+//
+// It returns an error rather than a note. A spec that names a package the
+// machine cannot get is a mistake in the spec, and reporting it as a note
+// ended the run with "nothing to do" and exit 0 — indistinguishable, from
+// the outside, from a vault that has nothing to install.
+func (c *Client) fetchSpecPackage(
+	ctx context.Context, fetcher *source.Fetcher, doc *spec.Spec, id, specDir string,
+) (*source.Fetched, source.Ref, error) {
+	seen := 0
+
 	for _, src := range doc.Sources {
 		if !isLocalSourceURL(src.URL) {
 			continue
 		}
 
-		ref, err := source.Parse(src.URL)
+		// Against the spec's own directory, never the process working
+		// directory: a relative source is a claim that the spec travels
+		// with its packages, and resolving it from wherever the reader
+		// happened to be turns a portable vault into "local path … does
+		// not exist" for everyone but its author.
+		ref, err := source.ParseSource(src.URL, specDir)
 		if err != nil {
-			return nil, source.Ref{}, "source " + src.Name + ": " + err.Error()
+			return nil, source.Ref{}, &UsageError{Cause: fmt.Errorf("source %s: %w", src.Name, err)}
 		}
 
-		fetched, err := fetcher.Fetch(ctx, ref)
+		offers, err := fetcher.FetchLocalOffers(ctx, ref)
 		if err != nil {
-			return nil, source.Ref{}, "source " + src.Name + ": " + err.Error()
+			return nil, source.Ref{}, &UsageError{Cause: fmt.Errorf("source %s: %w", src.Name, err)}
 		}
 
-		if fetched.Package.ID == id || fetched.Package.Name == id {
-			return fetched, ref, ""
-		}
+		seen += len(offers)
 
-		_ = fetched.Cleanup()
+		for _, fetched := range offers {
+			if catalogMatch(fetched, src.Name, id) {
+				return fetched, ref, nil
+			}
+		}
 	}
 
-	return nil, source.Ref{}, "no declared source provides it"
+	if seen == 0 && len(doc.Sources) > 0 {
+		return nil, source.Ref{}, &UsageError{Cause: fmt.Errorf(
+			"package %s: no declared source offers a package", id)}
+	}
+
+	return nil, source.Ref{}, &UsageError{Cause: fmt.Errorf(
+		"package %s: no declared source provides it", id)}
+}
+
+// catalogMatch reports whether one offered package is the id a spec asked
+// for. Four spellings reach the same package and all of them are written in
+// the wild: the manifest's own id, its name, the directory it sits in, and
+// the source-qualified form the spec's own id usually takes.
+func catalogMatch(fetched *source.Fetched, sourceName, id string) bool {
+	if fetched.Package.ID == id || fetched.Package.Name == id || fetched.Ref.ID == id {
+		return true
+	}
+
+	owner, name, ok := strings.Cut(id, "/")
+	if !ok {
+		return false
+	}
+
+	return owner == sourceName && (name == fetched.Package.Name || name == fetched.Ref.ID)
 }
 
 // isLocalSourceURL reports whether one spec source is a local path (Ф1 supports
 // local sources only; the owner/repo and marketplace forms arrive with the
-// source resolver, T3.1).
+// source resolver, T3.1). It delegates rather than listing prefixes: the
+// parser owns the grammar, so a second table here is a second opinion that
+// silently disagrees on the spellings it forgot.
 func isLocalSourceURL(raw string) bool {
-	return len(raw) > 1 && (raw[0] == '.' || raw[0] == '/' || raw[0] == '~')
+	return source.IsLocalURL(raw)
+}
+
+// specDirOf is the directory a plan's [[source]] paths are written relative
+// to. An empty spec path means the machine has no spec file, and there is
+// nothing for a relative source to be relative to.
+func specDirOf(plan *SyncPlan) string {
+	if plan == nil || plan.Paths.SpecPath == "" {
+		return ""
+	}
+
+	return filepath.Dir(plan.Paths.SpecPath)
 }
 
 // CheckFailedError reports that a check-only sync would have written, so the
@@ -347,6 +529,20 @@ type CheckFailedError struct {
 // Error implements error.
 func (e *CheckFailedError) Error() string {
 	return fmt.Sprintf("%d change(s) would rewrite %s", e.Planned, e.LockPath)
+}
+
+// HandsOffError reports cells the executor refused to write because the file
+// on disk is not the one verger put there. It is a conflict, not a failure:
+// the package is fine, the machine holds something the user changed, and the
+// fix is theirs to choose — `--force` keeps their copy and overwrites.
+type HandsOffError struct {
+	Cells []string
+}
+
+// Error implements error.
+func (e *HandsOffError) Error() string {
+	return fmt.Sprintf("your edit left alone in %d cell(s): %s; rerun with --force to overwrite, keeping your copy",
+		len(e.Cells), strings.Join(e.Cells, ", "))
 }
 
 // Receipt is the receipt shape the facade returns to a caller that needs the

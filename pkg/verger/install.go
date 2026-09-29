@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/host"
@@ -22,6 +23,10 @@ type PlannedPackage struct {
 	// delivered there a second time.
 	Target host.ID `json:"target,omitempty"`
 	allow  bool    // hooks consent, resolved before Apply
+	// Restored says this package had no receipt on this machine: what the
+	// executor writes came from the lock, so it is a restore. The plan knows
+	// this; the executor only carries it.
+	Restored bool
 }
 
 // targets returns the adapters one planned package is delivered to.
@@ -54,6 +59,8 @@ type PlanOptions struct {
 	Filter HostFilter
 	// Pin overrides the fetched version.
 	Pin string
+	// Scope is the trusted project root for a project-scope delivery.
+	Scope string
 }
 
 // Plan is one executable plan, as data: the scope it runs in, the adapters it
@@ -67,7 +74,12 @@ type Plan struct {
 	Packages []PlannedPackage `json:"-"`
 	Adopts   []AdoptPlan      `json:"adopts,omitempty"`
 	Adapters []host.Host      `json:"-"`
-	Dry      bool             `json:"dry_run,omitempty"`
+	// doc is the spec this plan was built against. [propagate] is a property
+	// of the document, not of a package row, so the install path can only
+	// honour it while the document is in hand; a front end assembling a Plan
+	// by hand gets the default "all" and nothing is silently narrowed.
+	doc *spec.Spec
+	Dry bool `json:"dry_run,omitempty"`
 	// Actions are the executor's operations. The operation that owns the plan
 	// (install, remove, sync) builds them; only Apply runs them.
 	Actions []apply.Action `json:"-"`
@@ -85,17 +97,9 @@ type AdoptPlan struct {
 // Plan resolves the refs of one install: it fetches every fetchable ref, picks
 // the strategy ladder per host, and adopts the agent refs. It writes nothing.
 func (c *Client) Plan(ctx context.Context, opts PlanOptions) (*Plan, error) {
-	refs, err := source.ParseAll(opts.Refs)
-	if err != nil {
-		return nil, &UsageError{Cause: err}
-	}
-
-	agentRefs, fetchRefs := splitRefs(refs)
-	if len(agentRefs) > 0 && len(fetchRefs) > 0 {
-		return nil, &UsageError{Cause: errors.New("install cannot mix agent refs (host:ref) with package refs")}
-	}
-
-	if err := c.RequireTrust(opts.Paths); err != nil {
+	// A lock or spec written by a newer verger is reported before anything
+	// else, so an install can never plan against a home it cannot read.
+	if err := c.checkSchemaVersions(opts.Paths); err != nil {
 		return nil, err
 	}
 
@@ -104,7 +108,25 @@ func (c *Client) Plan(ctx context.Context, opts PlanOptions) (*Plan, error) {
 		return nil, err
 	}
 
-	plan := &Plan{Paths: opts.Paths, Adapters: adapters}
+	if len(adapters) == 0 {
+		return nil, &HostUnavailableError{}
+	}
+
+	agentRefs, fetchRefs, err := splitInstallRefs(opts.Refs)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.RequireTrust(opts.Paths); err != nil {
+		return nil, err
+	}
+
+	doc, _, err := LoadSpec(opts.Paths.SpecPath)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := &Plan{Paths: opts.Paths, Adapters: adapters, doc: doc}
 
 	if len(agentRefs) > 0 {
 		adopts, adoptErr := c.planAdopts(ctx, agentRefs, plan)
@@ -121,11 +143,12 @@ func (c *Client) Plan(ctx context.Context, opts PlanOptions) (*Plan, error) {
 		return nil, err
 	}
 
-	if len(adapters) == 0 {
-		return nil, errors.New("no detected hosts; pass Hosts to target one explicitly")
+	packages, err := c.fetchPackages(ctx, fetchRefs, opts, adapters)
+	if err != nil {
+		return nil, err
 	}
 
-	packages, err := c.fetchPackages(ctx, fetchRefs, opts, adapters)
+	packages, err = c.dropDisabled(opts.Paths, packages)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +156,82 @@ func (c *Client) Plan(ctx context.Context, opts PlanOptions) (*Plan, error) {
 	plan.Packages = packages
 	plan.Cells = plannedCells(packages, adapters, opts.Paths.Scope)
 
+	if err := requireVersions(plan.Packages); err != nil {
+		return nil, err
+	}
+
 	return plan, nil
+}
+
+// splitInstallRefs parses the refs an install was given and separates the two
+// kinds. An agent ref adopts something a host already has and a package ref
+// fetches one; the two answer to different machinery, and an install that
+// mixed them would have to guess which a given ref wanted. A typo is a usage
+// error, because the user can fix it by typing again.
+func splitInstallRefs(raw []string) (agent, fetch []source.Ref, err error) {
+	refs, err := source.ParseAll(raw)
+	if err != nil {
+		return nil, nil, &UsageError{Cause: err}
+	}
+
+	agent, fetch = splitRefs(refs)
+	if len(agent) > 0 && len(fetch) > 0 {
+		return nil, nil, &UsageError{Cause: errors.New("install cannot mix agent refs (host:ref) with package refs")}
+	}
+
+	return agent, fetch, nil
+}
+
+// dropDisabled removes the packages the spec has turned off. The sync path
+// has always done this; install did not, so `verger install` wrote a package
+// the user had explicitly disabled — and said so in the spec, one line
+// above. A disabled entry is a decision, not a hint, and a command that
+// plans around it is a second way to undo it silently.
+func (c *Client) dropDisabled(paths Paths, packages []PlannedPackage) ([]PlannedPackage, error) {
+	doc, _, err := LoadSpec(paths.SpecPath)
+	if err != nil {
+		return nil, err
+	}
+
+	disabled := map[string]bool{}
+
+	for _, entry := range doc.Packages {
+		if entry.Disabled {
+			disabled[entry.ID] = true
+		}
+	}
+
+	if len(disabled) == 0 {
+		return packages, nil
+	}
+
+	kept := make([]PlannedPackage, 0, len(packages))
+
+	for _, item := range packages {
+		if disabled[item.Package.ID] {
+			continue
+		}
+
+		kept = append(kept, item)
+	}
+
+	return kept, nil
+}
+
+// requireVersions refuses a plan whose package has no version. The executor
+// checks the same thing, but checking it there means the user has already
+// read a table of hosts that are about to be written before the run fails on
+// a fact the plan could have known: a manifest that carries no version is a
+// bad package, and a bad package is not something to discover mid-apply.
+func requireVersions(packages []PlannedPackage) error {
+	for _, item := range packages {
+		if item.Package.Version == "" {
+			return &UsageError{Cause: fmt.Errorf("package %s: the manifest declares no version",
+				item.Package.ID)}
+		}
+	}
+
+	return nil
 }
 
 // plannedCells renders the display plan of one install without writing.
@@ -408,7 +506,9 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 
 		item.allow = allow
 
-		for _, adapter := range item.targets(adapters) {
+		allowed, origin := propagateTargets(plan, item, adapters)
+
+		for _, adapter := range allowed {
 			if !opts.Switches.HooksOn(adapter.ID()) {
 				allow = false
 			}
@@ -421,17 +521,85 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 			}
 
 			actions = append(actions, apply.Action{
-				Kind: apply.ActionInstall, Host: adapter.ID(),
+				Kind: apply.ActionInstall, Host: adapter.ID(), Restored: item.Restored,
 				Delivery: host.Delivery{
 					Package: pkg, Strategy: strategy, AllowHooks: allow, DryRun: opts.DryRun,
+					Project: opts.Scope,
 				},
 			})
 		}
+
+		for _, skipped := range skippedHosts(allowed, origin, adapters) {
+			plan.Notes = append(plan.Notes, item.Package.ID+": "+string(skipped)+
+				" is not written here: [propagate] install = origin keeps this package at the origin host")
+		}
 	}
 
-	plan.Actions = actions
+	plan.Actions = apply.DedupeActions(actions)
 
 	return nil
+}
+
+// propagateTargets narrows one planned package's hosts by the effective
+// [propagate] policy. "origin" keeps the package where the event happened and
+// writes nothing elsewhere; "ask" writes nothing unattended, because the
+// question belongs to a person and a plan is not a person. Without the spec
+// document the default is "all" and nothing is narrowed.
+func propagateTargets(plan *Plan, item *PlannedPackage, adapters []host.Host) (allowed []host.Host, origin host.ID) {
+	candidates := item.targets(adapters)
+	if len(candidates) == 0 || plan.doc == nil {
+		return candidates, ""
+	}
+
+	var entry *spec.Package
+
+	for i := range plan.doc.Packages {
+		if plan.doc.Packages[i].ID == item.Package.ID {
+			entry = &plan.doc.Packages[i]
+
+			break
+		}
+	}
+
+	for i, adapter := range candidates {
+		switch plan.doc.EffectiveMode(spec.EventInstall, "", string(adapter.ID()), entry) {
+		case spec.ModeOrigin:
+			// The first detected adapter is the origin: the order the plan
+			// itself fixed, not the host's own idea of one.
+			if i == 0 {
+				origin = adapter.ID()
+
+				return candidates[:1], origin
+			}
+		case spec.ModeAsk:
+			return nil, ""
+		case spec.ModeAll:
+			// Every adapter takes it; nothing to narrow.
+		}
+	}
+
+	return candidates, origin
+}
+
+// skippedHosts names the adapters a policy left out, so the plan says which
+// hosts were considered and declined rather than looking as if they were
+// never detected.
+func skippedHosts(allowed []host.Host, origin host.ID, adapters []host.Host) []host.ID {
+	kept := make(map[host.ID]bool, len(allowed))
+
+	for _, adapter := range allowed {
+		kept[adapter.ID()] = true
+	}
+
+	var skipped []host.ID
+
+	for _, adapter := range adapters {
+		if !kept[adapter.ID()] && adapter.ID() != origin {
+			skipped = append(skipped, adapter.ID())
+		}
+	}
+
+	return skipped
 }
 
 // planAdopts resolves the agent refs of one install: the source host's own
@@ -464,6 +632,15 @@ func (c *Client) planAdopts(ctx context.Context, refs []source.Ref, plan *Plan) 
 
 		id := firstNonEmpty(entry.Name, ref.AgentRef)
 		notes := []string{fmt.Sprintf("adopted %s from %s (%s)", id, ref.Agent, entry.Version)}
+		// A host whose listing carries no version (pi's resolved paths, dsh's
+		// missing verb) cannot be re-delivered: the executor requires a version.
+		// The adoption is still recorded, the delivery is skipped (W3-E2E10 F5).
+		if entry.Version == "" {
+			notes = append(notes, ref.Agent+" lists no version; recorded, not re-delivered")
+			adopts = append(adopts, AdoptPlan{Ref: ref, ID: id, AdoptedFrom: ref.Agent, Notes: notes})
+
+			continue
+		}
 
 		for _, adapter := range plan.Adapters {
 			if adapter.ID() == from.ID() {
@@ -565,12 +742,25 @@ func splitRefs(refs []source.Ref) ([]source.Ref, []source.Ref) {
 	return agentRefs, fetchRefs
 }
 
-// findInstalled locates one entry of a host's own listing by name.
-func findInstalled(listed []host.Installed, name string) (host.Installed, bool) {
+// findInstalled locates one entry of a host's own listing by selector.
+// The selector may carry a marketplace suffix (name@marketplace); the oracle
+// splits it, so the comparison must too.
+func findInstalled(listed []host.Installed, selector string) (host.Installed, bool) {
+	name, marketplace, _ := strings.Cut(selector, "@")
+	if name == "" {
+		name = selector
+	}
+
 	for _, entry := range listed {
-		if entry.Name == name {
-			return entry, true
+		if entry.Name != name {
+			continue
 		}
+
+		if marketplace != "" && entry.Marketplace != "" && entry.Marketplace != marketplace {
+			continue
+		}
+
+		return entry, true
 	}
 
 	return host.Installed{}, false

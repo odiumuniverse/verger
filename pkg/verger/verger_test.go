@@ -266,8 +266,7 @@ func TestSecretsOption(t *testing.T) {
 			Convey("Then the default store points at <home>/state/secrets.json and creates nothing", func() {
 				So(c.Secrets(), ShouldNotBeNil)
 				So(c.Secrets().Path(), ShouldEqual, filepath.Join(homeRoot, "state", "secrets.json"))
-				So(c.Secrets().Backend(), ShouldEqual, secret.BackendFile)
-				So(c.Secrets().Len(), ShouldEqual, 0)
+				So(len(c.Secrets().Names()), ShouldEqual, 0)
 				assertMissing(t, c.Home().StateDir())
 			})
 		})
@@ -367,7 +366,7 @@ func TestSecretsMissingFile(t *testing.T) {
 				defer func() { _ = c.Close() }()
 
 				So(c.Secrets(), ShouldNotBeNil)
-				So(c.Secrets().Len(), ShouldEqual, 0)
+				So(len(c.Secrets().Names()), ShouldEqual, 0)
 				assertMissing(t, filepath.Join(homeRoot, "state", "secrets.json"))
 			})
 		})

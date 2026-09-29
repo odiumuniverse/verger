@@ -3,6 +3,7 @@ package verger
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/host"
@@ -16,6 +17,11 @@ type RemoveOptions struct {
 	Paths Paths
 	// Hosts narrows the adapters; an empty list means every registered adapter.
 	Hosts []host.Host
+	// Filter narrows the detected adapters when Hosts is empty — the
+	// `--hosts` / `--except` of the CLI, as data, exactly as on an install.
+	// A host this build cannot deliver to is the same typed refusal an
+	// install gives, so the CLI maps both to one exit code.
+	Filter HostFilter
 	// Cause is recorded on the receipt so a later restore knows why.
 	Cause receipt.Cause
 	// Confirm answers the executor's questions; nil declines them.
@@ -37,7 +43,11 @@ type RemovalPlan struct {
 // PlanRemove resolves the receipts one package id owns and the actions that
 // would reverse them. A host whose adapter this build does not have is left
 // installed, with the reason in the notes, never silently dropped.
-func (c *Client) PlanRemove(_ context.Context, id string, opts RemoveOptions) (*RemovalPlan, error) {
+func (c *Client) PlanRemove(ctx context.Context, id string, opts RemoveOptions) (*RemovalPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	receipts := receipt.NewStore(opts.Paths.ReceiptsDir)
 
 	list, err := receipts.List()
@@ -47,7 +57,15 @@ func (c *Client) PlanRemove(_ context.Context, id string, opts RemoveOptions) (*
 
 	adapters := opts.Hosts
 	if len(adapters) == 0 {
-		adapters = c.Hosts()
+		// The filter is the `--hosts` / `--except` of the CLI, applied to the
+		// detected adapters exactly as an install applies it: a named host
+		// this build cannot reach is a typed refusal, not a silent no-op.
+		var err error
+
+		adapters, err = c.Targets(opts.Filter)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	adapterByID := map[host.ID]host.Host{}
@@ -177,9 +195,11 @@ func (c *Client) recordInstall(paths Paths, packages []PlannedPackage) error {
 		return err
 	}
 
+	specDir := filepath.Dir(paths.SpecPath)
+
 	for _, item := range packages {
 		AddSpecPackage(doc, item.Package.ID, item.Package.Version)
-		AddSpecSource(doc, item.Ref)
+		AddSpecSourceAt(doc, item.Ref, specDir)
 	}
 
 	return SaveSpec(paths.SpecPath, doc)

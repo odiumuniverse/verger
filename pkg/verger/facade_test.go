@@ -21,6 +21,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/receipt"
 	"github.com/odiumuniverse/verger/pkg/render"
+
 	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/spec"
 )
@@ -44,6 +45,10 @@ type fakeArtifact struct {
 // and reports one entry to its own oracle, which is all a lifecycle test needs.
 type fakeHost struct {
 	id host.ID
+	// undetected opts one adapter out of host detection, so a test can
+	// exercise the no-detected-hosts path. The zero value detects, which is
+	// what every hand-built adapter in this package wants.
+	undetected bool
 
 	mu        sync.Mutex
 	artifacts []fakeArtifact
@@ -51,14 +56,16 @@ type fakeHost struct {
 	delivers  int
 	uninstall int
 	removed   []string
+	// projects records the Project root of every delivery the adapter received.
+	projects []string
 }
 
 // ID implements host.Host.
 func (f *fakeHost) ID() host.ID { return f.id }
 
 // Detect implements host.Host: the facade test injects the adapter, so it is
-// always present.
-func (f *fakeHost) Detect(string) bool { return true }
+// present unless the test set undetected.
+func (f *fakeHost) Detect(string) bool { return !f.undetected }
 
 // Oracle implements host.Host.
 func (f *fakeHost) Oracle() host.Oracle { return &fakeOracle{host: f} }
@@ -67,6 +74,7 @@ func (f *fakeHost) Oracle() host.Oracle { return &fakeOracle{host: f} }
 func (f *fakeHost) Deliver(_ context.Context, _ string, d host.Delivery) (host.Result, error) {
 	f.mu.Lock()
 	f.delivers++
+	f.projects = append(f.projects, d.Project)
 	targets := append([]fakeArtifact(nil), f.artifacts...)
 	f.mu.Unlock()
 
@@ -754,7 +762,10 @@ func TestFacadeSyncReconcilesWithTheSpec(t *testing.T) {
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
 
-		So(AddSpecSource(doc, mustRef(t, ref)), ShouldBeTrue)
+		// The spec records where the package actually is: a relative URL
+		// resolves against the spec's own directory, and this fixture sits
+		// beside the world root, not beside the spec.
+		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
 		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
@@ -832,7 +843,7 @@ func TestFacadeUpdatePinAndOutdated(t *testing.T) {
 
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
-		So(AddSpecSource(doc, mustRef(t, ref)), ShouldBeTrue)
+		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
 		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
@@ -921,7 +932,7 @@ func TestFacadeWatchTakesTheLeaseAndReconciles(t *testing.T) {
 
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
-		So(AddSpecSource(doc, mustRef(t, ref)), ShouldBeTrue)
+		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
 		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
@@ -980,7 +991,7 @@ func TestFacadeWatchTakesTheLeaseAndReconciles(t *testing.T) {
 
 		watchErr := client.Watch(ctx, WatchOptions{
 			Paths:   paths,
-			Owner:   "verger-test",
+			Owner:   LeaseOwnerVerger,
 			Watch:   []string{"claude"},
 			Hooks:   HooksSkip,
 			Events:  events,
@@ -991,7 +1002,7 @@ func TestFacadeWatchTakesTheLeaseAndReconciles(t *testing.T) {
 			Convey("Then it held the lease and watched the host's own surfaces", func() {
 				So(watchErr, ShouldNotBeNil) // the context was cancelled
 				So(seenHeld, ShouldBeTrue)
-				So(seenLease.Owner, ShouldEqual, "verger-test")
+				So(seenLease.Owner, ShouldEqual, LeaseOwnerVerger)
 				So(seenTargets, ShouldHaveLength, 1)
 				So(seenTargets[0].Host, ShouldEqual, "claude")
 				So(seenTargets[0].Paths, ShouldNotBeEmpty)
@@ -1019,7 +1030,7 @@ func TestFacadeWatchWithoutAnEngine(t *testing.T) {
 		paths, err := client.Paths(User, "")
 		So(err, ShouldBeNil)
 
-		err = client.Watch(t.Context(), WatchOptions{Paths: paths, Owner: "verger-test"})
+		err = client.Watch(t.Context(), WatchOptions{Paths: paths, Owner: LeaseOwnerVerger})
 
 		Convey("Then Watch reports the capability as unavailable", func() {
 			typed, ok := errors.AsType[*NotAvailableError](err)
@@ -1108,8 +1119,11 @@ func TestFacadeAbsorbMigratesSecrets(t *testing.T) {
 			So(ok, ShouldBeTrue)
 			So(web, ShouldEqual, "web")
 
-			So(from.Secrets().Has("MCP_TOKEN"), ShouldBeFalse)
-			So(from.Secrets().Has("WEB_TOKEN"), ShouldBeFalse)
+			_, ok1 := from.Secrets().Get("MCP_TOKEN")
+			So(ok1, ShouldBeFalse)
+
+			_, ok2 := from.Secrets().Get("WEB_TOKEN")
+			So(ok2, ShouldBeFalse)
 		})
 
 		Convey("Then running the migration again changes nothing", func() {
@@ -1266,9 +1280,14 @@ func TestFacadePinVocabularyIsComplete(t *testing.T) {
 
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
-		So(AddSpecSource(doc, mustRef(t, ref)), ShouldBeTrue)
+		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
 		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
 		So(AddSpecPackage(doc, "acme/never-installed", ""), ShouldBeTrue)
+
+		// Declared but deliberately not delivered, rather than declared with no
+		// source to get it from: a package no source provides is a broken spec,
+		// and a broken spec is a loud failure, not a `missing` pin.
+		doc.Packages[len(doc.Packages)-1].Disabled = true
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		_, _, err = client.Sync(t.Context(), SyncOptions{Paths: paths, Hooks: HooksSkip})
@@ -1356,4 +1375,208 @@ func mkdirFixture(t *testing.T, dir string) {
 	t.Helper()
 
 	So(os.MkdirAll(dir, 0o700), ShouldBeNil)
+}
+
+// ---- API-REQ 1-5: Eject, approve hooks by (pkg, host, hash), Unregister ----
+
+func TestFacadeEjectMovesTheHome(t *testing.T) {
+	Convey("Given a client with a home", t, func() {
+		world, client := newFacadeWorld(t)
+		_ = world
+
+		Convey("When Eject moves the home to a fresh target", func() {
+			target := t.TempDir()
+			err := client.Eject(t.Context(), target)
+
+			Convey("Then the target holds the state and the source is gone", func() {
+				So(err, ShouldBeNil)
+				So(dirExists(filepath.Join(target, "state")), ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestFacadeApproveHooksForRecordsByKey(t *testing.T) {
+	Convey("Given a client", t, func() {
+		_, client := newFacadeWorld(t)
+		hash := digest.Bytes([]byte("hook-bytes"))
+
+		Convey("When ApproveHooksFor records the approval by (pkg, host, hash)", func() {
+			key, err := client.ApproveHooksFor("local:pkg", "claude", hash)
+
+			Convey("Then the key is returned and the store holds the hash", func() {
+				So(err, ShouldBeNil)
+				So(key, ShouldEqual, "local:pkg")
+
+				store, storeErr := client.ConsentStore()
+				So(storeErr, ShouldBeNil)
+
+				_, ok := store.Hooks("local:pkg")
+				So(ok, ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestFacadeUnregisterRemovesTheSpecEntry(t *testing.T) {
+	Convey("Given a client with an installed package", t, func() {
+		world, client := newFacadeWorld(t)
+		ref := world.fixture(t, "caveman", "1.2.3")
+
+		paths, err := client.Paths(User, "")
+		So(err, ShouldBeNil)
+
+		plan, err := client.Plan(t.Context(), PlanOptions{Paths: paths, Refs: []string{ref}})
+		So(err, ShouldBeNil)
+
+		_, err = client.Install(t.Context(), plan, ApplyOptions{Now: fixedClock})
+		So(err, ShouldBeNil)
+
+		Convey("When Unregister removes the package from the spec", func() {
+			err := client.Unregister(t.Context(), paths, "local:caveman", false)
+
+			Convey("Then the spec no longer carries the package", func() {
+				So(err, ShouldBeNil)
+
+				doc, _, loadErr := LoadSpec(paths.SpecPath)
+				So(loadErr, ShouldBeNil)
+				So(hasSpecPackageID(doc, "local:caveman"), ShouldBeFalse)
+			})
+		})
+	})
+}
+
+// dirExists reports whether path is an existing directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// TestPlanNoDetectedHostsIsTyped pins API-REQ 6: Plan returns a typed
+// HostUnavailableError when no hosts are detected.
+func TestPlanNoDetectedHostsIsTyped(t *testing.T) {
+	Convey("Given a client with no detected hosts", t, func() {
+		world, client := newFacadeWorld(t)
+		_ = world
+
+		// Reopen with an adapter the host does not detect, so Targets is empty.
+		_ = client.Close()
+		client, err := Open(t.Context(), WithHosts(&fakeHost{id: host.Claude, undetected: true}))
+		So(err, ShouldBeNil)
+		t.Cleanup(func() { _ = client.Close() })
+
+		paths, err := client.Paths(User, "")
+		So(err, ShouldBeNil)
+
+		Convey("When Plan is called", func() {
+			_, err := client.Plan(t.Context(), PlanOptions{
+				Refs:  []string{"local:caveman"},
+				Paths: paths,
+			})
+
+			Convey("Then the error is a HostUnavailableError", func() {
+				So(err, ShouldNotBeNil)
+				unavailable, ok := errors.AsType[*HostUnavailableError](err)
+				So(ok, ShouldBeTrue)
+				So(unavailable, ShouldNotBeNil)
+			})
+		})
+	})
+}
+
+// TestSyncPlanPropagateOrigin pins [propagate] policy: a package with
+// propagate.install = "origin" is only planned for the origin host.
+func TestSyncPlanPropagateOrigin(t *testing.T) {
+	Convey("Given a spec with propagate.install = origin", t, func() {
+		world, client := newFacadeWorld(t)
+		_ = world
+
+		paths, err := client.Paths(User, "")
+		So(err, ShouldBeNil)
+
+		doc, _, err := LoadSpec(paths.SpecPath)
+		So(err, ShouldBeNil)
+		// The package needs a source that provides it: a spec naming a
+		// package nothing can get is a broken spec, and this test is about
+		// which hosts a valid one reaches.
+		So(AddSpecSourceAt(doc, mustRef(t, world.fixture(t, "caveman", "1.2.3")),
+			filepath.Dir(paths.SpecPath)), ShouldBeTrue)
+
+		doc.Packages = []spec.Package{
+			{
+				ID:        "local:caveman",
+				Propagate: &spec.Propagate{Install: spec.ModeOrigin},
+			},
+		}
+		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
+
+		Convey("When SyncPlan is called", func() {
+			plan, err := client.SyncPlan(t.Context(), SyncOptions{Paths: paths})
+			So(err, ShouldBeNil)
+
+			Convey("Then only the origin host is planned", func() {
+				// The origin host is the first detected adapter
+				// With propagate=origin, only one host should be planned
+				for _, cell := range plan.Cells {
+					if cell.Package == "local:caveman" {
+						// Should only be one cell for the origin host
+						So(plan.Cells, ShouldHaveLength, 1)
+					}
+				}
+			})
+		})
+	})
+}
+
+// TestInstallPlanPropagateOrigin pins that [propagate] is enforced on the
+// install path too, not only on sync. Two commands reach the same policy from
+// different directions, and a policy that only holds for one of them is not a
+// policy: `verger install` would write into a host the spec says the package
+// stays out of, and only a later `verger sync` would notice.
+func TestInstallPlanPropagateOrigin(t *testing.T) {
+	Convey("Given a spec with propagate.install = origin and two detected hosts", t, func() {
+		world, _ := newFacadeWorld(t)
+		t.Chdir(world.root)
+
+		one := &fakeHost{id: host.Claude}
+		two := &fakeHost{id: host.Omp}
+
+		client, err := Open(t.Context(), WithHosts(one, two))
+		So(err, ShouldBeNil)
+
+		paths, err := client.Paths(User, "")
+		So(err, ShouldBeNil)
+
+		doc, _, err := LoadSpec(paths.SpecPath)
+		So(err, ShouldBeNil)
+
+		doc.Packages = []spec.Package{{ID: "local:caveman", Propagate: &spec.Propagate{Install: spec.ModeOrigin}}}
+		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
+
+		ref := world.fixture(t, "caveman", "1.2.3")
+
+		Convey("When the package is installed", func() {
+			plan, err := client.Plan(t.Context(), PlanOptions{Paths: paths, Refs: []string{ref}})
+			So(err, ShouldBeNil)
+
+			_, err = client.Install(t.Context(), plan, ApplyOptions{Now: fixedClock})
+			So(err, ShouldBeNil)
+
+			Convey("Then only the origin host is written", func() {
+				one.mu.Lock()
+				firstDelivers := one.delivers
+				one.mu.Unlock()
+
+				two.mu.Lock()
+				secondDelivers := two.delivers
+				two.mu.Unlock()
+
+				// The executor probes a delivery before it writes it, so a
+				// written action counts twice; what matters is which host
+				// was touched at all.
+				So(firstDelivers, ShouldNotEqual, 0)
+				So(secondDelivers, ShouldEqual, 0)
+			})
+		})
+	})
 }

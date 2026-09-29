@@ -36,7 +36,11 @@ var movedFiles = []string{
 // stricter direction, where a target that already holds state is refused rather
 // than merged, because ejecting into a home another tool owns would silently
 // drop one of the two.
-func moveHomes(_ context.Context, from, to *Client, merge bool) (*AbsorbReport, error) {
+func moveHomes(ctx context.Context, from, to *Client, merge bool) (*AbsorbReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if from == nil || to == nil {
 		return nil, errors.New("absorb: both homes are required")
 	}
@@ -63,42 +67,10 @@ func moveHomes(_ context.Context, from, to *Client, merge bool) (*AbsorbReport, 
 	// This runs before the target is laid out, because a rename cannot replace
 	// an existing directory.
 	if merge {
-		renamed, err := renameHome(from, to, src, dst, report)
-		if err != nil {
-			return nil, err
-		}
-
-		if renamed {
-			return report, nil
-		}
+		return mergeHomes(from, to, src, dst, report)
 	}
 
-	// A merge is the case where the secrets do not travel by themselves: the
-	// target already has a store, so the values are carried name by name
-	// (DESIGN §3.3 read → write → delete).
-	if err := MigrateSecrets(from, to); err != nil {
-		return nil, err
-	}
-
-	if err := to.Ensure(Paths{Scope: User}); err != nil {
-		return nil, err
-	}
-
-	if err := moveStateFiles(src, dst, merge, report); err != nil {
-		return nil, err
-	}
-
-	receiptsMoved, receiptsSkipped, err := moveReceipts(src, dst, merge)
-	if err != nil {
-		return nil, err
-	}
-
-	report.Moved = append(report.Moved, receiptsMoved...)
-	report.Skipped = append(report.Skipped, receiptsSkipped...)
-	slices.Sort(report.Moved)
-	slices.Sort(report.Skipped)
-
-	return report, nil
+	return mergeHomes(from, to, src, dst, report)
 }
 
 // moveStateFiles carries every state file a home move owns, recording which
@@ -120,6 +92,44 @@ func moveStateFiles(src, dst string, merge bool, report *AbsorbReport) error {
 	}
 
 	return nil
+}
+
+// mergeHomes carries one home into another that already holds state: the whole
+// home moves when the target is empty, and otherwise the state merges file by
+// file with the secrets carried name by name (DESIGN §3.3).
+func mergeHomes(from, to *Client, src, dst string, report *AbsorbReport) (*AbsorbReport, error) {
+	renamed, err := renameHome(from, to, src, dst, report)
+	if err != nil {
+		return nil, err
+	}
+
+	if renamed {
+		return report, nil
+	}
+
+	if err := MigrateSecrets(from, to); err != nil {
+		return nil, err
+	}
+
+	if err := to.Ensure(Paths{Scope: User}); err != nil {
+		return nil, err
+	}
+
+	if err := moveStateFiles(src, dst, true, report); err != nil {
+		return nil, err
+	}
+
+	receiptsMoved, receiptsSkipped, err := moveReceipts(src, dst, true)
+	if err != nil {
+		return nil, err
+	}
+
+	report.Moved = append(report.Moved, receiptsMoved...)
+	report.Skipped = append(report.Skipped, receiptsSkipped...)
+	slices.Sort(report.Moved)
+	slices.Sort(report.Skipped)
+
+	return report, nil
 }
 
 // renameHome tries the whole-home rename that keeps unknown state with the move:
