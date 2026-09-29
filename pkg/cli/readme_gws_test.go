@@ -114,9 +114,11 @@ func TestREADMEFlagsExist(t *testing.T) {
 		root := NewRootCmd(Options{})
 
 		known := map[string]bool{}
-		for _, cmd := range root.Commands() {
-			collectFlags(cmd, known)
-		}
+		// The root's own flags count too: `verger --version` and
+		// `verger --dry-run` are real invocations a user can type, and a
+		// test that only walked the subcommands would have called them
+		// flags that do not exist.
+		collectFlags(root, known)
 
 		for _, name := range uniqueMatches(readme, regexp.MustCompile("`--([a-z-]+)")) {
 			Convey("Then the flag --"+name+" exists somewhere in the tree", func() {
