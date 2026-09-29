@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
@@ -55,6 +56,14 @@ type ApplyOptions struct {
 	// value switches everything on, so a caller that never resolves them keeps
 	// every behaviour.
 	Switches Switches
+	// Scope is the trusted project root for a project-scope delivery.
+	Scope string
+	// Force overwrites files the user has edited since the receipt recorded
+	// them. The edit is not discarded: it is copied under state/backups first
+	// and the copy's path is reported, so forcing is recoverable rather than
+	// destructive. The zero value never overwrites, which is the only safe
+	// default for something that can take a person's work.
+	Force bool
 }
 
 // Event is one progress event of an operation, so a second front end can render
@@ -128,6 +137,51 @@ func LoadLock(path string) (*lock.Lock, error) {
 	return parsed, nil
 }
 
+// checkSchemaVersions reads the persisted documents whose schema this build
+// might be too old to understand, and reports the first one written by a
+// newer tool.
+//
+// It runs before every other verdict — before "no spec at …", before the
+// host check, before any write — because a document an older binary cannot
+// read is not something the user can fix by re-running with different flags:
+// the only correct answer is exit 7 and "update", never a silent success that
+// rewrites the file. A missing file is not a failure: a home that has never
+// synced has no lock and no spec, and that is the normal case.
+func (c *Client) checkSchemaVersions(paths Paths) error {
+	if paths.LockPath != "" {
+		if _, err := LoadLock(paths.LockPath); err != nil {
+			return schemaRefusal(err)
+		}
+	}
+
+	if paths.SpecPath != "" {
+		if _, _, err := LoadSpec(paths.SpecPath); err != nil {
+			return schemaRefusal(err)
+		}
+	}
+
+	return nil
+}
+
+// schemaRefusal keeps a schema-newer error as itself and passes everything
+// else through: only a version we cannot read changes the verdict, so every
+// other failure keeps the shape its own command already produced.
+func schemaRefusal(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if _, ok := errors.AsType[*lock.SchemaNewerError](err); ok {
+		return err
+	}
+
+	if _, ok := errors.AsType[*spec.SchemaNewerError](err); ok {
+		return err
+	}
+
+	return nil
+}
+
 // execOptions renders the executor options of one run.
 func (c *Client) execOptions(opts ApplyOptions) apply.Options {
 	out := apply.Options{
@@ -138,6 +192,13 @@ func (c *Client) execOptions(opts ApplyOptions) apply.Options {
 
 	if opts.Confirm != nil {
 		out.Confirm = opts.Confirm
+	}
+
+	if opts.Force {
+		// Force without a root would have to invent a place to put people's
+		// files, so it stays off until a caller names the directory.
+		out.Force = true
+		out.BackupsRoot = filepath.Join(c.Home().StateDir(), "backups")
 	}
 
 	return out

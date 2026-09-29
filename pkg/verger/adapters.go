@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/host"
+	"github.com/odiumuniverse/verger/pkg/secret"
 )
 
 // adapterFactories is the ten canonical host adapters this build can deliver
@@ -34,7 +35,10 @@ func (c *Client) buildAdapters() []host.Host {
 		host.WithStore(c.store),
 		host.WithTrash(c.store.Trash()),
 		host.WithOwnership(c.owner()),
-		host.WithSecrets(c.secrets),
+	}
+
+	if store, ok := c.secrets.(*secret.Store); ok {
+		options = append(options, host.WithSecrets(store))
 	}
 
 	if c.logger.Log() != nil {
@@ -172,6 +176,10 @@ type UsageError struct {
 
 // Error implements error.
 func (e *UsageError) Error() string {
+	if e.Cause == nil {
+		return "usage error"
+	}
+
 	return e.Cause.Error()
 }
 
