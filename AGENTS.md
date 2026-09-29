@@ -85,9 +85,43 @@ active (pattern: beadle `pkg/cli/home_isolation_test.go`). A test that forgets i
 
 - Work only inside `/Users/universe/my/verger`. Never modify other directories
   (`beadle`, `topscan`, …) — read-only reference at most.
-- Never run `git commit`, `git push`, `git checkout` of others' work, `git reset`,
-  or `git stash`: the orchestrator owns git state. Leave changes in the working tree.
-- Never delete or rewrite another task's files; append-only reports under
-  `docs/reviews/`.
+- **Go files: `edit` only.** Never `sed -i`, `python -c` or any scripted rewrite
+  of a `.go` file, including your own — after a compaction the anchor is gone
+  and a blind rewrite corrupts a neighbour's line.
+- **Hermetic tests are mandatory.** A test must pass with nothing of the
+  developer's machine behind it:
+  `B=$(mktemp -d); ln -s $(which go) $B/go; ln -s $(which git) $B/git; env -i
+  HOME=$(mktemp -d) TMPDIR=/tmp PATH=$B:/usr/bin:/bin go test -count=1 ./...`
+  A test that passes only because an agent binary happens to be installed is a
+  broken test: put a shim on PATH instead, or skip when the binary is absent.
+  A test that asserts only the *absence* of a phrase passes vacuously when the
+  code under it never ran — add a positive assertion.
+- **KEYCHAIN RULE.** No test and no diagnostic may touch the real OS secret
+  store. On macOS an isolated HOME makes the keychain look missing and the OS
+  answers with a modal "Reset To Defaults" — a keyring is triggered by a tool
+  deciding where to keep a string. Inject a panicking fake; never probe the real
+  keychain even read-only.
+- **INSTALL RULE.** Never install anything, and never write outside the repo or
+  a `mktemp -d` tree. No package managers, no `go install`, no `brew`.
+- `docs/` is local only and is **not committed**. It is the design record and
+  the report trail; treat it as scratch you may write but never as tracked state.
+- No `Co-Authored-By` trailer and no AI attribution anywhere in the tree.
+- Git state belongs to ops: no `git commit`, `push`, `reset`, `stash` or
+  `checkout` of others' work. Changes are left in the working tree and handed
+  over for the commit.
 - Report format: write the full report to a file, reply with at most 10 lines
   (status, files touched, evidence commands + results, open questions).
+
+## Gates (all of them, every change)
+
+```
+gofmt -l pkg/ cmd/                                     empty
+go vet ./...
+golangci-lint run ./pkg/...                            0 issues
+GOOS=linux golangci-lint run ./pkg/...                 0 issues
+hermetic go test -count=1 ./...                         no FAIL
+docs/tasks/repro-g4.sh <built binary>                   17/17
+```
+
+`golangci-lint` refuses to run in parallel with itself: if it reports a
+parallel run, wait and re-run rather than assuming a clean result.
