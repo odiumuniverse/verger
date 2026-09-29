@@ -79,6 +79,28 @@ jobs:
 
           ls -l dist
 
+      # The man pages come from the same cobra tree the binary is built from,
+      # so a flag cannot exist in one and not the other. Generated here rather
+      # than committed, because a checked-in page rots the moment a flag moves.
+      - name: Generate the man pages
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/man
+          go run -mod=vendor ./cmd/gendocs -out dist/man -version "${version}" -date "$(date -u '+%b %Y')"
+          ls -l dist/man | head
+
+      # A page that does not render is not a page. This is the same command a
+      # user would type after brew installs the formula.
+      - name: Smoke the man pages
+        run: |
+          man -l dist/man/verger.1 > /dev/null || groff -man -Tascii dist/man/verger.1 > /dev/null
+          echo "man renders"
+
+      - name: Pack the man pages
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tar -czf "dist/verger-man-${version}.tar.gz" -C dist/man .
+
       # sha256 of every published artifact, so a user can verify a download
       # without trusting the release page.
       - name: Checksum the artifacts
@@ -151,6 +173,11 @@ jobs:
             *"${version}"*) ;;
             *) echo "::error::packaged binary reports '${got}', expected the tag version ${version}"; exit 1 ;;
           esac
+          # Completions must be non-empty for all three shells
+          for shell in bash zsh fish; do
+            out="$(unpack/verger completion "$shell")"
+            [ -n "$out" ] || { echo "::error::verger completion $shell is empty"; exit 1; }
+          done
 
   publish:
     needs: [build, smoke]
@@ -234,6 +261,7 @@ jobs:
 
               def install
                 bin.install "verger"
+                generate_completions_from_executable(bin/"verger", "completion", shells: [:bash, :zsh, :fish])
               end
 
               test do
