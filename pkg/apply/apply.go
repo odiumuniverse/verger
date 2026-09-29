@@ -53,6 +53,11 @@ type Action struct {
 	Previous  *receipt.Receipt // update/remove: the last installed cell
 	Cause     string           // remove: user|capability|host-reset
 	Initiator string           // remove: the host that started it (§5.6)
+	// Restored marks a delivery that had no receipt on this machine: the
+	// package arrived from the lock, so what the executor writes is a
+	// restore, not an install. Only the plan knows what this machine had
+	// before, so the verdict is made there and carried, not rediscovered.
+	Restored bool
 }
 
 // Plan is the ordered set of actions one reconcile cycle executes.
@@ -73,6 +78,12 @@ const (
 	StatusNeedsAuth    Status = "needs-auth"
 	StatusNeedsRuntime Status = "needs-runtime"
 	StatusForeign      Status = "foreign"
+	// StatusSkipped means the delivery ran and wrote nothing on purpose: the
+	// package had nothing for this host, or all of it was already there. It
+	// is deliberately not "current" — a cell that says it wrote files while
+	// the disk holds none and the receipt holds no digest is the one answer
+	// that must never be printed.
+	StatusSkipped Status = "skipped"
 )
 
 // CellResult reports one executed action.
@@ -85,6 +96,15 @@ type CellResult struct {
 	Status   Status
 	Version  string
 	Notes    []string
+	// Backup is where the user's own copy of an overwritten file was kept, and
+	// is set only by a forced run. It is empty otherwise, including when the
+	// run wrote a file that had no user edit behind it.
+	Backup string
+	// Restored marks a cell delivered from the lock without a receipt of its
+	// own: what arrived from a spec or a lock, not what this machine did. It
+	// is the honest "restored from lock" in a render, because a cell with a
+	// fresh receipt is an install, not a restore.
+	Restored bool
 }
 
 // CircuitState is the typed per-host circuit breaker state (DESIGN §5.2): a
@@ -145,6 +165,13 @@ type Options struct {
 	Now      func() time.Time
 	Events   chan<- Event // optional progress, never closed by apply
 	Confirm  Confirmer
+	// Force overwrites a file whose content moved since the receipt recorded
+	// it. The user's copy is kept first: Force is a way to get the package
+	// back to the spec, never a way to lose work. BackupsRoot is where that
+	// copy goes, and an empty root disables forcing rather than guessing a
+	// place to put people's files.
+	Force       bool
+	BackupsRoot string
 }
 
 // Event is one progress record. At is filled by apply.

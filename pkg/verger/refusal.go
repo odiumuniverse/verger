@@ -6,8 +6,10 @@ import (
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/consent"
 	"github.com/odiumuniverse/verger/pkg/home"
+	"github.com/odiumuniverse/verger/pkg/lock"
 	"github.com/odiumuniverse/verger/pkg/render"
 	"github.com/odiumuniverse/verger/pkg/spec"
+	"github.com/odiumuniverse/verger/pkg/store"
 )
 
 // RefusalKind is the small vocabulary a second front end branches on instead of
@@ -106,6 +108,8 @@ func Classify(err error) RefusalKind {
 	for _, candidate := range []any{
 		&spec.SchemaNewerError{},
 		&consent.SchemaNewerError{},
+		&store.SchemaNewerError{},
+		&lock.SchemaNewerError{},
 		&home.LockedError{},
 		&render.HandsOffError{},
 	} {
@@ -128,6 +132,14 @@ func refusalOfShape(err error, probe any) bool {
 		_, ok := errors.AsType[*consent.SchemaNewerError](err)
 
 		return ok
+	case *store.SchemaNewerError:
+		_, ok := errors.AsType[*store.SchemaNewerError](err)
+
+		return ok
+	case *lock.SchemaNewerError:
+		_, ok := errors.AsType[*lock.SchemaNewerError](err)
+
+		return ok
 	case *home.LockedError:
 		_, ok := errors.AsType[*home.LockedError](err)
 
@@ -145,7 +157,7 @@ func refusalOfShape(err error, probe any) bool {
 // for, so both live in one table.
 func RefusalForShape(probe any) RefusalKind {
 	switch probe.(type) {
-	case *spec.SchemaNewerError, *consent.SchemaNewerError:
+	case *spec.SchemaNewerError, *consent.SchemaNewerError, *store.SchemaNewerError, *lock.SchemaNewerError:
 		return RefusalSchemaNewer
 	case *home.LockedError:
 		return RefusalLocked

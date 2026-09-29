@@ -12,9 +12,29 @@ import (
 	"github.com/odiumuniverse/verger/pkg/source"
 )
 
+// PackInput builds the chimera input of one host package, exported so a caller
+// that previews a synth strategy renders exactly what the facade would.
+func PackInput(pkg host.Package, root string) (pack.Input, error) {
+	return packInput(pkg, root)
+}
+
+// BuildHostPackage lifts one fetched payload into the host.Package the adapters
+// take, so a front end that fetches a ref itself resolves the package the same
+// way the library does.
+func BuildHostPackage(c *Client, fetched *source.Fetched, id host.ID, version, scope, projectRoot string) (host.Package, error) {
+	return c.buildHostPackage(fetched, id, version, scope, projectRoot)
+}
+
 // buildHostPackage lifts one fetched payload into the host.Package the
 // adapters take.
 func (c *Client) buildHostPackage(fetched *source.Fetched, id host.ID, version, scope, projectRoot string) (host.Package, error) {
+	// A payload verger cannot parse must be refused here, by name: the fetcher
+	// turns a parse failure into a warning and a versionless package, which then
+	// fails deep in the executor with a message about the version (W3-E2E10 F4).
+	if err := manifest.PiPackageRefusal(fetched.Root); err != nil {
+		return host.Package{}, &deliveryRefusalError{err}
+	}
+
 	meta := fetched.Package
 
 	dataDir, err := c.Store().PackageDataPath(idString(meta), string(id))
@@ -159,6 +179,16 @@ func packInput(pkg host.Package, root string) (pack.Input, error) {
 		Root: root, Components: pkg.Components, MCP: pkg.MCP, Hooks: pkg.Hooks,
 	}, nil
 }
+
+// deliveryRefusalError is a payload the adapter refuses to deliver, reported at
+// plan time instead of failing later with an unrelated message.
+type deliveryRefusalError struct{ cause error }
+
+// Error implements error.
+func (e *deliveryRefusalError) Error() string { return e.cause.Error() }
+
+// Unwrap returns the underlying cause.
+func (e *deliveryRefusalError) Unwrap() error { return e.cause }
 
 // SplitID splits one owner/name id.
 func SplitID(id string) (string, string) {

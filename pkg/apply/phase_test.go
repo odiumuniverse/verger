@@ -987,7 +987,7 @@ func TestDriftNoteSkipsAdapterChecked(t *testing.T) {
 				checked := map[string]bool{"/home/u/.dsh/cordis.patch.yml": true}
 				op := receipt.Op{Kind: receipt.OpWriteFile, Path: "/home/u/.dsh/cordis.patch.yml"}
 
-				note, blocked := r.driftNote(op, checked)
+				note, blocked := r.driftNote(op, checked, nil)
 				So(blocked, ShouldBeFalse)
 				So(note, ShouldBeEmpty)
 			})
@@ -995,7 +995,7 @@ func TestDriftNoteSkipsAdapterChecked(t *testing.T) {
 			Convey("Then a record op never blocks", func() {
 				op := receipt.Op{Kind: receipt.OpRecord, Path: "dsh://patch/fs", Note: "/home/u/.dsh/cordis.patch.yml"}
 
-				note, blocked := r.driftNote(op, nil)
+				note, blocked := r.driftNote(op, nil, nil)
 				So(blocked, ShouldBeFalse)
 				So(note, ShouldBeEmpty)
 			})
@@ -1007,7 +1007,7 @@ func TestDriftNoteSkipsAdapterChecked(t *testing.T) {
 				op := receipt.Op{Kind: receipt.OpWriteFile, Path: path, Digest: digest.Bytes([]byte("stale\n"))}
 				checked := map[string]bool{"/home/u/.dsh/cordis.patch.yml": true}
 
-				note, blocked := r.driftNote(op, checked)
+				note, blocked := r.driftNote(op, checked, nil)
 				So(blocked, ShouldBeTrue)
 				So(note, ShouldContainSubstring, "hands-off")
 			})

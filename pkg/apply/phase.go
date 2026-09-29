@@ -16,6 +16,7 @@ import (
 	"github.com/vmkteam/embedlog"
 
 	"github.com/odiumuniverse/verger/pkg/digest"
+	"github.com/odiumuniverse/verger/pkg/fsutil"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/lock"
 	"github.com/odiumuniverse/verger/pkg/receipt"
@@ -650,8 +651,8 @@ func (r *runner) runAction(action Action) CellResult {
 		Kind:     action.Kind,
 		Strategy: actionStrategy(action),
 		Version:  actionVersion(action),
+		Restored: action.Restored,
 	}
-
 	key := cellKey{cell.Package, string(cell.Host), cell.Scope}
 
 	if recovered, ok := r.recoveredCell(key); ok {
@@ -688,8 +689,13 @@ func (r *runner) runInstall(action Action, cell CellResult) CellResult {
 	}
 
 	// Drift detection: never replace something that changed behind the receipt.
+	// backedUp is this cell's own backup path: one forced run can touch
+	// several cells, and a single shared path would leave every cell but the
+	// last pointing at a copy that is not theirs.
+	var backedUp string
+
 	if action.Previous != nil {
-		if drift := r.driftNotes(*action.Previous); len(drift) > 0 {
+		if drift := r.driftNotes(*action.Previous, &backedUp); len(drift) > 0 {
 			cell.Status = StatusHandsOff
 			cell.Notes = slices.Clone(drift)
 			cell.Notes = append(cell.Notes, "nothing was written")
@@ -697,6 +703,8 @@ func (r *runner) runInstall(action Action, cell CellResult) CellResult {
 			return cell
 		}
 	}
+
+	cell.Backup = backedUp
 
 	planned, err := r.deliver(action, true)
 	if err != nil {
@@ -824,6 +832,23 @@ func (r *runner) commitInstall(action Action, cell CellResult, started time.Time
 
 	r.upsertLock(record)
 
+	// A delivery that recorded nothing at all wrote nothing. Saying "current"
+	// here is how `verger install` came to report two delivered hosts over an
+	// empty home: the receipt was written, it was simply empty, and nothing
+	// checked.
+	//
+	// Empty artifacts alone are not the test. A synth delivery registers a
+	// marketplace — a claim with no file behind it — and a host that
+	// registers rather than writes is still delivered. So the question is
+	// whether the receipt claims anything: no artifacts AND no operations
+	// means nothing was claimed, and "delivered" would be a lie.
+	if len(record.Artifacts) == 0 && len(record.RMA) == 0 {
+		cell.Status = StatusSkipped
+		cell.Notes = []string{"nothing to write: the package produced no files for " + string(action.Host)}
+
+		return cell
+	}
+
 	cell.Status = StatusCurrent
 	cell.Notes = slices.Clone(result.Notes)
 	cell.Notes = append(cell.Notes, dropNotes...)
@@ -930,13 +955,13 @@ func (r *runner) finishRemove(action Action, outcome rmaOutcome) error {
 
 // driftNotes compares the previous receipt against the disk and reports every
 // mismatch; an empty result means the cell is safe to touch.
-func (r *runner) driftNotes(prev receipt.Receipt) []string {
+func (r *runner) driftNotes(prev receipt.Receipt, backedUp *string) []string {
 	adapterChecked := adapterCheckedDocuments(prev.RMA)
 
 	var notes []string
 
 	for _, op := range prev.RMA {
-		if note, blocked := r.driftNote(op, adapterChecked); blocked {
+		if note, blocked := r.driftNote(op, adapterChecked, backedUp); blocked {
 			notes = append(notes, note)
 		}
 	}
@@ -964,18 +989,24 @@ func adapterCheckedDocuments(ops []receipt.Op) map[string]bool {
 
 // driftNote checks one receipt operation against the disk; blocked is true when
 // the artifact must not be touched.
-func (r *runner) driftNote(op receipt.Op, adapterChecked map[string]bool) (string, bool) {
+func (r *runner) driftNote(op receipt.Op, adapterChecked map[string]bool, backedUp *string) (string, bool) {
+	// DRIFT-2: a document the adapter owns record by record is not compared
+	// as a whole, at any granularity. A coarse byte digest over such a
+	// document would call every edit in it drift — including the user's own
+	// additions, which belong to nobody verger owns — and freeze records
+	// that never moved. The adapter checks its own records and reports the
+	// one that did.
+	if adapterChecked[op.Path] && op.Kind != receipt.OpRecord {
+		return "", false
+	}
+
 	switch op.Kind {
 	case receipt.OpHostInstall, receipt.OpRecord:
 		return "", false
 	case receipt.OpConfigKey:
 		return r.driftConfigNote(op)
 	default:
-		if adapterChecked[op.Path] {
-			return "", false
-		}
-
-		return r.driftEntryNote(op)
+		return r.driftEntryNote(op, backedUp)
 	}
 }
 
@@ -1003,7 +1034,7 @@ func (r *runner) driftConfigNote(op receipt.Op) (string, bool) {
 }
 
 // driftEntryNote checks one file, tree or link against its receipt digest.
-func (r *runner) driftEntryNote(op receipt.Op) (string, bool) {
+func (r *runner) driftEntryNote(op receipt.Op, backedUp *string) (string, bool) {
 	info, err := os.Lstat(op.Path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false
@@ -1019,10 +1050,79 @@ func (r *runner) driftEntryNote(op receipt.Op) (string, bool) {
 	}
 
 	if current != op.Digest {
+		// A forced run keeps the user's copy before it writes ours. The
+		// overwrite is the point of Force; losing the edit is not.
+		if r.opts.Force && r.opts.BackupsRoot != "" {
+			saved, err := r.backupUserEdit(op)
+			if err != nil {
+				// A forced run that cannot keep the user's copy must not
+				// overwrite anyway, and it must not hide why: a silent
+				// fall-through to hands-off reads as "you forgot
+				// --force", which sends the reader to the wrong flag.
+				return op.Path + ": hands-off (forced, but the backup failed: " + err.Error() + ")", true
+			}
+
+			*backedUp = saved
+
+			return "", false
+		}
+
 		return op.Path + ": hands-off (the artifact changed since the receipt)", true
 	}
 
 	return "", false
+}
+
+// backupUserEdit copies one artifact into the run's backup root and returns
+// where it went. The layout is <root>/<UTC stamp>/<path>, so one run's copies
+// never collide and the stamp orders them the way they happened. The
+// artifact keeps its name and its bytes; only its place changes.
+//
+// The kind decides the copy, because a delivered skill is a directory: reading
+// it as a file failed on every tree-shaped package, and the caller turned that
+// failure back into a hands-off note that still said "rerun with --force" —
+// the one answer that sends a reader to a flag they already used.
+func (r *runner) backupUserEdit(op receipt.Op) (string, error) {
+	stamp := r.now().UTC().Format("20060102T150405Z")
+	dest := filepath.Join(r.opts.BackupsRoot, stamp, op.Path)
+
+	if err := fsutil.EnsureDir(filepath.Dir(dest), 0o700); err != nil {
+		return "", fmt.Errorf("backup %s: %w", op.Path, err)
+	}
+
+	if op.Kind == receipt.OpCopyTree {
+		if err := fsutil.CopyTree(r.ctx, op.Path, dest); err != nil {
+			return "", fmt.Errorf("backup %s: %w", op.Path, err)
+		}
+
+		return dest, nil
+	}
+
+	// A symlink is backed up as the link it is, not as whatever it points at:
+	// restoring the target's bytes would restore a different artifact.
+	if op.Kind == receipt.OpSymlink {
+		target, err := os.Readlink(op.Path)
+		if err != nil {
+			return "", fmt.Errorf("backup %s: %w", op.Path, err)
+		}
+
+		if err := os.Symlink(target, dest); err != nil {
+			return "", fmt.Errorf("backup %s: %w", op.Path, err)
+		}
+
+		return dest, nil
+	}
+
+	data, err := os.ReadFile(op.Path) //nolint:gosec // G304: the path comes from a receipt
+	if err != nil {
+		return "", fmt.Errorf("backup %s: %w", op.Path, err)
+	}
+
+	if err := fsutil.WriteFileAtomic(dest, data, 0o600); err != nil {
+		return "", fmt.Errorf("backup %s: %w", op.Path, err)
+	}
+
+	return dest, nil
 }
 
 // dropOld executes the previous receipt's RMA for artifacts the new delivery
@@ -1571,7 +1671,7 @@ func (r *runner) planFailure(cell CellResult, action Action, err error) CellResu
 		}
 
 		cell.Status = StatusHandsOff
-		cell.Notes = append(cell.Notes, err.Error())
+		cell.Notes = append(cell.Notes, err.Error(), "nothing was written")
 
 		return cell
 	}
@@ -1800,6 +1900,9 @@ func (r *runner) setCell(idx int, cell CellResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// The backup path is per cell, not per run: one forced run can touch
+	// several cells and each has to name its own copy. The run's directory
+	// is shared, the path inside it is not.
 	r.cells[idx] = cell
 }
 
