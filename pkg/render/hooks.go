@@ -24,6 +24,12 @@ type HookPlan struct {
 	// the whole document.
 	Events   []HookEventPlan
 	Warnings []string
+	// Refused names the records this plan left alone because their bytes on
+	// disk are not the ones the receipt recorded. It is structured, not
+	// folded into Warnings, because a refused record is a verdict the caller
+	// has to report as hands-off — a warning in a note list reads as success
+	// to everything downstream, including a script checking the exit code.
+	Refused []string
 }
 
 // HookEventPlan is one event's records as this plan wrote them.
@@ -103,7 +109,7 @@ func PlanHooks(format manifest.Format, existing []byte, hooks []manifest.Hook, o
 		}
 	}
 
-	merged, warns := mergeHooksObject(existingHooks, rendered, format, owned)
+	merged, warns := mergeHooksObject(existingHooks, rendered, format, owned, &plan.Refused)
 
 	plan.Warnings = append(plan.Warnings, warns...)
 
@@ -197,7 +203,7 @@ func existingHooksObject(existing []byte) (map[string]any, error) {
 
 // mergeHooksObject rebuilds the hooks object: our entries are replaced by the
 // fresh render, foreign entries and foreign handlers stay.
-func mergeHooksObject(existing map[string]any, rendered map[string][]any, format manifest.Format, owned Owned) (map[string]any, []string) {
+func mergeHooksObject(existing map[string]any, rendered map[string][]any, format manifest.Format, owned Owned, refused *[]string) (map[string]any, []string) {
 	renderedCommands := hookCommandSet(rendered)
 
 	events := map[string]bool{}
@@ -215,7 +221,7 @@ func mergeHooksObject(existing map[string]any, rendered map[string][]any, format
 	out := map[string]any{}
 
 	for _, event := range sortedKeys(events) {
-		value, eventWarns := mergeHookEvent(event, existing[event], rendered[event], renderedCommands, format, owned)
+		value, eventWarns := mergeHookEvent(event, existing[event], rendered[event], renderedCommands, format, owned, refused)
 
 		warns = append(warns, eventWarns...)
 
@@ -249,7 +255,7 @@ func hookCommandSet(rendered map[string][]any) map[string]bool {
 
 // mergeHookEvent merges one event: a malformed value stays untouched, entries
 // ours are replaced, mixed and foreign entries are preserved.
-func mergeHookEvent(event string, existing any, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned) (any, []string) {
+func mergeHookEvent(event string, existing any, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned, refused *[]string) (any, []string) {
 	if existing != nil {
 		if _, isList := existing.([]any); !isList {
 			if len(fresh) == 0 {
@@ -263,11 +269,11 @@ func mergeHookEvent(event string, existing any, fresh []any, renderedCommands ma
 
 	list, _ := existing.([]any)
 
-	return mergeHookEntries(event, list, fresh, renderedCommands, format, owned)
+	return mergeHookEntries(event, list, fresh, renderedCommands, format, owned, refused)
 }
 
 // mergeHookEntries rebuilds one event's array.
-func mergeHookEntries(event string, list, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned) (any, []string) {
+func mergeHookEntries(event string, list, fresh []any, renderedCommands map[string]bool, format manifest.Format, owned Owned, refused *[]string) (any, []string) {
 	var (
 		next  []any
 		warns []string
@@ -294,6 +300,7 @@ func mergeHookEntries(event string, list, fresh []any, renderedCommands map[stri
 			// Ours by command, but the bytes on disk are not the bytes the
 			// receipt recorded: the user edited this record, so it stays.
 			next = append(next, entry)
+			*refused = append(*refused, hookRecordLabel(commands))
 			warns = append(warns, fmt.Sprintf(
 				"%s hooks: %s: the record changed outside verger; left in place", format, hookRecordLabel(commands)))
 		case ours == len(commands):

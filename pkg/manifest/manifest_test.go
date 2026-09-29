@@ -1309,3 +1309,57 @@ func TestReferencesEdges(t *testing.T) {
 		})
 	})
 }
+
+// TestPiPackageIsRecognisedAndRefused pins W3-E2E10 F4: a payload whose only
+// manifest is pi's `package.json` is recognised as a pi package and refused by
+// name, instead of degrading into a versionless package that fails later in the
+// executor.
+func TestPiPackageIsRecognisedAndRefused(t *testing.T) {
+	Convey("Given payloads with different manifests", t, func() {
+		write := func(t *testing.T, name, body string) string {
+			t.Helper()
+
+			root := t.TempDir()
+
+			if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o600); err != nil {
+				t.Fatalf("write %s: %v", name, err)
+			}
+
+			return root
+		}
+
+		Convey("When the payload carries a pi key", func() {
+			root := write(t, "package.json", `{"name":"pi-pkg","version":"1.0.0","pi":{"skills":["./skills"]}}`)
+
+			Convey("Then it is a pi package and the refusal names the way out", func() {
+				So(manifest.IsPiPackage(root), ShouldBeTrue)
+
+				err := manifest.PiPackageRefusal(root)
+				So(err, ShouldBeError)
+				So(manifest.IsPiPackageError(err), ShouldBeTrue)
+				So(err.Error(), ShouldContainSubstring, "pi install <path>")
+			})
+		})
+
+		Convey("When the payload only carries the pi-package keyword", func() {
+			root := write(t, "package.json", `{"name":"pi-pkg","keywords":["pi-package"]}`)
+
+			Convey("Then it is still a pi package", func() {
+				So(manifest.IsPiPackage(root), ShouldBeTrue)
+			})
+		})
+
+		Convey("When the payload is an ordinary npm package", func() {
+			root := write(t, "package.json", `{"name":"lib","version":"2.0.0"}`)
+
+			Convey("Then verger does not claim it", func() {
+				So(manifest.IsPiPackage(root), ShouldBeFalse)
+				So(manifest.PiPackageRefusal(root), ShouldBeNil)
+			})
+		})
+
+		Convey("When there is no package.json at all", func() {
+			So(manifest.IsPiPackage(t.TempDir()), ShouldBeFalse)
+		})
+	})
+}

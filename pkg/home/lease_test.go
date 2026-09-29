@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -379,6 +380,80 @@ func TestLeaseInvalidOwner(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestAcquireTakesOverAStaleLease pins the reclaim. A lease file outlives the
+// process that wrote it whenever the machine is killed rather than shut
+// down, and a watcher that refuses forever because a dead pid is in a file
+// is a watcher that never comes back after a crash — the same reason the
+// lock is taken before the file is read.
+func TestAcquireTakesOverAStaleLease(t *testing.T) {
+	Convey("Given a lease file left by a process that is gone", t, func() {
+		path := leasePath(t)
+
+		stale := Lease{
+			PID:   deadPID(t),
+			Owner: LeaseOwnerBeadle,
+			Since: time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC),
+		}
+
+		data, err := json.Marshal(stale)
+		So(err, ShouldBeNil)
+		mkFile(t, path, string(data), 0o600)
+
+		Convey("Then acquiring succeeds and names the new holder", func() {
+			handle, err := AcquireLease(path, LeaseOwnerVerger)
+			So(err, ShouldBeNil)
+			So(handle, ShouldNotBeNil)
+
+			So(handle.Info().Owner, ShouldEqual, LeaseOwnerVerger)
+			So(handle.Info().PID, ShouldEqual, os.Getpid())
+
+			Convey("And the file on disk is the new lease, not the stale one", func() {
+				info, _, statusErr := LeaseStatus(path)
+				So(statusErr, ShouldBeNil)
+				So(info.Owner, ShouldEqual, LeaseOwnerVerger)
+				So(info.PID, ShouldEqual, os.Getpid())
+			})
+
+			So(handle.Release(), ShouldBeNil)
+		})
+	})
+}
+
+// TestAcquireRefusesALiveForeignLease is the other half: a lease whose holder
+// is alive is not stale, and taking it would put two watchers on one home.
+func TestAcquireRefusesALiveForeignLease(t *testing.T) {
+	Convey("Given a lease held right now by another owner", t, func() {
+		path := leasePath(t)
+
+		handle, err := AcquireLease(path, LeaseOwnerBeadle)
+		So(err, ShouldBeNil)
+
+		Convey("Then a second acquire is refused and names the holder", func() {
+			_, err := AcquireLease(path, LeaseOwnerVerger)
+			So(err, ShouldNotBeNil)
+
+			held, ok := errors.AsType[*LeaseHeldError](err)
+			So(ok, ShouldBeTrue)
+			So(held.Owner, ShouldEqual, LeaseOwnerBeadle)
+			So(err.Error(), ShouldContainSubstring, LeaseOwnerBeadle)
+		})
+
+		So(handle.Release(), ShouldBeNil)
+	})
+}
+
+// deadPID returns a pid that is not running. It starts a short-lived child
+// and waits for it, so the number is one the OS has actually reaped rather
+// than one this test made up and hopes is unused.
+func deadPID(t *testing.T) int {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "true")
+	So(cmd.Run(), ShouldBeNil)
+
+	return cmd.Process.Pid
 }
 
 func TestLeaseStatusReadsBeforeReleasingProbe(t *testing.T) {

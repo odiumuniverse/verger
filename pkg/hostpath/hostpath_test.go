@@ -1011,3 +1011,43 @@ func TestBeadleFacingSurfaces(t *testing.T) {
 		})
 	})
 }
+
+// TestKiloProjectSurfacesAreTheNamesKiloAnswers pins the kilo project paths
+// against what kilo 7.8.1 was observed to read, so the table cannot drift
+// back to a comment that was never probed.
+func TestKiloProjectSurfacesAreTheNamesKiloAnswers(t *testing.T) {
+	Convey("Given kilo's project surfaces", t, func() {
+		s := hostpath.ProjectSurfaces(hostpath.Kilo, "/repo")
+
+		Convey("Then the paths are the ones kilo 7.8.1 was observed reading", func() {
+			// `kilo config check` flagged a bad MCP entry planted in each of
+			// .kilo/kilo.json, ./kilo.json and ./kilo.jsonc, so the host
+			// reads all three and any one of them is a valid write target.
+			// `kilo debug agent <name>` resolved a planted agent from both
+			// .kilo/agent/ and .kilo/agents/.
+			So(s.MCPDoc, ShouldEqual, "/repo/.kilo/kilo.json")
+			So(s.Agents, ShouldEqual, "/repo/.kilo/agents")
+			So(s.Skills, ShouldEqual, "/repo/.kilo/skills")
+			So(s.Commands, ShouldEqual, "/repo/.kilo/commands")
+			So(s.Rules, ShouldEqual, "/repo/AGENTS.md")
+		})
+	})
+}
+
+// TestDshHasNoProjectMCPSurface pins the one "empty" entry that is a
+// decision rather than an omission. dsh writes MCP into a profile-level
+// cordis.patch.yml (its own bundle places it in the profile's
+// compatibility.json, beside package.json), so there is no per-project file to
+// name. Inventing one would send a project's MCP servers somewhere dsh reads
+// at no scope; pkg/host's refuseOutsideProject turns the gap into a refusal.
+func TestDshHasNoProjectMCPSurface(t *testing.T) {
+	Convey("Given dsh's project surfaces", t, func() {
+		s := hostpath.ProjectSurfaces(hostpath.DSH, "/repo")
+
+		Convey("Then the surfaces dsh does have are present and MCPDoc is empty", func() {
+			So(s.Rules, ShouldEqual, "/repo/AGENTS.md")
+			So(s.Skills, ShouldEqual, "/repo/.dsh/skills")
+			So(s.MCPDoc, ShouldBeEmpty)
+		})
+	})
+}

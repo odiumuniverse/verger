@@ -63,9 +63,12 @@ type SchemaNewerError struct {
 	Supported int
 }
 
-// Error implements error.
+// Error implements error. The message is the one a user must act on, so it
+// names both versions and the way out: a file written by a newer verger is
+// never rewritten by an older one, and the only fix is to update.
 func (e *SchemaNewerError) Error() string {
-	return fmt.Sprintf("lock %s: schema %d is newer than supported %d", e.Path, e.Found, e.Supported)
+	return fmt.Sprintf("lock %s: written by a newer verger (schema %d > %d) — update verger/beadle",
+		e.Path, e.Found, e.Supported)
 }
 
 // SchemaInvalidError reports a lock without a usable schema version.
@@ -340,8 +343,20 @@ func (l *Lock) marshalCompact() ([]byte, error) {
 		return nil, &InvalidLockError{Cause: errors.New("nil lock")}
 	}
 
+	// Both directions are refused, not just the newer one. A Lock built in
+	// code with Schema 0 used to marshal and be written, producing a file
+	// claiming a schema this build does not implement — and the read path
+	// already refused it, so the tool could write a lock it could not read
+	// back. pkg/spec made the same call for the same reason.
+	//
+	// Path is left empty: Marshal has none to name. A caller going through
+	// Save gets the path from the file it refused to write.
 	if l.Schema > Schema {
-		return nil, &SchemaNewerError{Found: l.Schema}
+		return nil, &SchemaNewerError{Found: l.Schema, Supported: Schema}
+	}
+
+	if l.Schema <= 0 {
+		return nil, &SchemaInvalidError{Found: l.Schema}
 	}
 
 	copied := *l

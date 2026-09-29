@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -32,11 +31,15 @@ const (
 	trashLockRetry = 100 * time.Millisecond
 )
 
-// Test seams: production uses the fsutil implementations directly. These three
+// Test seams: production uses the fsutil implementations directly. These
 // unexported package vars are the accepted exception to "no production globals"
 // (the fsutil.renameForTest pattern, phase0-decisions verify-1 T0.4 Q4).
+//
+// There are two, not three. There was a `renameEntry = os.Rename` seam for the
+// hand-written rename-with-EXDEV-fallback that `moveEntry` used to carry; with
+// fsutil.MoveTree accepting file and symlink sources, that fallback is
+// fsutil's and is tested there, so the seam went with the duplication.
 var (
-	renameEntry    = os.Rename
 	moveTree       = fsutil.MoveTree
 	writeEntryFile = fsutil.WriteFileAtomic
 )
@@ -223,7 +226,17 @@ func (t *Trash) Put(ctx context.Context, src string, opts PutOptions) (Entry, er
 }
 
 // List returns every readable trash entry, sorted by removal time then id.
-// Buckets without entry.json are skipped.
+// Buckets without entry.json are skipped — they are a crashed put, and
+// `verger gc` collects them.
+//
+// Every other failure stops the listing and is returned, including a bucket
+// written by a newer verger, which surfaces as a *SchemaNewerError. That is
+// deliberate, and it is why this doc names two error types where one would do:
+// a corrupt bucket is this build's problem and a newer schema is not. Skipping
+// the second would let an older verger quietly hide entries it cannot read, so
+// a remove would report the package as gone while its bytes sit in the trash.
+//
+// Use errors.As to tell them apart; both carry the id you need to act on.
 func (t *Trash) List() ([]Entry, error) {
 	entries, err := os.ReadDir(t.dir)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -586,136 +599,24 @@ func lstatExists(path string) (bool, error) {
 	}
 }
 
-// moveEntry moves one filesystem entry. Directory trees go through
-// fsutil.MoveTree; files and symlinks use rename with an EXDEV copy fallback,
-// because fsutil.MoveTree accepts directory sources only.
+// moveEntry moves one filesystem entry — a directory tree, a regular file or
+// a symlink — through fsutil.MoveTree, which takes all three and owns the
+// cross-device fallback: on EXDEV it stages a copy beside the destination,
+// renames it into place, and only then removes the source.
+//
+// This used to branch. Directories went to MoveTree, while files and symlinks
+// had a hand-written rename-then-copy fallback here, on the grounds that
+// MoveTree accepted directory sources only. `checkTreeArgs` has accepted files
+// and symlinks since, so the branch was two implementations of one rule — and
+// the local one was the weaker of the two: it copied straight onto the
+// destination instead of staging and renaming, so a crash mid-copy left a
+// half-written payload where the original had been.
 func moveEntry(ctx context.Context, from, to string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	info, err := os.Lstat(from)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return &fsutil.SourceMissingError{Path: from}
-		}
-
-		return fmt.Errorf("stat %s: %w", from, err)
-	}
-
-	switch {
-	case info.IsDir():
-		return moveTree(ctx, from, to)
-	case info.Mode()&fs.ModeSymlink != 0:
-		return moveSymlink(ctx, from, to)
-	case info.Mode().IsRegular():
-		return moveRegular(ctx, from, to, info.Mode().Perm())
-	default:
-		return fmt.Errorf("move %s: unsupported file type %s", from, info.Mode())
-	}
-}
-
-// moveRegular renames one file, falling back to a copy across filesystems.
-func moveRegular(ctx context.Context, from, to string, perm fs.FileMode) error {
-	err := renameEntry(from, to)
-	if err == nil {
-		return nil
-	}
-
-	if !fsutil.IsCrossDevice(err) {
-		return fmt.Errorf("rename %s to %s: %w", from, to, err)
-	}
-
-	return copyRegular(ctx, from, to, perm)
-}
-
-// moveSymlink renames one symlink, falling back to a recreated link.
-func moveSymlink(ctx context.Context, from, to string) error {
-	err := renameEntry(from, to)
-	if err == nil {
-		return nil
-	}
-
-	if !fsutil.IsCrossDevice(err) {
-		return fmt.Errorf("rename %s to %s: %w", from, to, err)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	target, err := os.Readlink(from)
-	if err != nil {
-		return fmt.Errorf("read symlink %s: %w", from, err)
-	}
-
-	if err := os.Symlink(target, to); err != nil {
-		return fmt.Errorf("create symlink %s: %w", to, err)
-	}
-
-	if err := os.Remove(from); err != nil {
-		_ = os.Remove(to)
-
-		return fmt.Errorf("remove source %s: %w", from, err)
-	}
-
-	return nil
-}
-
-// copyRegular copies one regular file and removes the source after the
-// destination is synced and chmodded.
-func copyRegular(ctx context.Context, from, to string, perm fs.FileMode) error {
-	src, err := os.Open(from) //nolint:gosec // G304: the caller names the entry being moved
-	if err != nil {
-		return fmt.Errorf("open %s: %w", from, err)
-	}
-
-	defer func() { _ = src.Close() }()
-
-	dst, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm) //nolint:gosec // G304: to is inside the trash bucket
-	if err != nil {
-		return fmt.Errorf("create %s: %w", to, err)
-	}
-
-	if _, err := io.Copy(dst, src); err != nil {
-		_ = dst.Close()
-		_ = os.Remove(to)
-
-		return fmt.Errorf("copy %s: %w", to, err)
-	}
-
-	if err := dst.Sync(); err != nil {
-		_ = dst.Close()
-		_ = os.Remove(to)
-
-		return fmt.Errorf("sync %s: %w", to, err)
-	}
-
-	if err := dst.Close(); err != nil {
-		_ = os.Remove(to)
-
-		return fmt.Errorf("close %s: %w", to, err)
-	}
-
-	if err := os.Chmod(to, perm); err != nil {
-		_ = os.Remove(to)
-
-		return fmt.Errorf("chmod %s: %w", to, err)
-	}
-
-	if err := ctx.Err(); err != nil {
-		_ = os.Remove(to)
-
-		return err
-	}
-
-	if err := os.Remove(from); err != nil {
-		_ = os.Remove(to)
-
-		return fmt.Errorf("remove source %s: %w", from, err)
-	}
-
-	return nil
+	return moveTree(ctx, from, to)
 }
 
 // RestoreConflictError reports a restore whose original path already exists.

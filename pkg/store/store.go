@@ -51,6 +51,14 @@ func WithTrashRetention(d time.Duration) Option {
 	}
 }
 
+// TrashRetention reports the window a purge keeps entries for. It is
+// readable so a front end can tell the user what their store will do rather
+// than leaving them to infer it, and so a test can prove the option it passed
+// reached the store instead of stopping at a facade field.
+func (s *Store) TrashRetention() time.Duration {
+	return s.retention
+}
+
 // WithClock replaces the time source; nil keeps time.Now.
 func WithClock(now func() time.Time) Option {
 	return func(s *Store) {

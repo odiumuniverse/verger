@@ -1102,10 +1102,13 @@ func ProjectSurfaces(id, project string) HostSurfaces {
 		s.Agents = in(project, ".opencode/agents")
 		s.Commands = in(project, ".opencode/commands")
 	case Kilo:
-		// From the host's own source (kilocode packages/core/src/config/
-		// paths.ts): the project config is kilo.jsonc, and `.kilo/` wins
-		// over a bare kilo.jsonc when both exist. Not probe-verified: the
-		// live kilo 7.8.1 probes in this task covered the user root only.
+		// Probe-verified against kilo 7.8.1 with `kilo config check` and
+		// `kilo debug agent <name>`: kilo reads .kilo/kilo.json, ./kilo.json
+		// and ./kilo.jsonc alike, with no precedence observable between
+		// them, and it loads agents from .kilo/agent/ and .kilo/agents/ both.
+		// One write target is therefore enough. This replaces an earlier
+		// comment here that asserted kilo.jsonc and a ".kilo/ wins"
+		// precedence, both of which the live probes contradict.
 		s.Rules = in(project, "AGENTS.md")
 		s.MCPDoc = in(project, ".kilo/kilo.json")
 		s.Skills = in(project, ".kilo/skills")
@@ -1135,9 +1138,17 @@ func ProjectSurfaces(id, project string) HostSurfaces {
 		}
 	case DSH:
 		// DSH walks every AGENTS.md and CLAUDE.md from the git root down to
-		// the working directory, so there is no single project path. No dsh
-		// binary is installed on either platform; this mirrors beadle
-		// pkg/agent/dsh_chain.go:16,87-113.
+		// the working directory, so there is no single project path. This
+		// mirrors beadle pkg/agent/dsh_chain.go:16,87-113.
+		//
+		// There is deliberately NO MCPDoc. dsh 0.1.7-rc.2 is installed (it
+		// lives on the node 24 prefix), and its own bundle says
+		// cordis.patch.yml — the file dshSpec writes MCP into — lives in the
+		// profile's own compatibility.json beside package.json, not under a
+		// project directory. The profile is a user-scope layer, so dsh has no
+		// per-project MCP surface and an empty entry here is the truth, not an
+		// omission. pkg/host's refuseOutsideProject turns that into a refusal
+		// at project scope rather than a silent write into $HOME.
 		s.Rules = in(project, "AGENTS.md")
 		s.Skills = in(project, ".dsh/skills")
 	case Omp:

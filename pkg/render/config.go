@@ -30,7 +30,23 @@ type Change struct {
 }
 
 // Owned maps a key path to the digest of the value verger wrote last time.
+//
+// A document whose records verger claims one by one (a hook document keyed per
+// record) also carries the key itself, but the key's whole-object digest is not
+// an ownership signal: a user adding their OWN record changes it without
+// touching verger's. PerRecordKey marks such a key, so the check is skipped in
+// favour of the per-record guard (DRIFT-2).
 type Owned map[string]digest.Hash
+
+// perRecordPrefix marks an Owned entry as "checked record by record, not as a
+// whole key".
+const perRecordPrefix = "per-record:"
+
+// PerRecordKey is the Owned entry that hands ownership of one key over to its
+// records.
+func PerRecordKey(keyPath string) string {
+	return perRecordPrefix + keyPath
+}
 
 // HandsOffError reports a key that changed outside verger: the owned hash does
 // not match the current value, so nothing is written. Path is the top-level
@@ -348,6 +364,10 @@ func canonicalDigest(value any) digest.Hash {
 
 // ownershipError reports a present key verger does not own.
 func ownershipError(owned Owned, keyPath string, current any) error {
+	if _, perRecord := owned[PerRecordKey(keyPath)]; perRecord {
+		return nil
+	}
+
 	digest, ok := owned[keyPath]
 	if ok && digest == canonicalDigest(current) {
 		return nil

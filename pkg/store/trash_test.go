@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -323,10 +322,14 @@ func TestTrashPutFailureRollsBack(t *testing.T) {
 		tr := st.Trash()
 
 		Convey("When the move into the bucket fails", func() {
-			restore := renameEntry
-			renameEntry = func(_, _ string) error { return errors.New("boom") }
+			// The seam is the whole move, not the rename inside it: the
+			// cross-device fallback moved to fsutil when MoveTree learned to
+			// take a file source, and it is tested there
+			// (TestMoveTreeFileSourceCrossDevice).
+			restore := moveTree
+			moveTree = func(context.Context, string, string) error { return errors.New("boom") }
 
-			defer func() { renameEntry = restore }()
+			defer func() { moveTree = restore }()
 
 			src := filepath.Join(t.TempDir(), "file.txt")
 			mkFile(t, src, "keep me", 0o600)
@@ -364,13 +367,18 @@ func TestTrashPutFailureRollsBack(t *testing.T) {
 	})
 }
 
-func TestTrashCrossDeviceFile(t *testing.T) {
-	Convey("Given a store whose rename always reports EXDEV", t, func() {
-		restore := renameEntry
-		renameEntry = func(_, _ string) error { return syscall.EXDEV }
-
-		defer func() { renameEntry = restore }()
-
+// TestTrashFileRoundTrip pins what the trash promises for a plain file: it
+// leaves the source, keeps the payload in the bucket, and puts the bytes back
+// where they were.
+//
+// The cross-device path itself is no longer simulated here. It used to be,
+// through a `renameEntry` seam that fed a hand-written EXDEV fallback living
+// in this package. That fallback moved to fsutil when MoveTree learned to take
+// a file source, and it is tested there — TestMoveTreeFileSourceCrossDevice
+// and TestMoveTreeCrossDevice. Simulating it from here would have re-pinned a
+// mechanism this package no longer owns.
+func TestTrashFileRoundTrip(t *testing.T) {
+	Convey("Given a store", t, func() {
 		clock := &fixedClock{at: time.Date(2026, 9, 25, 1, 2, 3, 4, time.UTC)}
 		st := newStore(t, clock.now)
 		tr := st.Trash()
@@ -378,29 +386,29 @@ func TestTrashCrossDeviceFile(t *testing.T) {
 		Convey("When a regular file is trashed and restored", func() {
 			dir := t.TempDir()
 			src := filepath.Join(dir, "file.bin")
-			mkFile(t, src, "cross-device", 0o640)
+			mkFile(t, src, "round-trip", 0o640)
 
 			entry, err := tr.Put(context.Background(), src, PutOptions{})
 
-			Convey("Then it is copied into the bucket and moved back on restore", func() {
+			Convey("Then the payload sits in the bucket and the bytes come back", func() {
 				So(err, ShouldBeNil)
 				assertMissing(t, src)
 
 				payload := filepath.Join(st.TrashDir(), entry.ID, "payload")
 
-				So(string(readTestFile(t, payload)), ShouldEqual, "cross-device")
+				So(string(readTestFile(t, payload)), ShouldEqual, "round-trip")
 				So(payload, ShouldNotEqual, src)
 
 				restored, restoreErr := tr.Restore(context.Background(), entry.ID)
 				So(restoreErr, ShouldBeNil)
 				So(restored.ID, ShouldEqual, entry.ID)
 
-				So(string(readTestFile(t, src)), ShouldEqual, "cross-device")
+				So(string(readTestFile(t, src)), ShouldEqual, "round-trip")
 				So(bucketNames(t, st.TrashDir()), ShouldBeEmpty)
 			})
 		})
 
-		Convey("When a symlink is trashed across devices", func() {
+		Convey("When a symlink is trashed", func() {
 			dir := t.TempDir()
 			target := filepath.Join(dir, "target.txt")
 			mkFile(t, target, "data", 0o600)
@@ -867,6 +875,93 @@ func TestTrashPurgeJunkAndCustomRetention(t *testing.T) {
 	})
 }
 
+// TestTrashListNamesBothErrorClasses closes N005. The doc used to name only
+// *CorruptTrashError, which left a reader assuming that was the only way List
+// could fail. It is not, and the difference is not cosmetic: a corrupt bucket
+// is this build's problem, a newer schema is not, and treating the second like
+// the first — skipping it — would let an older verger hide entries it cannot
+// read, so a remove would report the package as gone while its bytes sat in
+// the trash.
+//
+// The two cases are separate on purpose. List walks the buckets in name
+// order, so a trash holding both would report whichever sorts first and the
+// assertion would be about the accident of the names rather than the class.
+func TestTrashListNamesBothErrorClasses(t *testing.T) {
+	Convey("Given a bucket written by a newer verger", t, func() {
+		clock := &fixedClock{at: time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)}
+		st := newStore(t, clock.now)
+		tr := st.Trash()
+		So(st.Ensure(), ShouldBeNil)
+
+		newer := filepath.Join(st.TrashDir(), "newer")
+		So(os.Mkdir(newer, 0o700), ShouldBeNil)
+		mkFile(t, filepath.Join(newer, entryFileName),
+			`{"schema":2,"id":"newer","original":"/tmp/x","stored":"payload","kind":"file"}`, 0o600)
+
+		Convey("When List runs", func() {
+			_, err := tr.List()
+
+			Convey("Then it refuses, naming the newer schema", func() {
+				So(err, ShouldNotBeNil)
+
+				newerErr := &SchemaNewerError{}
+				So(errors.As(err, &newerErr), ShouldBeTrue)
+				So(newerErr.Supported, ShouldEqual, entrySchema)
+			})
+		})
+	})
+
+	Convey("Given a corrupt bucket only", t, func() {
+		clock := &fixedClock{at: time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)}
+		st := newStore(t, clock.now)
+		tr := st.Trash()
+		So(st.Ensure(), ShouldBeNil)
+
+		corrupt := filepath.Join(st.TrashDir(), "corrupt")
+		So(os.Mkdir(corrupt, 0o700), ShouldBeNil)
+		mkFile(t, filepath.Join(corrupt, entryFileName), "{broken", 0o600)
+
+		Convey("When List runs", func() {
+			_, err := tr.List()
+
+			Convey("Then it refuses with the corrupt class, not the schema one", func() {
+				So(err, ShouldNotBeNil)
+
+				corruptErr := &CorruptTrashError{}
+				So(errors.As(err, &corruptErr), ShouldBeTrue)
+
+				newerErr := &SchemaNewerError{}
+				So(errors.As(err, &newerErr), ShouldBeFalse)
+			})
+		})
+	})
+
+	Convey("Given only an orphan and a readable entry", t, func() {
+		clock := &fixedClock{at: time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)}
+		st := newStore(t, clock.now)
+		tr := st.Trash()
+		So(st.Ensure(), ShouldBeNil)
+
+		src := filepath.Join(t.TempDir(), "kept.txt")
+		mkFile(t, src, "kept", 0o600)
+
+		kept, err := tr.Put(context.Background(), src, PutOptions{})
+		So(err, ShouldBeNil)
+
+		So(os.Mkdir(filepath.Join(st.TrashDir(), "orphan"), 0o700), ShouldBeNil)
+
+		Convey("When List runs", func() {
+			entries, err := tr.List()
+
+			Convey("Then the orphan is skipped and the real entry is listed", func() {
+				So(err, ShouldBeNil)
+				So(entries, ShouldHaveLength, 1)
+				So(entries[0].ID, ShouldEqual, kept.ID)
+			})
+		})
+	})
+}
+
 func TestTrashUnicodeAndSpaces(t *testing.T) {
 	Convey("Given paths with unicode and spaces", t, func() {
 		clock := &fixedClock{at: time.Date(2026, 9, 25, 5, 6, 7, 8, time.UTC)}
@@ -1008,9 +1103,10 @@ func TestTrashHelperProcess(t *testing.T) {
 
 	switch cfg.Mode {
 	case "slow-entry":
-		// Force the EXDEV copy so a large payload keeps the put in flight.
-		renameEntry = func(_, _ string) error { return syscall.EXDEV }
-
+		// The put is held in flight by the entry write, not by a forced EXDEV
+		// copy: the move completes first, which is exactly the window this
+		// helper needs — the payload exists while put-done has not been
+		// printed. The cross-device path is fsutil's to test now.
 		previous := writeEntryFile
 		writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
 			fmt.Println("payload-ready")
