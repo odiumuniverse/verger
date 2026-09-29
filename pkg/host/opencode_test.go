@@ -1147,8 +1147,12 @@ func TestOpenCodeRemoveThroughApply(t *testing.T) {
 	})
 }
 
-// TestOpenCodeEnvPrecedence pins the config root resolution: XDG_CONFIG_HOME
-// replaces the home-relative default (beadle's rule, byte for byte).
+// TestOpenCodeEnvPrecedence pins the whole config-root precedence, in the
+// order the host resolves it: OPENCODE_CONFIG_DIR replaces the root outright
+// and wins outright, XDG_CONFIG_HOME is the fallback, and the home-relative
+// `.config/opencode` is the default when neither is set. The first two cases
+// were live-probed on 2.0.18 with `opencode debug paths`; the precedence
+// between them follows from that probe.
 func TestOpenCodeEnvPrecedence(t *testing.T) {
 	Convey("Given a config root moved through XDG_CONFIG_HOME", t, func() {
 		fakeOpenCode(t)

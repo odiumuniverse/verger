@@ -13,10 +13,13 @@ import (
 	"github.com/odiumuniverse/verger/pkg/render"
 )
 
-// Kilo (Kilo Code, an OpenCode fork) surface names. The layout is the one
-// beadle resolves, byte for byte: `<home>/.config/kilo` (no XDG relocation
-// there, and none here), a `kilo.jsonc`/`kilo.json` config document, and the
-// same skills/agents/commands directory names as OpenCode.
+// Kilo (Kilo Code, an OpenCode fork) surface names. `<home>/.config/kilo` is
+// only the DEFAULT root: kilo relocates, and pkg/hostpath owns the rule —
+// KILO_CONFIG_DIR replaces the root outright, XDG_CONFIG_HOME is the
+// fallback, and the home default is read exactly when XDG is unset. All three
+// were measured live on 7.8.1 (W1-A §fix F2). An earlier version of this
+// comment said there was no XDG relocation "there, and none here", which
+// stopped being true when hostpath started modelling it.
 const (
 	wordKilo           = "kilo"
 	kiloDirName        = "kilo"

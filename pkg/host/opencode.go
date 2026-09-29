@@ -23,16 +23,14 @@ import (
 // skills, agents, commands and the config document (docs/tasks/phase2-wave1.md,
 // verified for agent frontmatter live on the fork, kilo 7.8.1).
 const (
-	wordOpenCode = "opencode"
-	flagVersion  = "--version"
-	// openCodeConfigDirEnv replaces the whole OpenCode config root.
-	openCodeConfigDirEnv = "OPENCODE_CONFIG_DIR"
-	openCodeDirName      = "opencode"
-	openCodeJSONC        = "opencode.jsonc"
-	openCodeJSON         = "opencode.json"
-	openCodeSkillsDir    = "skills"
-	openCodeAgentsDir    = "agents"
-	openCodeCommandDir   = "commands"
+	wordOpenCode       = "opencode"
+	flagVersion        = "--version"
+	openCodeDirName    = "opencode"
+	openCodeJSONC      = "opencode.jsonc"
+	openCodeJSON       = "opencode.json"
+	openCodeSkillsDir  = "skills"
+	openCodeAgentsDir  = "agents"
+	openCodeCommandDir = "commands"
 
 	// openCodeMCPPrefixV2 and openCodeMCPPrefixV1 are the two MCP containers
 	// the host reads; a delivery writes into the one the config already
@@ -123,18 +121,21 @@ func hostEnv(home string) hostpath.Env {
 	return hostpath.Env{Home: home, GOOS: runtime.GOOS, Lookup: os.LookupEnv}
 }
 
-// configDir resolves the OpenCode config root the way the host does, live-probed
-// on 2.0.18 (`opencode debug paths` in an isolated HOME, service started):
-// OPENCODE_CONFIG_DIR replaces the root outright and wins over
+// configDir resolves the OpenCode config root the way the host does,
+// live-probed on 2.0.18 (`opencode debug paths` in an isolated HOME, service
+// started): OPENCODE_CONFIG_DIR replaces the root outright and wins over
 // XDG_CONFIG_HOME, which wins over the home-relative `.config/opencode`. The
 // value is used verbatim — a relative one included, exactly as the host reads
-// it. pkg/hostpath models XDG and the default but not yet
-// OPENCODE_CONFIG_DIR, so that one layer lives here until it does (W1-A §fix).
+// it.
+//
+// The whole rule is hostpath's (the OpenCode root resolver in
+// pkg/hostpath/hostpath.go), so this asks it instead of repeating it. An
+// earlier version read OPENCODE_CONFIG_DIR here with its own os.Getenv and
+// left hostpath to cover only XDG and the default. That left the adapter
+// owning a second copy of a rule hostpath already models, and reading the
+// process environment outside the caller-supplied Env — the contract
+// hostpath exists to hold. The duplicated constant went with it.
 func openCodeConfigDir(home string) string {
-	if value := os.Getenv(openCodeConfigDirEnv); value != "" {
-		return value
-	}
-
 	roots, err := hostpath.Roots(hostpath.OpenCode, hostEnv(home))
 	if err != nil {
 		return filepath.Join(home, ".config", openCodeDirName)
@@ -554,7 +555,7 @@ type openCodeOracle struct {
 	base *Base
 }
 
-// openCodeOracleWait is DefaultOracleWait: the bound is injectable through
+// The oracle wait is host.DefaultOracleWait, injectable through
 // host.WithOracleWait so a test does not sit through it.
 //
 // List implements Oracle: `opencode plugin list` prints the `ID VERSION
@@ -562,7 +563,7 @@ type openCodeOracle struct {
 // found" (both captured live on 2.0.18). The CLI offers no `--json` on this
 // verb, so the table is parsed; a configured plugin the host could not
 // resolve is listed with `-` in the id and version columns and counts as
-// disabled. The call is bounded (openCodeOracleWait): the answer comes from
+// disabled. The call is bounded by that wait: the answer comes from
 // the host's background service, and a service that never comes up must not
 // hang the caller.
 func (o *openCodeOracle) List(ctx context.Context) ([]Installed, error) {
