@@ -14,6 +14,7 @@ package hostpath
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -116,6 +117,7 @@ const (
 	dshDirName      = ".dsh"
 	ompDirName      = ".omp"
 	ompAgentDirName = "agent"
+	ompConfigFile   = "config.yml"
 	ompProfilesDir  = "profiles"
 	ompDefaultName  = "default"
 	sharedDirName   = ".agents"
@@ -225,6 +227,15 @@ type HostSurfaces struct {
 	// claude and cursor use for rules that apply conditionally.
 	RulesPerFile string
 
+	// RulesReads are the project instruction documents a host reads, with the
+	// write target (ProjectSurfaces.Rules) first. Wider than one only for a
+	// host that reads several names at one level — today claude, whose
+	// project AGENTS.md is the file verger writes and which also reads
+	// .claude/CLAUDE.md and CLAUDE.md beside it. A single-entry list is
+	// filled from Rules by normalizeReadLists, exactly as the other read
+	// lists are.
+	RulesReads []string
+
 	// MCPDoc is the single MCP document when the host has one. It is empty
 	// for hosts that name their config file by extension search instead.
 	MCPDoc string
@@ -252,6 +263,16 @@ type HostSurfaces struct {
 	// ~/.gemini/skills within the same tier, so SkillsReads[0] there is the
 	// shared hub and Skills is second. A consumer that wants to write must
 	// use Skills, never Reads[0].
+	//
+	// The gemini order is not a guess. gemini-cli 0.46.0, installed on the
+	// machine this was measured on, ships the rule in its own bundle at
+	// lib/node_modules/@google/gemini-cli/bundle/docs/cli/skills.md:50-53:
+	// "Within the same tier (user or workspace), the `.agents/skills/` alias
+	// takes precedence over the `.gemini/skills/` directory." The alias IS
+	// the shared hub, so the hub ranks first.
+	//
+	// Codex is the other host whose read order is NOT measured by a probe —
+	// see fillCodex, which explains why and pins what it is.
 	SkillsReads []string
 
 	// Agents is the subagents write target, empty when the host has none.
@@ -305,6 +326,18 @@ type HostSurfaces struct {
 	// pkg/agent/pi_adapter.go:26-40.
 	AdapterProbes []string
 
+	// ProfilesDir is the directory holding a host's profile subdirectories.
+	// The resolver names it and never lists it: this package is pure, so the
+	// listing is ListProfiles' job. Empty for a host with no profiles.
+	ProfilesDir string
+
+	// Markers are the host-identity facts a detect or configured check needs
+	// — the config document a host writes on first run and the binary names
+	// that identify it. They are identity, not configuration roots, which is
+	// why they are a field here rather than something a consumer re-derives
+	// from Roots. Empty for a host with no such marker.
+	Markers HostMarkers
+
 	// IgnoreRoots are directories under a surface the host itself owns, which
 	// a canon walk must skip rather than present as user content. beadle
 	// pkg/agent/agents.go:65,156,243,346,429,494,592.
@@ -339,6 +372,21 @@ type HostSurfaces struct {
 
 	// SharedAgents is the cross-vendor ~/.agents root this host reads.
 	SharedAgents string
+}
+
+// HostMarkers are a host's identity facts: the config document that proves the
+// host has run, and the binary names that identify it. They are deliberately
+// NOT part of HostRoots — a marker is not a root, and folding one into the root
+// rules would let a root change move a marker that never moved.
+type HostMarkers struct {
+	// ConfigFile is the document the host writes on first run, so its
+	// presence is proof the host is installed and configured.
+	ConfigFile string
+
+	// Binaries are the executable names that identify the host on PATH, in
+	// preference order. A host with no verified binary name has none; a
+	// consumer must not invent one from the host id.
+	Binaries []string
 }
 
 // All returns every canonical host id, in the order the READMEs list them.
@@ -676,13 +724,29 @@ func fillCodex(s *HostSurfaces, roots HostRoots, env Env) {
 	s.MCPTable = "mcp_servers"
 	// beadle pkg/agent/inbox_path.go:24-25.
 	s.Inbox = filepath.Join(roots.ConfigRoot, "inbox.md")
-	// Codex reads BOTH skill roots: probed live on macOS and Linux 0.158.0
-	// with `codex debug prompt-input` and the same skill planted in each
-	// directory — both copies are surfaced, so the probe CANNOT rank them.
-	// The order below therefore follows beadle (pkg/agent/agents.go:385-393),
-	// not a measured precedence: the shared hub first because the host's own
-	// note calls ~/.codex/skills the deprecated location, and the deprecated
-	// directory second but still read.
+	// Codex reads BOTH skill roots, and the order below is now MEASURED rather
+	// than inherited from beadle.
+	//
+	// Probe, codex-cli 0.158.0, an isolated HOME, the same skill (`probe`) in
+	// each directory, `codex debug prompt-input`:
+	//
+	//	skill roots table:  r0 = <home>/.codex/skills
+	//	                    r1 = <home>/.agents/skills
+	//	                    r2 = <home>/.codex/skills/.system
+	//	available skills:  probe: ORDER PROBE (file: r1/probe/SKILL.md)   <- hub FIRST
+	//	                   probe: ORDER PROBE (file: r0/probe/SKILL.md)   <- own dir second
+	//
+	// Two things follow, and they are different facts. The host ENUMERATES its
+	// own directory first (r0), but PRESENTS the available skills hub-first,
+	// and that presentation order is what SkillsReads models. And codex does
+	// not de-duplicate: both copies of a clashing name are surfaced, so this
+	// list is a presentation order, not a name-clash resolution — a consumer
+	// must not read it as "the hub wins".
+	//
+	// The earlier comment here said the order followed beadle because the
+	// probe could not rank the two roots. The probe still cannot rank them
+	// (both are surfaced), but it does establish the order they are offered in,
+	// and the order below matches it. Pinned by TestCodexSkillsReadOrderIsPinned.
 	s.Skills = filepath.Join(env.Home, sharedDirName, "skills")
 	s.SkillsReads = []string{s.Skills, filepath.Join(roots.ConfigRoot, "skills")}
 	// Codex is the one host whose skills write target IS the shared hub, so
@@ -694,6 +758,11 @@ func fillCodex(s *HostSurfaces, roots HostRoots, env Env) {
 	s.Agents = filepath.Join(roots.ConfigRoot, "agents")
 	s.Commands = filepath.Join(roots.ConfigRoot, "prompts")
 	s.Hooks = filepath.Join(roots.ConfigRoot, "hooks.json")
+	// Gap 1: the same claude plugin tree is skipped for codex (beadle
+	// pkg/agent/agents.go:435).
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 3: `codex` is the verified binary name.
+	s.Markers = HostMarkers{Binaries: []string{"codex"}}
 }
 
 // fillGemini writes the gemini surface. The read ORDER is quoted from the
@@ -758,6 +827,10 @@ func fillCursor(s *HostSurfaces, roots HostRoots, env Env) {
 	s.Settings = filepath.Join(roots.SettingsRoot, "cli-config.json")
 	// beadle pkg/agent/inbox_path.go:22-23.
 	s.Inbox = filepath.Join(roots.ConfigRoot, "inbox.md")
+	// Gap 1: beadle pkg/agent/agents.go:346.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 3: the binary the host is invoked as.
+	s.Markers = HostMarkers{Binaries: []string{"cursor-agent"}}
 }
 
 // fillOpenCode writes the opencode surface. OpenCode 2.0.18 declares plugins
@@ -768,6 +841,17 @@ func fillOpenCode(s *HostSurfaces, roots HostRoots, env Env) {
 	s.fillXDG(roots, env.Home, "opencode.jsonc", "opencode.json")
 	// V2 reads AGENTS.md only.
 	s.Rules = filepath.Join(roots.ConfigRoot, "AGENTS.md")
+	// Gap 1: beadle pkg/agent/agents.go:156.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 3: `opencode` (2.0.18, probed live).
+	s.Markers = HostMarkers{Binaries: []string{"opencode"}}
+	// Gap 9: opencode HAS an inbox and beadle writes it — beadle
+	// pkg/agent/inbox_path.go:36-43 carried a local line for exactly this,
+	// keyed off roots(OpenCode, home).ConfigRoot, which is what this joins.
+	// agy and dsh stay without one: beadle models an inbox for every host
+	// except agy, opencode and dsh (inbox_path.go:36-39), and two of those
+	// three are now covered.
+	s.Inbox = filepath.Join(roots.ConfigRoot, "inbox.md")
 }
 
 // fillKilo writes the kilo surface, then widens the read lists to the pairs
@@ -819,6 +903,10 @@ func fillKilo(s *HostSurfaces, roots HostRoots, env Env) {
 	// directory is right but the extension is not free.
 	s.PluginModulesWrite = filepath.Join(roots.ConfigRoot, kiloPluginDir)
 	s.PluginModules = []string{s.PluginModulesWrite, filepath.Join(roots.ConfigRoot, kiloPluginsDir)}
+	// Gap 1: beadle pkg/agent/kilo_paths.go:93.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 3: `kilo` (7.8.1, probed live).
+	s.Markers = HostMarkers{Binaries: []string{"kilo"}}
 }
 
 // fillPi writes the pi surface. pi has no subagents and no declarative hooks;
@@ -843,6 +931,10 @@ func fillPi(s *HostSurfaces, roots HostRoots, env Env) {
 		filepath.Join(roots.ConfigRoot, "node_modules", "pi-mcp-adapter"),
 		filepath.Join(roots.ConfigRoot, "extensions", "pi-mcp-adapter"),
 	}
+	// Gap 1: beadle pkg/agent/agents.go:500.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 3: `pi` (0.74.2).
+	s.Markers = HostMarkers{Binaries: []string{"pi"}}
 }
 
 // fillDSH writes the DSH surface. DSH's MCP is a YAML patch layer, not a JSON
@@ -852,6 +944,12 @@ func fillDSH(s *HostSurfaces, roots HostRoots, env Env) {
 	s.MCPDoc = filepath.Join(roots.ConfigRoot, "cordis.patch.yml")
 	s.Skills = filepath.Join(roots.ConfigRoot, "skills")
 	s.SharedAgents = dshSharedAgents(env, env.Home)
+	// Gap 1: beadle pkg/agent/dsh.go:146.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 2: the profiles directory; the listing is ListProfiles' job.
+	s.ProfilesDir = filepath.Join(roots.ConfigRoot, ompProfilesDir)
+	// Gap 3: `dsh`, and the harness home env the host itself reads.
+	s.Markers = HostMarkers{Binaries: []string{"dsh"}}
 	s.SkillsReads = []string{s.Skills, filepath.Join(s.SharedAgents, "skills")}
 }
 
@@ -878,6 +976,22 @@ func fillOmp(s *HostSurfaces, roots HostRoots, env Env) {
 	s.Plugins = filepath.Join(roots.StateRoot, "plugins")
 	// beadle pkg/agent/inbox_path.go:30-31.
 	s.Inbox = filepath.Join(roots.ConfigRoot, "inbox.md")
+	// Gap 1: beadle pkg/agent/omp.go:222.
+	s.IgnoreRoots = claudePluginTreeIgnore(env.Home)
+	// Gap 2: the profiles directory; beadle pkg/agent/omp.go:151 lists it.
+	s.ProfilesDir = filepath.Join(roots.StateRoot, ompProfilesDir)
+	// Gap 3: the config document omp writes on first run
+	// (beadle pkg/agent/omp.go:25,103,120) and the binary name (:26).
+	//
+	// ConfigRoot ALREADY ends in the agent directory (fillOmp's root rule is
+	// <stateRoot>/agent, or <stateRoot>/profiles/<profile>/agent), so joining
+	// ompAgentDirName again produced `agent/agent/config.yml`. beadle's own
+	// ompMarker is filepath.Join(OmpAgentDir(home), ompConfigFile) — the agent
+	// dir and the file, never the dir twice.
+	s.Markers = HostMarkers{
+		ConfigFile: filepath.Join(roots.ConfigRoot, ompConfigFile),
+		Binaries:   []string{"omp"},
+	}
 }
 
 // fillXDG fills the surfaces the opencode family shares: a config document
@@ -916,11 +1030,23 @@ func ProjectSurfaces(id, project string) HostSurfaces {
 
 	switch id {
 	case Claude:
-		// From the host's own settings doc (claude-code directory layout): a
-		// project `AGENTS.md` is read natively from v2.1.280, `.mcp.json`
-		// carries project MCP servers, and `.claude/rules/*.md` are the
-		// per-file rules. A project CLAUDE.md stays the user's own file.
-		s.Rules = in(project, ".claude/CLAUDE.md")
+		// From the host's own settings doc (claude-code directory layout):
+		// `.mcp.json` carries project MCP servers and `.claude/rules/*.md`
+		// are the per-file rules.
+		//
+		// The project instruction WRITE target is <project>/AGENTS.md, which
+		// claude reads natively from v2.1.280 — beadle
+		// pkg/agent/agents.go:111 writes exactly that path, and a resolver
+		// that answered `.claude/CLAUDE.md` instead would send the digest
+		// block somewhere beadle never reads. The other two names stay in
+		// the READ list: the host reads all three, but only one of them is
+		// ours to write.
+		s.Rules = in(project, "AGENTS.md")
+		s.RulesReads = []string{
+			s.Rules,
+			in(project, ".claude/CLAUDE.md"),
+			in(project, "CLAUDE.md"),
+		}
 		s.MCPDoc = in(project, ".mcp.json")
 		s.Skills = in(project, ".claude/skills")
 		s.Agents = in(project, ".claude/agents")
@@ -994,6 +1120,19 @@ func ProjectSurfaces(id, project string) HostSurfaces {
 		s.MCPDoc = in(project, ".pi/mcp.json")
 		s.Skills = in(project, ".pi/skills")
 		s.Commands = in(project, ".pi/prompts")
+		// Gap 5: the project-scope adapter probe, which is a DIFFERENT set
+		// from the user-scope one above — beadle
+		// pkg/agent/pi_adapter.go:29-44 checks <cwd>/.pi for the settings
+		// file and the npm catalog, where the user scope is
+		// <agentDir>/packages/extensions and <agentDir>/node_modules. The
+		// resolver names the files; the settings CONTENT scan stays with the
+		// consumer, because a path cannot say whether a file mentions the
+		// adapter package.
+		s.AdapterProbes = []string{
+			in(project, ".pi/settings.json"),
+			in(project, ".pi/npm/node_modules/pi-mcp-adapter"),
+			in(project, ".pi/extensions/pi-mcp-adapter"),
+		}
 	case DSH:
 		// DSH walks every AGENTS.md and CLAUDE.md from the git root down to
 		// the working directory, so there is no single project path. No dsh
@@ -1146,4 +1285,148 @@ func kiloConfigReads(roots HostRoots, env Env) []string {
 	}
 
 	return reads
+}
+
+// claudePluginsDir is claude's own plugin tree, which lives under the HOME
+// directory and NOT under a CLAUDE_CONFIG_DIR that may have been moved
+// elsewhere: beadle carries the literal home-relative path in nine places
+// (pkg/agent/agents.go:156,243,346,435,500,598, dsh.go:146, kilo_paths.go:93,
+// omp.go:222) and the same walk must be skipped for every one of them, so it
+// is one helper here rather than nine. Home-relative on purpose: a relocated
+// config dir does not relocate the plugin tree the walk must not descend into.
+func claudePluginsDir(home string) string {
+	return filepath.Join(home, claudeDirName, "plugins")
+}
+
+// claudePluginTreeIgnore is the ignore root for the hosts whose own skills
+// surface is wide enough to reach into claude's plugin tree — the hosts that
+// read the shared hub, plus the shared hub itself. Claude and Gemini set
+// IgnoreRoots in their own fillers; these are the rest.
+func claudePluginTreeIgnore(home string) []string {
+	return []string{claudePluginsDir(home)}
+}
+
+// ListProfiles returns the profile directory names under dir, sorted, and nil
+// when dir cannot be read. It is the one function in this package that touches
+// the filesystem, and it is deliberately not a method on HostSurfaces: Roots
+// and Surfaces stay pure, so a consumer resolves roots in tests and lists
+// profiles only where it already has a home. A missing directory is not an
+// error — a host with no profiles yet has none.
+func ListProfiles(dir string) ([]string, error) {
+	if dir == "" {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("list profiles in %s: %w", dir, err)
+	}
+
+	names := make([]string, 0, len(entries))
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			names = append(names, entry.Name())
+		}
+	}
+
+	slices.Sort(names)
+
+	return names, nil
+}
+
+// ProjectChainRoot returns the project root of cwd: the nearest directory at
+// or above cwd that holds a .git entry (a directory, or a worktree file). It
+// reports false when there is none, and a project with no .git above cwd has
+// no chain. exists is injected rather than taken from os.Stat so the walk
+// stays testable and this package keeps its purity.
+func ProjectChainRoot(cwd string, exists func(string) bool) (string, bool) {
+	if cwd == "" {
+		return "", false
+	}
+
+	for dir := filepath.Clean(cwd); ; {
+		if exists(filepath.Join(dir, ".git")) {
+			return dir, true
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+
+		dir = parent
+	}
+}
+
+// DSHChainCandidates are the instruction file names DSH reads in EVERY
+// directory of a project chain, in the documented order (beadle
+// pkg/agent/dsh_chain.go:14-16).
+func DSHChainCandidates() []string {
+	return []string{"AGENTS.md", "CLAUDE.md"}
+}
+
+// DSHProjectChain returns the instruction files DSH reads for a project: every
+// AGENTS.md and CLAUDE.md between root and cwd inclusive, root first, each
+// directory's candidates in DSHChainCandidates order. It is a function and
+// not a HostSurfaces field because it is a WALK, not a path — encoding it as
+// a single field would force the caller to re-derive the same walk (beadle
+// pkg/agent/dsh_chain.go:87-149).
+//
+// The result is a candidate list, not a list of existing files: a name with no
+// file is inert, so deleting a file prunes its element rather than shifting
+// the chain. A caller that needs only the files that exist filters with its
+// own existence check; this package does not stat them.
+func DSHProjectChain(root, cwd string) []string {
+	if root == "" {
+		return nil
+	}
+
+	root = filepath.Clean(root)
+	dirs := []string{root}
+
+	rel, err := filepath.Rel(root, filepath.Clean(cwd))
+	if err != nil || rel == "." {
+		rel = ""
+	}
+
+	dir := root
+
+	for part := range strings.SplitSeq(filepath.ToSlash(rel), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+
+		dir = filepath.Join(dir, part)
+		dirs = append(dirs, dir)
+	}
+
+	chain := make([]string, 0, len(dirs)*2)
+
+	for _, dir := range dirs {
+		for _, name := range DSHChainCandidates() {
+			chain = append(chain, filepath.Join(dir, name))
+		}
+	}
+
+	return chain
+}
+
+// Shared is the cross-vendor ~/.agents hub as its own surface, not a host.
+// beadle models it as a `shared` pseudo-agent (pkg/agent/agentid.go:25) that
+// writes ~/.agents/skills while the hosts that read it natively keep their own
+// copy. It is a function rather than an eleventh All() entry because it is
+// not a host: it has no binary, no config root, no rules document and no hooks,
+// and giving it a host id would invite Roots("shared") to invent all four.
+// beadle pkg/agent/agents.go:585-599 is the write side this mirrors.
+func Shared(env Env) HostSurfaces {
+	root := filepath.Join(env.Home, sharedDirName)
+
+	return HostSurfaces{
+		ID:           "shared",
+		Skills:       filepath.Join(root, "skills"),
+		SkillsReads:  []string{filepath.Join(root, "skills")},
+		SharedAgents: root,
+		IgnoreRoots:  claudePluginTreeIgnore(env.Home),
+	}
 }

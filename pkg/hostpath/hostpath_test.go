@@ -583,7 +583,11 @@ func TestProjectSurfaces(t *testing.T) {
 		table := map[string]struct {
 			rules, mcp, skills, agents, commands string
 		}{
-			"claude":   {".claude/CLAUDE.md", ".mcp.json", ".claude/skills", ".claude/agents", ".claude/commands"},
+			// claude's project rules WRITE target is the project's own AGENTS.md
+			// (claude 2.1.280 reads it natively; beadle pkg/agent/agents.go:111
+			// writes that path). The other two names the host reads stay in
+			// RulesReads — see TestClaudeProjectRulesWriteAGENTSAndReadAllThree.
+			"claude":   {"AGENTS.md", ".mcp.json", ".claude/skills", ".claude/agents", ".claude/commands"},
 			"codex":    {"AGENTS.md", ".codex/config.toml", ".codex/skills", ".codex/agents", ".codex/prompts"},
 			"gemini":   {"GEMINI.md", ".gemini/settings.json", ".gemini/skills", ".gemini/agents", ".gemini/commands"},
 			"agy":      {"", ".agents/mcp_config.json", "", "", ""},
