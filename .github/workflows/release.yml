@@ -367,17 +367,32 @@ jobs:
               license "MIT"
 
               on_macos do
-                url "__DARWIN_URL__"
-                sha256 "__DARWIN_SHA__"
+                # brew style rejects a bare url/sha256 directly inside
+                # on_macos/on_linux: the arch has to be stated, because
+                # "darwin-universal" and "linux-amd64" are not the same file.
+                # Both mac branches point at the same universal tarball, which
+                # is exactly what Homebrew expects a universal artifact to look
+                # like: one url, declared for both arches.
+                on_intel do
+                  url "__DARWIN_URL__"
+                  sha256 "__DARWIN_SHA__"
+                end
+
+                on_arm do
+                  url "__DARWIN_URL__"
+                  sha256 "__DARWIN_SHA__"
+                end
               end
 
               on_linux do
-                if OS::CPU == :arm64
-                  url "__ARM64_URL__"
-                  sha256 "__ARM64_SHA__"
-                else
+                on_intel do
                   url "__AMD64_URL__"
                   sha256 "__AMD64_SHA__"
+                end
+
+                on_arm do
+                  url "__ARM64_URL__"
+                  sha256 "__ARM64_SHA__"
                 end
               end
 
@@ -388,7 +403,10 @@ jobs:
                 # gendocs may add subcommand pages later and they should land
                 # without another edit here.
                 man1.install Dir["man/*.1"]
-                generate_completions_from_executable(bin/"verger", "completion", shells: [:bash, :zsh, :fish])
+                # No shells: list. The default is the set the binary actually
+                # generates, so adding a shell is a change in one place — the
+                # binary — instead of two.
+                generate_completions_from_executable(bin/"verger", "completion")
               end
 
               test do
@@ -396,7 +414,7 @@ jobs:
                 # `brew test` is the only place a missing man1.install shows up
                 # as a failure rather than as a user typing `man verger` and
                 # getting nothing.
-                assert_predicate man1/"verger.1", :exist?
+                assert_path_exists man1/"verger.1"
               end
             end
           FORMULA
