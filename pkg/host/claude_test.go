@@ -2,8 +2,10 @@ package host_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -999,4 +1001,287 @@ func digestFile(t *testing.T, path string) digest.Hash {
 	}
 
 	return sum
+}
+
+// driftPackage builds a package with one no-secret stdio MCP server, so the
+// receipt digest and the host's `mcp get` answer compare equal.
+func driftPackage(t *testing.T) host.Package {
+	t.Helper()
+
+	return host.Package{
+		ID:      "acme/drift",
+		Version: "1.0.0",
+		Format:  manifest.FormatClaude,
+		Root:    t.TempDir(),
+		MCP: []manifest.MCPServer{
+			{Name: "probe", Transport: "stdio", Command: []string{"node", "/tmp/probe.js"}},
+		},
+	}
+}
+
+// mcpGetOutput is the `claude mcp get probe` text answer for one command.
+func mcpGetOutput(command string) string {
+	return "probe:\n" +
+		"  Scope: Local config (private to you in this project)\n" +
+		"  Status: ✘ Failed to connect\n" +
+		"  Type: stdio\n" +
+		"  Command: " + command + "\n" +
+		"  Args: /tmp/probe.js\n" +
+		"  Environment:\n"
+}
+
+// mcpDriftProbe adapts one claude adapter's oracle to apply.DriftProbe.
+type mcpDriftProbe struct {
+	h host.Host
+}
+
+// MCPDigest implements apply.DriftProbe.
+func (p mcpDriftProbe) MCPDigest(ctx context.Context, name string) (apply.MCPDrift, error) {
+	prober, ok := p.h.Oracle().(host.MCPProber)
+	if !ok {
+		return apply.MCPDrift{Unknown: true}, nil
+	}
+
+	server, err := prober.MCPGet(ctx, name)
+	if err != nil {
+		if errors.Is(err, host.ErrServerNotFound) {
+			return apply.MCPDrift{Gone: true}, nil
+		}
+
+		return apply.MCPDrift{}, err
+	}
+
+	data, err := json.Marshal(server)
+	if err != nil {
+		return apply.MCPDrift{}, err
+	}
+
+	return apply.MCPDrift{Sum: digest.Bytes(data)}, nil
+}
+
+func TestClaudeOracleMCPGet(t *testing.T) {
+	Convey("Given a scripted claude mcp get", t, func() {
+		fakeClaude(t)
+		home := t.TempDir()
+
+		h, _ := newClaude(t, home, map[string]hostcli.Response{
+			"claude mcp get probe": response(mcpGetOutput("node")),
+		})
+
+		Convey("When the oracle probes one server", func() {
+			prober, ok := h.Oracle().(host.MCPProber)
+
+			Convey("Then the host implements the probe and the value parses", func() {
+				So(ok, ShouldBeTrue)
+
+				server, err := prober.MCPGet(t.Context(), "probe")
+				So(err, ShouldBeNil)
+				So(server, ShouldResemble, manifest.MCPServer{
+					Name: "probe", Transport: "stdio", Command: []string{"node", "/tmp/probe.js"},
+				})
+			})
+		})
+
+		Convey("When the host has no such server", func() {
+			h, _ := newClaude(t, home, map[string]hostcli.Response{
+				"claude mcp get probe": {Code: 1, Stderr: `No MCP server named "probe".`},
+			})
+
+			prober, ok := h.Oracle().(host.MCPProber)
+			So(ok, ShouldBeTrue)
+
+			_, err := prober.MCPGet(t.Context(), "probe")
+
+			So(err, ShouldNotBeNil)
+
+			Convey("Then it is ErrServerNotFound", func() {
+				So(errors.Is(err, host.ErrServerNotFound), ShouldBeTrue)
+			})
+		})
+
+		Convey("When the host offers no probe", func() {
+			Convey("Then the oracle does not implement MCPProber", func() {
+				_, ok := h.Oracle().(host.MCPProber)
+				So(ok, ShouldBeTrue)
+			})
+		})
+	})
+}
+
+func TestClaudeMCPDrift(t *testing.T) {
+	Convey("Given a delivered no-secret MCP server", t, func() {
+		fakeClaude(t)
+		home := t.TempDir()
+		st := openStore(t)
+
+		script := map[string]hostcli.Response{
+			"claude mcp get probe": {Code: 1, Stderr: `No MCP server named "probe".`},
+			"claude mcp add --scope user --transport stdio probe node /tmp/probe.js": response(""),
+		}
+
+		h, _ := newClaude(t, home, script, host.WithStore(st), host.WithTrash(st.Trash()))
+
+		res, err := h.Deliver(t.Context(), home, host.Delivery{
+			Package: driftPackage(t), Strategy: host.Loose,
+		})
+
+		Convey("When it is delivered loose", func() {
+			Convey("Then the receipt claims the MCP server", func() {
+				So(err, ShouldBeNil)
+
+				var artifact *receipt.Artifact
+
+				for i := range res.Artifacts {
+					if res.Artifacts[i].Kind == "mcp" {
+						artifact = &res.Artifacts[i]
+					}
+				}
+
+				So(artifact, ShouldNotBeNil)
+				So(artifact.Path, ShouldEqual, "claude://mcp/probe")
+				So(artifact.Digest, ShouldNotBeEmpty)
+			})
+
+			Convey("And the host's unchanged answer matches the receipt", func() {
+				artifact := mcpArtifact(t, res)
+
+				probe, _ := newClaude(t, home, map[string]hostcli.Response{
+					"claude mcp get probe": response(mcpGetOutput("node")),
+				})
+
+				sum, err := mcpDriftProbe{h: probe}.MCPDigest(t.Context(), "probe")
+				So(err, ShouldBeNil)
+				So(sum.Unknown, ShouldBeFalse)
+				So(sum.Gone, ShouldBeFalse)
+				So(sum.Sum, ShouldEqual, artifact.Digest)
+			})
+
+			Convey("And an edited command is drift", func() {
+				artifact := mcpArtifact(t, res)
+
+				probe, _ := newClaude(t, home, map[string]hostcli.Response{
+					"claude mcp get probe": response(mcpGetOutput("/usr/local/bin/attacker")),
+				})
+
+				sum, err := mcpDriftProbe{h: probe}.MCPDigest(t.Context(), "probe")
+				So(err, ShouldBeNil)
+				So(sum.Sum, ShouldNotEqual, artifact.Digest)
+
+				report, err := apply.ReceiptDrift(t.Context(), receipt.Receipt{
+					Package: "acme/drift", Host: "claude", Scope: "user",
+					Artifacts: []receipt.Artifact{*artifact},
+				}, mcpDriftProbe{h: probe})
+
+				So(err, ShouldBeNil)
+				So(report.Drifted(), ShouldBeTrue)
+				So(report.Keys, ShouldResemble, []string{"claude://mcp/probe"})
+			})
+
+			Convey("And a removed server is drift", func() {
+				artifact := mcpArtifact(t, res)
+
+				probe, _ := newClaude(t, home, map[string]hostcli.Response{
+					"claude mcp get probe": {Code: 1, Stderr: `No MCP server named "probe".`},
+				})
+
+				report, err := apply.ReceiptDrift(t.Context(), receipt.Receipt{
+					Package: "acme/drift", Host: "claude", Scope: "user",
+					Artifacts: []receipt.Artifact{*artifact},
+				}, mcpDriftProbe{h: probe})
+
+				So(err, ShouldBeNil)
+				So(report.Drifted(), ShouldBeTrue)
+			})
+		})
+	})
+}
+
+// mcpArtifact returns the MCP artifact of one delivery result.
+func mcpArtifact(t *testing.T, res host.Result) *receipt.Artifact {
+	t.Helper()
+
+	for i := range res.Artifacts {
+		if res.Artifacts[i].Kind == "mcp" {
+			return &res.Artifacts[i]
+		}
+	}
+
+	t.Fatalf("no MCP artifact in %d artifacts", len(res.Artifacts))
+
+	return nil
+}
+
+// TestClaudeMCPGetLive probes the real claude binary in an isolated HOME; it
+// skips when claude is not installed.
+func TestClaudeMCPGetLive(t *testing.T) {
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skip("claude is not installed")
+	}
+
+	Convey("Given an isolated HOME with one delivered MCP server", t, func() {
+		home := t.TempDir()
+		configDir := filepath.Join(home, ".claude")
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+		h := host.NewClaude(host.WithHome(home))
+
+		add := exec.CommandContext(t.Context(), "claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "probe", "node", "/tmp/probe.js")
+
+		add.Env = append(os.Environ(), "HOME="+home, "CLAUDE_CONFIG_DIR="+configDir)
+
+		if out, err := add.CombinedOutput(); err != nil {
+			t.Skipf("claude mcp add: %v: %s", err, out)
+		}
+
+		t.Cleanup(func() {
+			rm := exec.CommandContext(t.Context(), "claude", "mcp", "remove", "--scope", "user", "probe")
+
+			rm.Env = append(os.Environ(), "HOME="+home, "CLAUDE_CONFIG_DIR="+configDir)
+			_, _ = rm.CombinedOutput()
+		})
+
+		Convey("When the oracle probes the server", func() {
+			prober, ok := h.Oracle().(host.MCPProber)
+			So(ok, ShouldBeTrue)
+
+			server, err := prober.MCPGet(t.Context(), "probe")
+
+			So(err, ShouldBeNil)
+
+			Convey("Then the live answer parses into the manifest shape", func() {
+				So(err, ShouldBeNil)
+				So(server.Name, ShouldEqual, "probe")
+				So(server.Transport, ShouldEqual, "stdio")
+				So(server.Command, ShouldResemble, []string{"node", "/tmp/probe.js"})
+			})
+		})
+
+		Convey("When the command is edited by hand", func() {
+			edited := exec.CommandContext(t.Context(), "claude", "mcp", "remove", "--scope", "user", "probe")
+
+			edited.Env = append(os.Environ(), "HOME="+home, "CLAUDE_CONFIG_DIR="+configDir)
+			if out, err := edited.CombinedOutput(); err != nil {
+				t.Skipf("claude mcp remove: %v: %s", err, out)
+			}
+
+			addEdited := exec.CommandContext(t.Context(), "claude", "mcp", "add", "--scope", "user", "--transport", "stdio", "probe", "node", "/usr/local/bin/attacker")
+
+			addEdited.Env = append(os.Environ(), "HOME="+home, "CLAUDE_CONFIG_DIR="+configDir)
+			if out, err := addEdited.CombinedOutput(); err != nil {
+				t.Skipf("claude mcp add: %v: %s", err, out)
+			}
+
+			prober, ok := h.Oracle().(host.MCPProber)
+			So(ok, ShouldBeTrue)
+
+			server, err := prober.MCPGet(t.Context(), "probe")
+
+			So(err, ShouldBeNil)
+
+			Convey("Then the live answer carries the edited command", func() {
+				So(err, ShouldBeNil)
+				So(server.Command, ShouldResemble, []string{"node", "/usr/local/bin/attacker"})
+			})
+		})
+	})
 }

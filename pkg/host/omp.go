@@ -320,6 +320,9 @@ type ompInstall struct {
 	// its inverse then keeps it, because a delivery may remove only what it
 	// registered itself (Host.Deliver, Op.Existed).
 	existed bool
+	// scope is the install scope the host CLI was told to use, so the RMA
+	// removes from the same scope. omp plugin takes --scope user|project.
+	scope string
 }
 
 // installID is the plugin selector `<plugin>@<marketplace>`.
@@ -337,8 +340,8 @@ func ompMarketplacePath(name string) string {
 // rma removes the plugin, then — refcounted at removal — its marketplace.
 func (p ompInstall) rma() []receipt.Op {
 	return []receipt.Op{
-		{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordMarketplace, wordRemove, p.marketplace}, Existed: p.existed},
-		{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordUninstall, p.installID()}},
+		{Kind: receipt.OpHostInstall, Command: concat([]string{wordPlugin, wordMarketplace, wordRemove, p.marketplace}, scopeArgs(p.scope)), Existed: p.existed},
+		{Kind: receipt.OpHostInstall, Command: concat([]string{wordPlugin, wordUninstall, p.installID()}, scopeArgs(p.scope))},
 	}
 }
 
@@ -425,7 +428,7 @@ func (h *omp) install(ctx context.Context, userHome string, pkg Package, plan *o
 // proves the marketplace, the delivery fails instead of adopting a name it
 // would then take the liberty of removing.
 func (h *omp) register(ctx context.Context, before []registeredMarketplace, pkg Package, plan *ompInstall) (string, bool, error) {
-	_, addErr := h.base.run(ctx, wordOmp, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef})
+	_, addErr := h.base.run(ctx, wordOmp, concat([]string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}, scopeArgs(pkg.Scope)))
 	registeredNow := addErr == nil
 
 	if addErr != nil && !ompMarketplaceExists(addErr) {
@@ -454,7 +457,7 @@ func (h *omp) register(ctx context.Context, before []registeredMarketplace, pkg 
 // lists it; a miss is a *DeliveryError at the verify step, never a silent step
 // down.
 func (h *omp) verify(ctx context.Context, pkg Package, plan *ompInstall) (OracleResult, error) {
-	if _, err := h.base.run(ctx, wordOmp, []string{wordPlugin, wordInstallCLI, plan.installID(), flagForce}); err != nil {
+	if _, err := h.base.run(ctx, wordOmp, concat([]string{wordPlugin, wordInstallCLI, plan.installID(), flagForce}, scopeArgs(pkg.Scope))); err != nil {
 		return OracleResult{}, err
 	}
 
@@ -641,6 +644,7 @@ func (h *omp) installPlan(ctx context.Context, d Delivery, synth bool) (ompInsta
 		return ompInstall{
 			addRef: layout.root, plugin: layout.identity.Name, marketplace: name,
 			version: d.Package.Version, synth: &layout, existed: registered,
+			scope: d.Package.Scope,
 		}, nil
 	}
 
@@ -656,6 +660,7 @@ func (h *omp) installPlan(ctx context.Context, d Delivery, synth bool) (ompInsta
 	return ompInstall{
 		addRef: d.Package.Marketplace, plugin: name,
 		marketplace: marketplaceName(d.Package.Marketplace), version: d.Package.Version,
+		scope: d.Package.Scope,
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package host_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -615,15 +616,21 @@ func TestCursorHooksHandEditedRecordIsHandsOff(t *testing.T) {
 		st := openStore(t)
 		pkg := cursorPackage(t)
 
-		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(cursorSecrets(t)))
 		deps := applyWorld(t, st, ownerMap{})
+
+		// The per-record guard reads the previous receipt through the
+		// adapter's ownership source. Without it the record digests are
+		// invisible, the per-record check silently does nothing, and only
+		// the coarse document check is left to catch a hand edit.
+		h, _ := newCursor(t, home, nil, host.WithStore(st), host.WithTrash(st.Trash()),
+			host.WithSecrets(cursorSecrets(t)), host.WithOwnership(receiptsOwner{receipts: deps.Receipts}))
 		deps.Hosts[host.Cursor] = h
 
 		install := func() apply.CellResult {
 			report, err := apply.Run(t.Context(), deps, apply.Plan{Actions: []apply.Action{{
 				Kind: apply.ActionInstall, Host: host.Cursor,
 				Delivery: host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true},
-			}}}, apply.Options{})
+			}}}, apply.Options{Confirm: acceptHooks{}})
 			So(err, ShouldBeNil)
 
 			return report.Cells[0]
@@ -655,11 +662,12 @@ func TestCursorHooksHandEditedRecordIsHandsOff(t *testing.T) {
 					body := cursorHooksDoc(t, home)
 					So(body, ShouldContainSubstring, "echo theirs")
 					So(body, ShouldContainSubstring, "failClosed")
-					// The cell is hands-off, not failed: the document's whole
-					// `hooks` digest moved, and pkg/apply checks a config-key
-					// op before the per-record guard. Safe, but stricter than
-					// per-record ownership intends — see the report.
-					So(cell.Status, ShouldEqual, apply.StatusHandsOff)
+					// DRIFT-2: a user adding their own record must not freeze
+					// verger's records. The document is owned record by
+					// record, so our record stays updatable and the cell
+					// stays current. Only a hand-edited verger record is
+					// hands-off — the case below.
+					So(cell.Status, ShouldEqual, apply.StatusCurrent)
 				})
 			})
 
@@ -683,6 +691,16 @@ func TestCursorHooksHandEditedRecordIsHandsOff(t *testing.T) {
 			})
 		})
 	})
+}
+
+// acceptHooks answers every question "yes". A hooks re-delivery asks before
+// writing, and a test about ownership, not consent, must not stop at the
+// prompt and never reach the assertion it was written for.
+type acceptHooks struct{}
+
+// Confirm implements apply.Confirmer.
+func (acceptHooks) Confirm(context.Context, apply.Question) (bool, error) {
+	return true, nil
 }
 
 // cursorHookRecordDigests reads the per-record digests a receipt recorded for

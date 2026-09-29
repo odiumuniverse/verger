@@ -1033,3 +1033,65 @@ func TestGeminiPolicyEveryStratum(t *testing.T) {
 		})
 	})
 }
+
+// TestGeminiSharedSettingsClaimsMCPServers pins F3: gemini writes hooks and MCP
+// servers into one `settings.json`, so the document's own artifact claims
+// whichever component planned first — the receipt must still carry the `mcp`
+// kind, one claim per server, or `status` and `remove` have no MCP claim at all.
+func TestGeminiSharedSettingsClaimsMCPServers(t *testing.T) {
+	Convey("Given a Gemini package that ships both hooks and MCP servers", t, func() {
+		home := t.TempDir()
+		st := openStore(t)
+		pkg := geminiPackage(t)
+		secrets := secretStore(t, map[string]string{"MCP_TOKEN": "s3cr3t-token"})
+
+		So(len(pkg.MCP), ShouldBeGreaterThan, 0)
+
+		h, _ := newGemini(t, home, nil,
+			host.WithStore(st), host.WithTrash(st.Trash()), host.WithSecrets(secrets))
+
+		res, err := h.Deliver(t.Context(), home, host.Delivery{
+			Package: pkg, Strategy: host.Loose, AllowHooks: true,
+		})
+		So(err, ShouldBeNil)
+
+		Convey("When it is delivered", func() {
+			Convey("Then the receipt claims every MCP server beside the document", func() {
+				claimed := map[string]bool{}
+
+				for _, artifact := range res.Artifacts {
+					if strings.HasSuffix(artifact.Kind, "-record") {
+						claimed[artifact.Kind[:len(artifact.Kind)-len("-record")]] = true
+					}
+				}
+
+				So(claimed, ShouldContainKey, "mcp")
+
+				names := make([]string, 0, len(res.Artifacts))
+
+				for _, artifact := range res.Artifacts {
+					if artifact.Kind == "mcp-record" {
+						names = append(names, artifact.Name)
+						So(artifact.Digest.Valid(), ShouldBeTrue)
+					}
+				}
+
+				for _, server := range pkg.MCP {
+					So(names, ShouldContain, server.Name)
+				}
+			})
+
+			Convey("Then every claim is backed by an op on its own path", func() {
+				ops := make(map[string]bool, len(res.RMA))
+
+				for _, op := range res.RMA {
+					ops[op.Path] = true
+				}
+
+				for _, artifact := range res.Artifacts {
+					So(ops, ShouldContainKey, artifact.Path)
+				}
+			})
+		})
+	})
+}

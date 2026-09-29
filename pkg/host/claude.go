@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/hostcli"
+	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/receipt"
 	"github.com/odiumuniverse/verger/pkg/render"
 	"github.com/odiumuniverse/verger/pkg/store"
@@ -22,6 +23,7 @@ import (
 const (
 	wordClaude      = "claude"
 	wordPlugin      = "plugin"
+	wordScope       = "--scope"
 	wordMarketplace = "marketplace"
 	wordInstallCLI  = "install"
 	wordUninstall   = "uninstall"
@@ -114,6 +116,94 @@ func claudeMCPGetArgs(name string) []string {
 	return []string{wordMCP, "get", name}
 }
 
+// MCPProber is the optional Oracle extension for a host that manages MCP
+// servers through its own CLI: the read-only probe of one server's value.
+// A host whose MCP surface is a document (gemini, cursor, omp, opencode,
+// kilo) does not implement it — the receipt's config-key op is the claim.
+type MCPProber interface {
+	// MCPGet returns the host's current value of one CLI-managed MCP server,
+	// in the manifest shape the receipt digest was computed from, so a drift
+	// check can compare the two.
+	MCPGet(ctx context.Context, name string) (manifest.MCPServer, error)
+}
+
+// ErrServerNotFound reports that the host has no MCP server with the probed
+// name: the delivered value is gone, which is drift, not a missing host.
+var ErrServerNotFound = errors.New("the host has no such MCP server")
+
+// MCPGet implements MCPProber: the read-only `claude mcp get <name>` probe.
+func (o *claudeOracle) MCPGet(ctx context.Context, name string) (manifest.MCPServer, error) {
+	out, err := o.base.run(ctx, wordClaude, claudeMCPGetArgs(name))
+	if err != nil {
+		exit, ok := errors.AsType[*hostcli.ExitError](err)
+		if ok && reportsUnknownServer(exit.Stderr+"\n"+string(out)) {
+			return manifest.MCPServer{}, ErrServerNotFound
+		}
+
+		return manifest.MCPServer{}, err
+	}
+
+	return parseClaudeMCPGet(name, out)
+}
+
+// parseClaudeMCPGet reads the `claude mcp get <name>` text answer into the
+// manifest shape the receipt digest was computed from (loosePlanner's
+// rewriteServer output): Name, Transport, Command, Env, URL, Headers. The
+// host reports the resolved command, so a server whose manifest carries no
+// secrets compares equal; a server with secrets does not, because the
+// receipt records the rewritten refs while the host holds the values.
+func parseClaudeMCPGet(name string, out []byte) (manifest.MCPServer, error) {
+	server := manifest.MCPServer{Name: name}
+
+	var command []string
+
+	var env map[string]string
+
+	inEnv := false
+
+	for line := range strings.Lines(string(out)) {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		key, value, found := strings.Cut(trimmed, ":")
+		if !found {
+			continue
+		}
+
+		switch key = strings.TrimSpace(key); key {
+		case "Type":
+			server.Transport = strings.TrimSpace(value)
+		case "Command":
+			command = append(command, strings.TrimSpace(value))
+		case "Args":
+			command = append(command, strings.Fields(strings.TrimSpace(value))...)
+		case "URL":
+			server.URL = strings.TrimSpace(value)
+		case "Environment":
+			inEnv = true
+		default:
+			if !inEnv || !strings.Contains(trimmed, "=") {
+				continue
+			}
+
+			envKey, envValue, _ := strings.Cut(trimmed, "=")
+
+			if env == nil {
+				env = map[string]string{}
+			}
+
+			env[strings.TrimSpace(envKey)] = strings.TrimSpace(envValue)
+		}
+	}
+
+	server.Command = command
+	server.Env = env
+
+	return server, nil
+}
+
 // installPlan is one native or synth host install.
 type installPlan struct {
 	addRef      string // native: the source ref; synth: the owner marketplace root
@@ -127,19 +217,56 @@ type installPlan struct {
 
 // newInstallPlan builds the plan of one plugin in one marketplace; the RMA
 // removes the install, then the marketplace (refcounted at removal).
-func newInstallPlan(addRef, plugin, marketplace string) installPlan {
+func newInstallPlan(addRef, plugin, marketplace, scope string) installPlan {
 	installID := plugin + "@" + marketplace
 
+	// The scope rides at the tail of every argv, so the inverse removes from
+	// the same scope the install wrote to. A project install removed at user
+	// scope would leave the project's registration behind.
 	return installPlan{
 		addRef:      addRef,
 		plugin:      plugin,
 		marketplace: marketplace,
 		installID:   installID,
 		rma: []receipt.Op{
-			{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordMarketplace, wordRm, marketplace}},
-			{Kind: receipt.OpHostInstall, Command: []string{wordPlugin, wordUninstall, installID}},
+			{Kind: receipt.OpHostInstall, Command: concat([]string{wordPlugin, wordMarketplace, wordRm, marketplace}, scopeArgs(scope))},
+			{Kind: receipt.OpHostInstall, Command: concat([]string{wordPlugin, wordUninstall, installID}, scopeArgs(scope))},
 		},
 	}
+}
+
+// scopeArgs returns the host CLI flag that selects the installation scope, or
+// nothing at user scope so every user-scope command is byte-identical to what
+// verger has always run. Claude Code 2.1.284 takes -s/--scope on both
+// `plugin marketplace add` and `plugin install`, and "user" is the default.
+func scopeArgs(scope string) []string {
+	if scope == "" || scope == receipt.ScopeUser {
+		return nil
+	}
+
+	return []string{wordScope, scope}
+}
+
+// concat joins argv pieces into one command.
+func concat(parts ...[]string) []string {
+	var out []string
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+
+	return out
+}
+
+// bareArgv strips a trailing --scope pair, so the command matchers keep
+// working whether or not the scope was recorded.
+func bareArgv(argv []string) []string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == wordScope {
+			return append(append([]string{}, argv[:i]...), argv[i+2:]...)
+		}
+	}
+
+	return argv
 }
 
 // deliverInstall runs the native or synth host installer and verifies via the
@@ -165,11 +292,11 @@ func (h *claude) deliverInstall(ctx context.Context, home string, d Delivery, sy
 		if verb, err = h.registerSynth(ctx, d.Package, plan); err != nil {
 			return Result{}, err
 		}
-	} else if _, err := h.base.run(ctx, wordClaude, []string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}); err != nil {
+	} else if _, err := h.base.run(ctx, wordClaude, concat([]string{wordPlugin, wordMarketplace, wordAdd, plan.addRef}, scopeArgs(d.Package.Scope))); err != nil {
 		return Result{}, err
 	}
 
-	if _, err := h.base.run(ctx, wordClaude, []string{wordPlugin, verb, plan.installID}); err != nil {
+	if _, err := h.base.run(ctx, wordClaude, concat([]string{wordPlugin, verb, plan.installID}, scopeArgs(d.Package.Scope))); err != nil {
 		return Result{}, err
 	}
 
@@ -223,7 +350,7 @@ func (h *claude) installPlan(ctx context.Context, d Delivery, synth bool) (insta
 		return installPlan{}, &NotSupportedError{Host: Claude, Operation: unsupportedNoMarketplace}
 	}
 
-	return newInstallPlan(d.Package.Marketplace, name, marketplaceName(d.Package.Marketplace)), nil
+	return newInstallPlan(d.Package.Marketplace, name, marketplaceName(d.Package.Marketplace), d.Package.Scope), nil
 }
 
 // synthPlan places the synth package in its owner marketplace (decision F3):
@@ -238,7 +365,7 @@ func (h *claude) synthPlan(ctx context.Context, pkg Package) (installPlan, error
 		return installPlan{}, err
 	}
 
-	plan := newInstallPlan(layout.root, layout.identity.Name, name)
+	plan := newInstallPlan(layout.root, layout.identity.Name, name, pkg.Scope)
 	plan.registered = isRegistered
 	plan.synth = &layout
 
@@ -404,6 +531,8 @@ func isMCPRemove(argv []string) bool {
 
 // isUninstallCommand reports whether argv is the Claude `plugin uninstall <id>` op.
 func isUninstallCommand(argv []string) bool {
+	argv = bareArgv(argv)
+
 	return len(argv) == 3 && argv[0] == wordPlugin && argv[1] == wordUninstall
 }
 
@@ -511,6 +640,8 @@ func removeEmptyDir(dir string) {
 
 // isMarketplaceRemove reports whether argv is `plugin marketplace rm|remove <name>`.
 func isMarketplaceRemove(argv []string) bool {
+	argv = bareArgv(argv)
+
 	return len(argv) == 4 && argv[0] == wordPlugin && argv[1] == wordMarketplace && (argv[2] == wordRm || argv[2] == wordRemove)
 }
 

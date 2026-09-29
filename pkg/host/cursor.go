@@ -114,10 +114,10 @@ func (h *cursor) deliverInstall(_ context.Context, _ string, _ Delivery, synth b
 }
 
 // cursorSpec is the loose surface of the Cursor adapter: skills, agents and
-// slash commands below the agent home, MCP servers in its mcp.json. Its hook
-// document is a dialect verger does not render yet, so hooks are skipped with a
-// note rather than written somewhere invented; a rule component keeps the D23
-// skill wrapper, which the delivery says out loud.
+// slash commands below the agent home, MCP servers in its mcp.json, and hooks
+// in hooks.json — the hook dialect below is read from the live cursor-agent
+// bundle. A rule component keeps the D23 skill wrapper, which the delivery
+// says out loud.
 func cursorSpec(userHome string) looseSpec {
 	dir := cursorConfigDir(userHome)
 

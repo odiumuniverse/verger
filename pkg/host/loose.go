@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/fsutil"
 	"github.com/odiumuniverse/verger/pkg/hostcli"
+	"github.com/odiumuniverse/verger/pkg/hostpath"
 	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/receipt"
 	"github.com/odiumuniverse/verger/pkg/render"
@@ -148,6 +150,12 @@ type looseSpec struct {
 	hookModulesDir string            // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
 	mcpConfig      *mcpConfigSpec    // config-document MCP surface (Codex, Gemini)
 	variables      map[string]string // host-specific braced variables (Gemini extensionPath)
+
+	// project is the trusted project root for a project-scope delivery, or
+	// "" at user scope. When it is set, projectScope rewrites the surface
+	// paths above from hostpath.ProjectSurfaces, so every host delivers into
+	// its own project layout without each adapter repeating the mapping.
+	project string
 }
 
 // mcpConfigSpec describes an MCP surface written into a shared config document
@@ -267,6 +275,54 @@ func (s looseSpec) renderedRule(name string, rule []byte) ([]byte, error) {
 	}
 
 	return render.RuleMarkdown(name, rule)
+}
+
+// projectScope returns the spec aimed at the host's own project layout
+// instead of the user one. The paths come from hostpath.ProjectSurfaces, the
+// same table beadle resolves, so the two tools write the same project file
+// for a host. Surfaces the host has no project form for are left as they
+// were: a surface that does not exist at project scope is a gap to report,
+// not a path to invent.
+func (s looseSpec) projectScope() looseSpec {
+	if s.project == "" {
+		return s
+	}
+
+	surfaces := hostpath.ProjectSurfaces(string(s.host), s.project)
+
+	if surfaces.Skills != "" {
+		s.skillsDir = surfaces.Skills
+	}
+
+	if surfaces.Agents != "" {
+		s.agentsDir = surfaces.Agents
+	}
+
+	if surfaces.Commands != "" {
+		s.commandsDir = surfaces.Commands
+	}
+
+	// ProjectSurfaces is the authority on where a host keeps its hooks in a
+	// project, including for a host that uses a document separate from its
+	// settings (codex writes .codex/hooks.json beside config.toml). An earlier
+	// version only overrode hooksPath when it happened to equal
+	// settingsPath, which left codex's hooks document at user scope.
+	if surfaces.Hooks != "" {
+		s.settingsPath = surfaces.Hooks
+		s.hooksPath = surfaces.Hooks
+	}
+
+	if surfaces.RulesPerFile != "" {
+		s.rulesDir = surfaces.RulesPerFile
+	}
+
+	if s.mcpConfig != nil && surfaces.MCPDoc != "" {
+		cfg := *s.mcpConfig
+		cfg.path = surfaces.MCPDoc
+		s.mcpConfig = &cfg
+	}
+
+	return s
 }
 
 // looseStepKind tags one planned side effect.
@@ -403,6 +459,26 @@ func planLoose(ctx context.Context, base *Base, spec looseSpec, d Delivery) (*lo
 		return nil, err
 	}
 
+	// A project-scope delivery lands in the host's own project layout. The
+	// scope is resolved before the planner exists, because every path the
+	// planner writes comes from the spec.
+	if d.Package.Scope != "" && d.Package.Scope != receipt.ScopeUser {
+		if d.Package.Scope != receipt.ScopeProject || d.Project == "" {
+			return nil, &NotSupportedError{Host: spec.host, Operation: "project scope delivery"}
+		}
+
+		spec.project = d.Project
+		spec = spec.projectScope()
+
+		// A project-scope delivery must not write outside the project. If the
+		// host has no project form for a surface the package needs, the spec
+		// still carries the user-scope path — and writing there would put a
+		// project's MCP servers into the user's home. Refuse instead.
+		if err := spec.refuseOutsideProject(); err != nil {
+			return nil, err
+		}
+	}
+
 	planner := &loosePlanner{
 		base: base,
 		spec: spec,
@@ -412,10 +488,6 @@ func planLoose(ctx context.Context, base *Base, spec looseSpec, d Delivery) (*lo
 	}
 
 	planner.dataDir = dataDirPath(base, d.Package, spec.host)
-
-	if d.Package.Scope != "" && d.Package.Scope != receipt.ScopeUser {
-		return nil, &NotSupportedError{Host: spec.host, Operation: "project scope delivery in Ф1"}
-	}
 
 	if err := planner.components(); err != nil {
 		return nil, err
@@ -955,12 +1027,24 @@ func (p *loosePlanner) planHooks(file string, existing []byte, rewritten []manif
 		return p.deliveryError(stepPlan, err)
 	}
 
-	plan, err := render.PlanHooks(p.spec.hooksDialect(), planning, rewritten, p.hookRecordOwnership())
+	plan, err := render.PlanHooks(p.spec.hooksDialect(), planning, rewritten, p.hookRecordOwnership(rewritten))
 	if err != nil {
 		return p.deliveryError(stepPlan, err)
 	}
 
 	p.plan.notes = append(p.plan.notes, plan.Warnings...)
+
+	// A record verger owns, whose bytes the user changed, is a refusal the
+	// caller has to see as hands-off. Returning a warning alone would let
+	// the cell read "current" over a delivery that wrote nothing, which is
+	// the one answer a script must not be able to trust.
+	if len(plan.Refused) > 0 {
+		return &render.HandsOffError{
+			Path:    file,
+			KeyPath: plan.Refused[0],
+			Reason:  "the record changed outside verger; left in place: " + strings.Join(plan.Refused, ", "),
+		}
+	}
 
 	if p.spec.hooksTrustNote && plan.Rendered > 0 {
 		p.note("%d hook(s) are rendered into %s; %s trusts hooks by hash and skips new or changed ones until you review them in /hooks",
@@ -979,16 +1063,29 @@ func (p *loosePlanner) planHooks(file string, existing []byte, rewritten []manif
 
 	var ownedDigest digest.Hash
 
-	if current, ok := jsoncMember(existing, "hooks"); ok {
+	// A dialect whose records verger claims one by one does not own the whole
+	// `hooks` object: the user adds their own records to the same document, and
+	// that must not read as verger's value moving (DRIFT-2). In that case the
+	// coarse key is marked per-record and recordHookRecords carries the
+	// ownership.
+	perRecord := p.spec.hookRecordPath != nil
+
+	if current, ok := jsoncMember(existing, "hooks"); ok && !perRecord {
 		ownedDigest = canonicalValueDigest(current)
 	}
 
-	p.queueConfigEdit(file, false, render.EditJSONC, pendingEdit{
+	pe := pendingEdit{
 		edit:  render.Edit{Path: "hooks", Value: value},
 		kind:  "hook",
 		name:  "hooks",
 		owned: ownedDigest,
-	})
+	}
+
+	if perRecord {
+		pe.markPerRecord = true
+	}
+
+	p.queueConfigEdit(file, false, render.EditJSONC, pe)
 
 	p.recordHookRecords(plan, file)
 
@@ -1145,10 +1242,13 @@ func (cfg *pendingConfig) setWholeFile(whole bool, records func([]render.Edit) [
 
 // pendingEdit is one key edit plus the artifact identity it records.
 type pendingEdit struct {
-	edit  render.Edit
-	kind  string
-	name  string
-	owned digest.Hash // current value digest the edit adopts as owned; empty leaves the key unowned (an existing value is hands-off)
+	edit render.Edit
+	kind string
+	name string
+	// markPerRecord hands ownership of this key over to its records, so the
+	// whole-object digest is not an ownership signal (DRIFT-2).
+	markPerRecord bool
+	owned         digest.Hash // current value digest the edit adopts as owned; empty leaves the key unowned (an existing value is hands-off)
 }
 
 // queueConfigEdit adds one key edit to the pending document of a file.
@@ -1158,6 +1258,14 @@ func (p *loosePlanner) queueConfigEdit(
 	pe pendingEdit,
 ) {
 	cfg := p.configFor(file, tomlDoc, edit)
+
+	if pe.markPerRecord {
+		if cfg.owned == nil {
+			cfg.owned = render.Owned{}
+		}
+
+		cfg.owned[render.PerRecordKey(pe.edit.Path)] = ""
+	}
 
 	if pe.owned != "" {
 		if cfg.owned == nil {
@@ -1259,6 +1367,8 @@ func (p *loosePlanner) flushConfig(cfg *pendingConfig) error {
 		documentArtifact(cfg.file, cfg.editFor(changes[0].Path), changes[0].Digest), ops, replaced,
 	)
 
+	p.appendMCPClaims(cfg)
+
 	return nil
 }
 
@@ -1350,6 +1460,7 @@ func (p *loosePlanner) recordUnchangedOrWholeFile(cfg *pendingConfig, edits []pe
 	})
 
 	p.appendRecordArtifacts(cfg, keyEditsOf(edits))
+	p.appendMCPClaims(cfg)
 }
 
 // addWholeFile records a whole-file document write as one file op, so pkg/apply
@@ -1394,6 +1505,43 @@ func (cfg *pendingConfig) documentKind() string {
 	}
 
 	return artifactMCP
+}
+
+// appendMCPClaims records one receipt artifact per MCP server of a shared
+// document. Gemini writes `settings.json` for both hooks and MCP servers, so
+// the document's own artifact carries whichever component planned first and the
+// receipt would claim no `mcp` kind at all (F3). The per-server claim below is
+// what restores it — and it is what lets a later delivery prove one server is
+// still verger's while another moved.
+func (p *loosePlanner) appendMCPClaims(cfg *pendingConfig) {
+	if cfg.records == nil {
+		return
+	}
+
+	claims := make([]render.Edit, 0, len(cfg.edits))
+
+	for _, pe := range cfg.edits {
+		if pe.kind == artifactMCP {
+			claims = append(claims, pe.edit)
+		}
+	}
+
+	if len(claims) == 0 {
+		return
+	}
+
+	artifacts := cfg.records(claims)
+
+	ops := make([]receipt.Op, 0, len(artifacts))
+
+	for _, artifact := range artifacts {
+		ops = append(ops, receipt.Op{
+			Kind: receipt.OpRecord, Path: artifact.Path, Note: cfg.file, Digest: artifact.Digest,
+		})
+	}
+
+	p.plan.artifacts = append(p.plan.artifacts, artifacts...)
+	p.plan.ops = append(p.plan.ops, ops...)
 }
 
 // appendRecordArtifacts records one receipt artifact per owned record of a
@@ -1692,6 +1840,16 @@ func (p *loosePlanner) planMCPConfig() error {
 		return err
 	}
 
+	// A resolved secret value would be written verbatim into this document.
+	// At user scope that document is the user's own config; at project scope
+	// it usually lives in the repository, and a value that reaches a commit
+	// is a leak. Refuse with the path and the reason rather than writing it.
+	if secret {
+		if err := p.refuseSecretIntoGit(cfg.path); err != nil {
+			return err
+		}
+	}
+
 	if len(servers) == 0 {
 		return nil
 	}
@@ -1713,6 +1871,30 @@ func (p *loosePlanner) planMCPConfig() error {
 
 	prefix := mcpContainerPrefix(cfg)
 
+	document := p.configFor(cfg.path, cfg.toml, cfg.edit)
+	document.setMember(cfg.member)
+	document.setWholeFile(cfg.wholeFile, cfg.recordArtifacts)
+
+	p.recordMCPEdits(cfg, edits, pending, prefix, document)
+
+	if secret && len(pending) > 0 {
+		p.configFor(cfg.path, cfg.toml, cfg.edit).secret = true
+	}
+
+	return nil
+}
+
+// recordMCPEdits files every server of this package under one config document:
+// the ones that need a write are queued, the ones already written are
+// recorded without one. It is one loop lifted out of planMCPConfig, which was
+// over the complexity budget with it inline.
+func (p *loosePlanner) recordMCPEdits(
+	cfg *mcpConfigSpec,
+	edits []render.Edit,
+	pending []render.Edit,
+	prefix string,
+	document *pendingConfig,
+) {
 	// Every server is this package's, whether or not this delivery has to write
 	// it: the ones already configured exactly as wanted are recorded without a
 	// write, the rest are written. Dropping the former would leave them
@@ -1722,8 +1904,6 @@ func (p *loosePlanner) planMCPConfig() error {
 		pendingPaths[edit.Path] = true
 	}
 
-	document := p.configFor(cfg.path, cfg.toml, cfg.edit)
-	document.setMember(cfg.member)
 	document.setWholeFile(cfg.wholeFile, cfg.recordArtifacts)
 
 	for _, edit := range edits {
@@ -1744,12 +1924,6 @@ func (p *loosePlanner) planMCPConfig() error {
 
 		document.recorded = append(document.recorded, pe)
 	}
-
-	if secret && len(pending) > 0 {
-		p.configFor(cfg.path, cfg.toml, cfg.edit).secret = true
-	}
-
-	return nil
 }
 
 // resolvedMCPServers rewrites the variables of every server and resolves its
@@ -2485,14 +2659,20 @@ func scanHookModules(root, hostID string) ([]hookModule, error) {
 // it. A record with a recorded digest is verger's; without one it is the user's
 // and is never rewritten. The whole-document digest the config edit carries
 // stays the coarse backstop for a host that declares no per-record identity.
-func (p *loosePlanner) hookRecordOwnership() render.Owned {
+//
+// hooks must be the RENDERED list — the same slice planHooks hands the
+// renderer. The receipt keys its record artifacts by the rendered command
+// (${PLUGIN_ROOT} already substituted), so keying off the package's raw hooks
+// asks for a path the receipt never wrote, finds nothing, and silently
+// disables the per-record guard for every host that rewrites variables.
+func (p *loosePlanner) hookRecordOwnership(hooks []manifest.Hook) render.Owned {
 	if p.spec.hookRecordPath == nil {
 		return nil
 	}
 
 	owned := render.Owned{}
 
-	for _, hook := range p.pkg.Hooks {
+	for _, hook := range hooks {
 		event, ok := render.HookEventName(p.spec.hooksDialect(), hook.Event)
 		if !ok {
 			continue
@@ -2508,4 +2688,104 @@ func (p *loosePlanner) hookRecordOwnership() render.Owned {
 	}
 
 	return owned
+}
+
+// refuseSecretIntoGit refuses a delivery that would write a resolved secret
+// value into a file the project's git repository already tracks. The refusal
+// names the file and the reason, because "it failed" leaves the user with no
+// way to know what to do about it.
+//
+// The check is deliberately narrow: only project scope, only a path inside
+// the project, and only a file git already tracks. A file the repository does
+// not track yet is the user's to commit or not, and .verger/ stays out of
+// version control by the store's own exclude, so this is the last place a
+// leak can be caught before it is written.
+func (p *loosePlanner) refuseSecretIntoGit(path string) error {
+	if p.spec.project == "" || path == "" {
+		return nil
+	}
+
+	// Two questions have to be answered before anything is refused: is the
+	// file inside the project, and does git already track it. Both have a
+	// "cannot tell" answer, and both are answered by not refusing: a path
+	// this check cannot place is a path it has no claim about. Written as one
+	// condition rather than as two early returns, so failing open is a
+	// decision the code states instead of an accident it performs.
+	rel, relErr := filepath.Rel(p.spec.project, path)
+	inside := relErr == nil && !strings.HasPrefix(rel, "..")
+
+	if !inside || !gitTracks(p.spec.project, rel) {
+		return nil
+	}
+
+	return fmt.Errorf("refusing to write a resolved secret into %s: git tracks it, so the value would be committed: ignore or untrack the file, or resolve the secret from the environment", path)
+}
+
+// gitTracks reports whether the repository at root tracks rel.
+//
+// It has no error return, and that is the honest shape: a directory that is
+// not a repository, a git that is not installed, and a file git does not track
+// are all the same answer — nothing to leak into that this check can see — and
+// none of them is a failure of the caller. An error return that is only ever
+// nil would say "this can fail" and then never say it.
+func gitTracks(root, rel string) bool {
+	isRepo := false
+	if _, statErr := os.Stat(filepath.Join(root, ".git")); statErr == nil {
+		isRepo = true
+	}
+
+	if !isRepo {
+		return false
+	}
+
+	// The binary is the literal "git" and the one variable argument is
+	// preceded by "--", so a rel that starts with a dash reaches git as a
+	// path rather than as an option.
+	cmd := exec.CommandContext(context.Background(), "git", "ls-files", "--error-unmatch", "--", rel) //nolint:gosec // G204: the binary is a literal and `--` ends option parsing, so no argument is an option
+	cmd.Dir = root
+
+	// `ls-files --error-unmatch` exits non-zero for "not tracked", which is
+	// this function's other answer.
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// refuseOutsideProject refuses a project-scope spec whose write targets are not
+// all inside the project. hostpath.ProjectSurfaces is the table that answers
+// "where does this host keep X in a project", and an entry that is empty means
+// the host has no project form for it — not that verger should fall back to the
+// user scope and quietly write there.
+func (s looseSpec) refuseOutsideProject() error {
+	if s.project == "" {
+		return nil
+	}
+
+	targets := map[string]string{
+		"skills": s.skillsDir, "agents": s.agentsDir, "commands": s.commandsDir,
+		"rules": s.rulesDir, "hooks": s.hooksPath, "settings": s.settingsPath,
+	}
+
+	if s.mcpConfig != nil {
+		targets["mcp"] = s.mcpConfig.path
+	}
+
+	for name, path := range targets {
+		if path == "" {
+			continue
+		}
+
+		rel, err := filepath.Rel(s.project, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return &NotSupportedError{
+				Host:      s.host,
+				Operation: "project scope delivery of " + name + " (the host has no project surface for it)",
+			}
+		}
+	}
+
+	return nil
 }

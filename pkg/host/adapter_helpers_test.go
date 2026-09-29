@@ -374,7 +374,7 @@ func (c *codexCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ [
 // dispatch routes one recorded call to the fake verb. --json is dropped first:
 // the fake answers the same body for it and does not parse flags.
 func (c *codexCLI) dispatch(key string, args []string) ([]byte, error) {
-	bare := slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == "--json" })
+	bare := dropFlagPair(slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == "--json" }), "--scope")
 
 	switch {
 	case len(bare) == 3 && bare[0] == "plugin" && bare[1] == "marketplace" && bare[2] == "list":
@@ -981,7 +981,12 @@ func (o *ompCLI) Run(_ context.Context, bin hostcli.Binary, args []string, _ []b
 // real CLI ignores it outside `plugin list` (the fake answers the same bytes
 // either way, so a test can assert the flag was or was not passed).
 func (o *ompCLI) dispatch(key string, args []string) ([]byte, error) {
+	// --scope <value> is a real omp plugin flag (omp plugin --help), so the
+	// fake strips the pair the way the host does instead of refusing the
+	// command it is meant to model.
 	bare := slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == flagJSONTest })
+
+	bare = dropFlagPair(bare, "--scope")
 
 	switch {
 	case len(bare) == 3 && bare[0] == "plugin" && bare[1] == "marketplace" && bare[2] == "list":
@@ -1204,3 +1209,21 @@ const (
 	flagJSONTest  = "--json"
 	flagForceTest = "--force"
 )
+
+// dropFlagPair removes a `--flag value` pair from argv, so a fake that matches
+// on arity keeps matching once an adapter passes a real scope flag.
+func dropFlagPair(argv []string, flag string) []string {
+	out := make([]string, 0, len(argv))
+
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == flag && i+1 < len(argv) {
+			i++
+
+			continue
+		}
+
+		out = append(out, argv[i])
+	}
+
+	return out
+}

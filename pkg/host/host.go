@@ -80,6 +80,10 @@ type Delivery struct {
 	Strategy   Strategy
 	AllowHooks bool // false for adopt and for pending consent
 	DryRun     bool
+	// Project is the trusted project root for a project-scope delivery, and
+	// is ignored at user scope. Empty means "no project", which leaves a
+	// project-scope delivery unsupported rather than guessing a root.
+	Project string
 }
 
 // Result reports what one delivery or uninstall did.

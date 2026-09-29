@@ -98,6 +98,13 @@ func (h *gemini) deliverLoose(ctx context.Context, home string, d Delivery) (Res
 			path:   settings,
 			format: manifest.FormatGemini,
 			edit:   render.EditJSONC,
+			// `settings.json` carries both the hooks object and `mcpServers`,
+			// so the document's own artifact claims whichever component planned
+			// first. One artifact per server restores the `mcp` kind in the
+			// receipt and lets a later delivery tell one server from another
+			// (F3).
+			recordPath:      mcpRecordPath,
+			recordArtifacts: mcpRecordArtifacts,
 		},
 	}
 
@@ -464,4 +471,46 @@ func validateManifest(dir string) ([]string, error) {
 // geminiConfigDir resolves the Gemini config dir: <home>/.gemini.
 func geminiConfigDir(home string) string {
 	return filepath.Join(home, geminiDirName)
+}
+
+// mcpRecordKind is the receipt artifact kind of one MCP server claimed inside a
+// shared document. It collapses onto the `mcp` component kind, the way the DSH
+// patch layer's records do.
+const mcpRecordKind = "mcp-record"
+
+// mcpServerPrefix is the container key gemini's settings.json holds its servers
+// under; the key path of one server is this prefix plus its name.
+const mcpServerPrefix = "mcpServers."
+
+// mcpRecordPath is the receipt identity of one MCP server: a value identity, not
+// a filesystem path, so it never collides with the document's own artifact.
+func mcpRecordPath(name string) string {
+	return "gemini://mcp/" + name
+}
+
+// mcpRecordArtifacts claims one receipt artifact per planned MCP server, each
+// carrying that server's own value digest.
+func mcpRecordArtifacts(edits []render.Edit) []receipt.Artifact {
+	artifacts := make([]receipt.Artifact, 0, len(edits))
+
+	for _, edit := range edits {
+		name := strings.TrimPrefix(edit.Path, mcpServerPrefix)
+		if name == edit.Path {
+			continue
+		}
+
+		data, err := json.Marshal(edit.Value)
+		if err != nil {
+			continue
+		}
+
+		artifacts = append(artifacts, receipt.Artifact{
+			Kind:   mcpRecordKind,
+			Name:   name,
+			Path:   mcpRecordPath(name),
+			Digest: digest.Bytes(data),
+		})
+	}
+
+	return artifacts
 }
