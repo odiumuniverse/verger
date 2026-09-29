@@ -87,6 +87,11 @@ func (r *serviceAwareRunner) Run(
 // is to start it.
 func TestOpenCodeSaysTheServiceIsNotListening(t *testing.T) {
 	Convey("Given a binary that answers, and a background service that does not", t, func() {
+		// The shim, not an installed opencode, is what puts the binary on
+		// PATH: without it the runner never runs and the note is "host CLI
+		// not found", which says nothing about the service.
+		fakeOpenCode(t)
+
 		runner := &serviceAwareRunner{blockOn: []string{"plugin list"}}
 
 		open := host.NewOpenCode(
@@ -113,6 +118,12 @@ func TestOpenCodeSaysTheServiceIsNotListening(t *testing.T) {
 // "the service is not listening" about it would point at the wrong thing.
 func TestOpenCodeDistinguishesAWedgedBinaryFromADeadService(t *testing.T) {
 	Convey("Given a binary that answers nothing", t, func() {
+		// Without the shim the runner is never resolved, the note is "host
+		// CLI not found" — and a test that only asserts the absence of one
+		// phrase passes on that. The shim makes the assertion about the
+		// wedged branch rather than about a missing binary.
+		fakeOpenCode(t)
+
 		open := host.NewOpenCode(
 			host.WithHome(t.TempDir()),
 			host.WithRunner(blockingRunner{}),
@@ -121,9 +132,10 @@ func TestOpenCodeDistinguishesAWedgedBinaryFromADeadService(t *testing.T) {
 
 		_, err := open.Oracle().List(t.Context())
 
-		Convey("Then the note does not blame the service", func() {
+		Convey("Then the note blames the host, not a service that is down", func() {
 			So(err, ShouldNotBeNil)
 			So(err.Error(), ShouldNotContainSubstring, "service is not listening")
+			So(err.Error(), ShouldContainSubstring, "wedged")
 		})
 	})
 }

@@ -17,6 +17,12 @@ import (
 // that never happened.
 func TestOpenCodeOracleNamesTheBudgetItActuallyWaited(t *testing.T) {
 	Convey("Given a caller's deadline shorter than the oracle's own bound", t, func() {
+		// The shim is what makes this independent of whether opencode is
+		// installed on the machine running the test. Without it the runner
+		// never runs, the note is "host CLI not found", and the result
+		// depends on the box the test lands on.
+		fakeOpenCode(t)
+
 		h := host.NewOpenCode(
 			host.WithHome(t.TempDir()),
 			host.WithRunner(blockingRunner{}),
