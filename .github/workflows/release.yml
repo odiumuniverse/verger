@@ -363,7 +363,8 @@ jobs:
             class Verger < Formula
               desc "Deliver agent packages to every coding agent host"
               homepage "https://github.com/odiumuniverse/verger"
-              version "__VERSION__"
+              # brew audit flags an explicit version as redundant with the one
+              # it scans from the url; the tarball names carry it.
               license "MIT"
 
               on_macos do
@@ -419,7 +420,6 @@ jobs:
             end
           FORMULA
           src = template
-            .gsub("__VERSION__", version)
             .gsub("__DARWIN_URL__", "#{base}/verger-#{version}-darwin-universal.tar.gz")
             .gsub("__DARWIN_SHA__", sha_darwin)
             .gsub("__ARM64_URL__", "#{base}/verger-#{version}-linux-arm64.tar.gz")
