@@ -352,3 +352,31 @@ func TestLockStaleAfterProcessDeath(t *testing.T) {
 		})
 	})
 }
+
+// TestLockTightensAPreExistingLooseLockFile pins the decision documented on
+// Lock: the 0600 rule is enforced on every acquisition, not only at creation,
+// so a lock file left loose by an old umask or an outside edit is restored.
+func TestLockTightensAPreExistingLooseLockFile(t *testing.T) {
+	Convey("Given a lock file that already exists and is too open", t, func() {
+		h, err := New(filepath.Join(t.TempDir(), "verger"))
+		So(err, ShouldBeNil)
+		So(os.MkdirAll(h.StateDir(), 0o700), ShouldBeNil)
+		// The loose mode is the point of the test: it models a lock file left
+		// behind by an old umask, which Lock must tighten.
+		//nolint:gosec // G306: the deliberately loose mode is what the test creates
+		So(os.WriteFile(h.FileLockPath(), nil, 0o666), ShouldBeNil)
+		//nolint:gosec // G302: the deliberately loose mode is what the test creates
+		So(os.Chmod(h.FileLockPath(), 0o666), ShouldBeNil)
+		assertMode(t, h.FileLockPath(), 0o666)
+
+		Convey("When the home is locked", func() {
+			unlock, lockErr := h.Lock(context.Background())
+
+			Convey("Then the file is owner-only, not merely a fresh file", func() {
+				So(lockErr, ShouldBeNil)
+				So(unlock(), ShouldBeNil)
+				assertMode(t, h.FileLockPath(), 0o600)
+			})
+		})
+	})
+}

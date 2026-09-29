@@ -236,14 +236,15 @@ func TestHooksFromDocumentClaudeFilters(t *testing.T) {
 		hooks, warns, err := hooksFromDocument(FormatClaude, "hooks/hooks.json", data)
 
 		Convey("When the document is parsed", func() {
-			Convey("Then the matcher degrades to empty and non-command handlers are skipped", func() {
+			// Fail-closed: a matcher that cannot be read is not the same as no
+			// matcher, so its entry is dropped rather than widened to every
+			// tool call. The two command-shaped entries still decode.
+			Convey("Then the entry with the unreadable matcher is dropped, and the other two decode to nothing", func() {
 				So(err, ShouldBeNil)
-				So(hooks, ShouldResemble, []Hook{
-					{Event: EventPreTool, Matcher: "", Command: "ok.sh", Timeout: 0, Origin: FormatClaude},
-				})
+				So(hooks, ShouldBeEmpty)
 
 				So(warns, ShouldResemble, []string{
-					"claude: hooks/hooks.json: hook matcher is not a string; ignored",
+					"claude: hooks/hooks.json: hook matcher is not a string; hook ignored",
 					"claude: hooks/hooks.json: hook pre-tool handler type \"prompt\" is not a command; skipped",
 					"claude: hooks/hooks.json: hook pre-tool handler has no command; skipped",
 				})
@@ -461,6 +462,50 @@ func TestCodexHookPrecedence(t *testing.T) {
 					`codex: plugin.json: hook path "../outside.json" escapes the package root; ignored`,
 				})
 			})
+		})
+	})
+}
+
+// TestHookDialectTableIsSingleSourced pins the one-table rule: every canonical
+// event a dialect speaks is a valid event, every host event round-trips back
+// to the canonical event it maps to, and the reverse lookup never depends on
+// map iteration order.
+func TestHookDialectTableIsSingleSourced(t *testing.T) {
+	Convey("Given the dialects the manifest knows", t, func() {
+		Convey("When each mapping is checked in both directions", func() {
+			for _, format := range []Format{FormatClaude, FormatCodex, FormatGemini} {
+				events := canonEventsFor(format)
+				So(events, ShouldNotBeEmpty)
+
+				for hostEvent, canon := range events {
+					So(ValidEvent(canon), ShouldBeTrue)
+
+					back, ok := HostEvent(format, canon)
+					So(ok, ShouldBeTrue)
+					So(back, ShouldEqual, hostEvent)
+				}
+			}
+		})
+
+		Convey("Then the reverse lookup is stable across repeated calls", func() {
+			for range 50 {
+				host, ok := HostEvent(FormatClaude, EventStop)
+				So(ok, ShouldBeTrue)
+				So(host, ShouldEqual, "Stop")
+			}
+		})
+
+		Convey("Then Cursor keeps its documented asymmetry", func() {
+			// Cursor speaks matchers but contributes no host event names in
+			// Ф1: the matcher is meaningful, the reverse mapping is not.
+			So(MatcherEvent(FormatCursor, EventPreTool), ShouldBeTrue)
+
+			_, ok := HostEvent(FormatCursor, EventPreTool)
+			So(ok, ShouldBeFalse)
+		})
+
+		Convey("Then an event no dialect speaks is not canonical", func() {
+			So(ValidEvent("nonsense"), ShouldBeFalse)
 		})
 	})
 }

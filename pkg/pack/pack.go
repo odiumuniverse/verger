@@ -86,10 +86,15 @@ type Input struct {
 // digest of the rendered bytes it produced; MCP servers and hooks have no
 // digest entry.
 type Artifact struct {
-	Files    map[string][]byte      // slash-relative
-	Digests  map[string]digest.Hash // per logical component (kind/name)
-	Formats  []manifest.Format      // formats rendered valid
-	Warnings []string
+	Files   map[string][]byte      // slash-relative
+	Digests map[string]digest.Hash // per logical component (kind/name)
+	Formats []manifest.Format      // formats rendered valid
+	// SourceFormat is the dialect the payload was read from, so a caller can
+	// tell what this chimera was rendered *from*, not only what it renders
+	// *to*. It is the source's own value and is never validated: a chimera
+	// renders every format regardless of where it came from.
+	SourceFormat manifest.Format
+	Warnings     []string
 
 	// symlinks maps a rendered path to its link target: a skill tree is copied
 	// verbatim, and a symlink cannot live in a byte map.
@@ -130,6 +135,44 @@ type renderer struct {
 	// case-insensitive store filesystem would collapse case variants into one
 	// file, silently dropping a component.
 	folded map[string]string
+	// foldedDirs is the same guard one level up: a case-variant *directory*
+	// would merge two logical trees into one on a case-insensitive store, so
+	// the directory prefixes are folded too.
+	foldedDirs map[string]string
+}
+
+// foldDir records the directory prefix of an output path in the case-folded
+// index. "skills/Alpha/a.md" and "skills/alpha/b.md" are distinct file paths,
+// but on a case-insensitive store they are the same directory: the second
+// render would land inside the first one's tree.
+func (r *renderer) foldDir(rel string) error {
+	dir, ok := cutDir(rel)
+	if !ok {
+		return nil
+	}
+
+	key := strings.ToLower(dir)
+	if prev, prevOK := r.foldedDirs[key]; prevOK && prev != dir {
+		return &RenderError{
+			Component: rel,
+			Cause:     fmt.Errorf("output directory %q differs only by case from %q", dir, prev),
+		}
+	}
+
+	r.foldedDirs[key] = dir
+
+	return nil
+}
+
+// cutDir returns the slash-relative directory prefix of a path, reporting
+// false for a path with no directory part.
+func cutDir(rel string) (string, bool) {
+	idx := strings.LastIndex(rel, "/")
+	if idx <= 0 {
+		return "", false
+	}
+
+	return rel[:idx], true
 }
 
 // Render builds the chimera artifact. It is pure: the payload root is only
@@ -145,12 +188,14 @@ func Render(in Input) (Artifact, error) {
 		name:  identity.Name,
 		owner: identity.Owner,
 		art: Artifact{
-			Files:    map[string][]byte{},
-			Digests:  map[string]digest.Hash{},
-			Formats:  chimeraFormats(),
-			symlinks: map[string]string{},
+			Files:        map[string][]byte{},
+			Digests:      map[string]digest.Hash{},
+			Formats:      chimeraFormats(),
+			SourceFormat: in.Format,
+			symlinks:     map[string]string{},
 		},
-		folded: map[string]string{},
+		folded:     map[string]string{},
+		foldedDirs: map[string]string{},
 	}
 
 	mcp := r.renderMCP()
@@ -322,11 +367,18 @@ func (r *renderer) addFile(rel string, data []byte) error {
 
 // foldPath records one output path in the case-folded index. Exact duplicates
 // keep their kind-specific semantics (files: "duplicate output path"; symlinks:
-// last write wins); this guard refuses only a path that differs from an
+// last write wins); this guard refuses a path that differs from an
 // already-claimed one by case alone, because a case-insensitive store
-// filesystem would overwrite the first with the second. Only case folding is
-// covered — Unicode NFC/NFD equivalence would need x/text/unicode/norm, which
-// is not an allowed dependency in Ф1.
+// filesystem would overwrite the first with the second, and it refuses the
+// same collision one level up, on the directory prefix.
+//
+// Only case folding is covered. Unicode NFC/NFD equivalence is a documented
+// limitation: it would need x/text/unicode/norm, which is not an allowed
+// dependency in Ф1. Two components whose slugs differ only by Unicode
+// composition are therefore rendered as two paths, and on a normalising
+// filesystem the second write can replace the first. The limitation is pinned
+// by TestRenderUnicodeCompositionIsNotFolded so the day it is lifted, the
+// test is what changes.
 func (r *renderer) foldPath(rel string) error {
 	key := strings.ToLower(rel)
 
@@ -335,6 +387,10 @@ func (r *renderer) foldPath(rel string) error {
 			Component: rel,
 			Cause:     fmt.Errorf("output path %q differs only by case from %q", rel, prev),
 		}
+	}
+
+	if err := r.foldDir(rel); err != nil {
+		return err
 	}
 
 	r.folded[key] = rel

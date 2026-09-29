@@ -2,6 +2,7 @@ package pack
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,13 @@ import (
 
 // PackWriteError reports a staging or rename failure. The target keeps its
 // previous content, or is left empty.
+//
+// After the swap has started the target is moved aside to a `.old-*` sibling
+// before the new tree is renamed in. If that second rename fails the backup is
+// moved back, so the target holds either its previous content or the new one —
+// but a **crash** (SIGKILL, power loss) between the two renames leaves the
+// target absent and the previous content in the `.old-*` sibling. Write owns
+// that recovery: the next call restores it. See recoverStale.
 type PackWriteError struct {
 	Dir   string
 	Cause error
@@ -48,6 +56,13 @@ type Result struct {
 // renamed into place; a target that already carries the exact artifact is a
 // no-op returning the same dir. The store path validation errors pass through
 // unchanged; every staging/rename failure is a *PackWriteError.
+//
+// The install is crash-safe rather than crash-proof: a killed process can
+// leave a `<synth>.tmp-*` staging tree and a `<synth>.old-*` backup of the
+// previous version beside the target. Every call first recovers the state a
+// previous call left behind — a backup is renamed back when the target is
+// missing, and every leftover is removed once the target is in place — so
+// those siblings have an owner and never accumulate.
 func Write(ctx context.Context, st *store.Store, in Input) (Result, error) {
 	if st == nil {
 		return Result{}, &PackWriteError{Cause: errors.New("store is required")}
@@ -74,6 +89,10 @@ func Write(ctx context.Context, st *store.Store, in Input) (Result, error) {
 	if sameTarget(target, art) {
 		return Result{Dir: target, Artifact: art}, nil
 	}
+
+	// Recover whatever a crashed earlier install left beside the target, so
+	// the swap below always starts from a known state.
+	recoverStale(target)
 
 	staging, err := os.MkdirTemp(filepath.Dir(target), filepath.Base(target)+".tmp-*")
 	if err != nil {
@@ -245,6 +264,52 @@ func sameEntry(current, rel string, entry fs.DirEntry, art Artifact) (bool, erro
 		return bytes.Equal(got, want), nil
 	default:
 		return false, nil
+	}
+}
+
+// recoverStale takes ownership of the siblings a crashed install left beside a
+// synth target. A `<synth>.old-*` backup means the process died between the
+// "move the target aside" and the "rename the new tree in" renames: the target
+// is then missing and the backup holds the last good version, so the backup is
+// renamed back. Leftover `<synth>.tmp-*` staging trees and any backup that is
+// no longer needed are removed. It is best effort — every step is ignored on
+// failure, because a leftover directory must never fail the write that found
+// it.
+func recoverStale(target string) {
+	parent := filepath.Dir(target)
+	base := filepath.Base(target)
+
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+
+	_, targetErr := os.Lstat(target)
+	targetMissing := errors.Is(targetErr, fs.ErrNotExist)
+
+	// Oldest first: the first backup is the version the crashed swap moved
+	// aside, and any later one is debris from an even older run.
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int {
+		return cmp.Compare(a.Name(), b.Name())
+	})
+
+	for _, entry := range entries {
+		name := entry.Name()
+
+		switch {
+		case strings.HasPrefix(name, base+".tmp-"):
+			_ = os.RemoveAll(filepath.Join(parent, name))
+		case strings.HasPrefix(name, base+".old-") && targetMissing:
+			if err := os.Rename(filepath.Join(parent, name), target); err == nil {
+				targetMissing = false
+
+				continue
+			}
+
+			_ = os.RemoveAll(filepath.Join(parent, name))
+		case strings.HasPrefix(name, base+".old-"):
+			_ = os.RemoveAll(filepath.Join(parent, name))
+		}
 	}
 }
 

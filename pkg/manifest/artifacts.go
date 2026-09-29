@@ -200,13 +200,29 @@ func declaredSkills(root string, format Format, file string, rels []string, warn
 }
 
 // localPath resolves one plugin-relative path; ok is false when the path
-// escapes the package root.
+// escapes the package root, including through a symlink.
 func localPath(root, rel string) (string, bool) {
 	if !filepath.IsLocal(rel) {
 		return "", false
 	}
 
-	return filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(rel, "./"))), true
+	joined := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(rel, "./")))
+
+	// A symlink inside the package can point outside it. Resolve both the
+	// candidate and the root (on macOS, TempDir is a symlink to /private/var)
+	// before comparing, so a path under a symlinked root is not wrongly
+	// rejected.
+	if resolved, err := filepath.EvalSymlinks(joined); err == nil {
+		if resolvedRoot, err := filepath.EvalSymlinks(root); err == nil {
+			if !strings.HasPrefix(resolved, resolvedRoot+string(filepath.Separator)) && resolved != resolvedRoot {
+				return "", false
+			}
+		} else if !strings.HasPrefix(resolved, root+string(filepath.Separator)) && resolved != root {
+			return "", false
+		}
+	}
+
+	return joined, true
 }
 
 // relOrEmpty renders a slash-relative path below root; ok is false when the

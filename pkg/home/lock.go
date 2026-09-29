@@ -21,6 +21,12 @@ type Unlock func() error
 // expiry or cancellation yields *LockedError wrapping ctx.Err(). Locks are per
 // open file description, so a second Lock in the same process fails instead of
 // re-entering.
+//
+// The lock file is owner-only 0600. The mode is enforced on **every** Lock,
+// not only when the file is created: the file lives in verger's own state dir,
+// so any other mode is either a leftover umask or an outside edit, and a lock
+// file other users can reach is a property worth restoring on every
+// acquisition rather than once at creation.
 func (h *Home) Lock(ctx context.Context) (Unlock, error) {
 	path := h.FileLockPath()
 
@@ -46,7 +52,8 @@ func (h *Home) Lock(ctx context.Context) (Unlock, error) {
 		return nil, &LockedError{Path: path, Cause: errors.New("lock is held by another process")}
 	}
 
-	// The lock file belongs to verger: enforce 0600 even when it pre-existed.
+	// The lock file belongs to verger: enforce owner-only 0600 even when it
+	// pre-existed (see the Lock doc for why this is not creation-only).
 	//nolint:gosec // G302: a lock file is owner-only 0600
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = fileLock.Unlock()

@@ -112,14 +112,16 @@ func (l *LeaseHandle) Release() error {
 	return nil
 }
 
-// leaseRead reads the lease content for LeaseStatus. It is an unexported test
-// seam (the accepted fsutil.renameForTest pattern) proving the probe lock is
-// still held while the content is read.
-var leaseRead = loadLeaseFile
-
 // LeaseStatus reports whether the lease is currently held and, best effort, by
 // whom. It never blocks and never mutates the file.
 func LeaseStatus(path string) (Lease, bool, error) {
+	return leaseStatus(path, loadLeaseFile)
+}
+
+// leaseStatus is LeaseStatus with the content reader injected, so a test can
+// prove that the content is read while the probe lock is still held without
+// the package carrying a mutable global (rule 13).
+func leaseStatus(path string, read func(string) (Lease, error)) (Lease, bool, error) {
 	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
 		return Lease{}, false, nil
 	} else if err != nil {
@@ -137,7 +139,7 @@ func LeaseStatus(path string) (Lease, bool, error) {
 		// Read while the probe lock is still held: releasing it first would
 		// open a window for a concurrent acquirer to truncate the file
 		// mid-read.
-		lease, readErr := leaseRead(path)
+		lease, readErr := read(path)
 
 		_ = fileLock.Unlock()
 
@@ -148,7 +150,7 @@ func LeaseStatus(path string) (Lease, bool, error) {
 		return lease, false, nil
 	}
 
-	lease, readErr := leaseRead(path)
+	lease, readErr := read(path)
 	if readErr != nil {
 		return Lease{}, false, readErr
 	}

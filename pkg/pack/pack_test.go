@@ -1395,3 +1395,133 @@ func snapshotTree(t *testing.T, root string) map[string]string {
 
 	return out
 }
+
+// TestRenderCaseVariantDirectoryRefused pins the directory-level half of the
+// case-fold guard: "Alpha" and "alpha" produce distinct file paths, so only
+// folding the directory prefix catches that the two trees are one directory
+// on a case-insensitive store.
+func TestRenderCaseVariantDirectoryRefused(t *testing.T) {
+	Convey("Given two skills whose rendered directories differ only by case", t, func() {
+		root := t.TempDir()
+
+		for _, tree := range []string{"one", "two"} {
+			writeFile(t, filepath.Join(root, "src", tree, "SKILL.md"), "---\nname: skill\n---\n\nbody\n")
+		}
+
+		in := Input{
+			ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion,
+			Root: root,
+			Components: []manifest.Component{
+				{Kind: manifest.KindSkill, Name: "Alpha", Path: "src/one"},
+				{Kind: manifest.KindSkill, Name: "alpha", Path: "src/two"},
+			},
+		}
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the colliding directory is refused by name", func() {
+				target := renderError(t, err)
+				So(target.Cause.Error(), ShouldContainSubstring, "differs only by case")
+				So(art.Files, ShouldBeEmpty)
+			})
+		})
+	})
+}
+
+// TestRenderUnicodeCompositionIsNotFolded pins the documented limitation: the
+// case-fold guard is case only, so two slugs that differ solely by Unicode
+// composition render as two paths instead of colliding. Lifting the
+// limitation means changing this test.
+func TestRenderUnicodeCompositionIsNotFolded(t *testing.T) {
+	Convey("Given two skills whose names differ only by Unicode composition", t, func() {
+		root := t.TempDir()
+
+		for _, tree := range []string{"one", "two"} {
+			writeFile(t, filepath.Join(root, "src", tree, "SKILL.md"), "---\nname: skill\n---\n\nbody\n")
+		}
+
+		in := Input{
+			ID: goldenID, Name: goldenName, Owner: goldenOwner, Version: goldenVersion,
+			Root: root,
+			Components: []manifest.Component{
+				{Kind: manifest.KindSkill, Name: "cafe\u0301", Path: "src/one"},
+				{Kind: manifest.KindSkill, Name: "caf\u00e9", Path: "src/two"},
+			},
+		}
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the two spellings are distinct paths, not a folded duplicate", func() {
+				So(err, ShouldBeNil)
+				So(art.Files, ShouldNotBeEmpty)
+			})
+		})
+	})
+}
+
+// TestRenderRecordsTheSourceFormat pins Input.Format's one real use: the
+// artifact records the dialect it was rendered from, next to the formats it
+// renders to.
+func TestRenderRecordsTheSourceFormat(t *testing.T) {
+	Convey("Given a payload read from the codex dialect", t, func() {
+		in := fixtureInput(t)
+		in.Format = manifest.FormatCodex
+
+		Convey("When the package is rendered", func() {
+			art, err := Render(in)
+
+			Convey("Then the artifact carries the source format and still renders every format", func() {
+				So(err, ShouldBeNil)
+				So(art.SourceFormat, ShouldEqual, manifest.FormatCodex)
+				So(art.Formats, ShouldContain, manifest.FormatClaude)
+			})
+		})
+	})
+}
+
+// TestWriteRecoversFromACrashedInstall pins the owner of the leftover
+// siblings: a killed install between the two swap renames leaves the target
+// missing and the previous version in a .old-* backup, and the next write
+// restores it and clears every leftover.
+func TestWriteRecoversFromACrashedInstall(t *testing.T) {
+	Convey("Given a synth dir whose install was killed mid-swap", t, func() {
+		st, openErr := store.Open(filepath.Join(t.TempDir(), "store"))
+		So(openErr, ShouldBeNil)
+
+		in := fixtureInput(t)
+
+		res, err := Write(t.Context(), st, in)
+		So(err, ShouldBeNil)
+
+		parent := filepath.Dir(res.Dir)
+		base := filepath.Base(res.Dir)
+
+		// Model the crash: the target is moved aside and never moved back.
+		So(os.Rename(res.Dir, filepath.Join(parent, base+".old-crashed")), ShouldBeNil)
+
+		stale := filepath.Join(parent, base+".tmp-crashed")
+		So(os.MkdirAll(stale, 0o700), ShouldBeNil)
+
+		Convey("When the same package is written again", func() {
+			again, writeErr := Write(t.Context(), st, in)
+
+			Convey("Then the backup is restored and both leftovers are gone", func() {
+				So(writeErr, ShouldBeNil)
+				So(again.Dir, ShouldEqual, res.Dir)
+
+				_, statErr := os.Lstat(res.Dir)
+				So(statErr, ShouldBeNil)
+
+				entries, readErr := os.ReadDir(parent)
+				So(readErr, ShouldBeNil)
+
+				for _, entry := range entries {
+					So(strings.HasPrefix(entry.Name(), base+".tmp-"), ShouldBeFalse)
+					So(strings.HasPrefix(entry.Name(), base+".old-"), ShouldBeFalse)
+				}
+			})
+		})
+	})
+}

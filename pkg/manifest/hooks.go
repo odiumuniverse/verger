@@ -23,38 +23,76 @@ const (
 	EventStop         = "stop"
 )
 
-// canonEventsFor returns the dialect table of one format: host event names to
-// canonical events. An unmapped host event is never guessed.
-func canonEventsFor(format Format) map[string]string {
-	switch format {
-	case FormatClaude, FormatCodex:
-		return map[string]string{
+// dialect is one format's hook vocabulary: the host event names it speaks,
+// mapped to canonical events, and whether its dialect carries a matcher at
+// all. This one table is the single source of truth for the three questions
+// the manifest asks about a format — which host events exist, whether an
+// event is canonical, and whether a matcher is meaningful — so a new format
+// is declared once instead of in three switches.
+type dialect struct {
+	events  map[string]string // host event name → canonical event
+	matcher bool              // the dialect carries a matcher on its tool events
+}
+
+// dialects is the per-format table. An unmapped host event is never guessed.
+var dialects = map[Format]dialect{
+	FormatClaude: {
+		matcher: true,
+		events: map[string]string{
 			"PreToolUse":   EventPreTool,
 			"PostToolUse":  EventPostTool,
 			"SessionStart": EventSessionStart,
 			"Stop":         EventStop,
 			"Notification": EventNotification,
-		}
-	case FormatGemini:
-		return map[string]string{
+		},
+	},
+	FormatCodex: {
+		matcher: true,
+		events: map[string]string{
+			"PreToolUse":   EventPreTool,
+			"PostToolUse":  EventPostTool,
+			"SessionStart": EventSessionStart,
+			"Stop":         EventStop,
+			"Notification": EventNotification,
+		},
+	},
+	FormatGemini: {
+		matcher: true,
+		events: map[string]string{
 			"BeforeTool":   EventPreTool,
 			"AfterTool":    EventPostTool,
 			"SessionStart": EventSessionStart,
 			"Notification": EventNotification,
-		}
-	default:
-		return nil
-	}
+		},
+	},
+	// Cursor speaks matchers but contributes no host event names in Ф1, so a
+	// canonical event cannot be rendered back into a host event for it.
+	FormatCursor: {matcher: true},
 }
+
+// canonEventsFor returns the dialect table of one format: host event names to
+// canonical events. A format with no table returns nil.
+func canonEventsFor(format Format) map[string]string {
+	return dialects[format].events
+}
+
+// canonicalEvents is every canonical event any dialect speaks, derived from
+// the one table so the set cannot drift from the mappings.
+var canonicalEvents = func() map[string]bool {
+	out := map[string]bool{}
+
+	for _, d := range dialects {
+		for _, canon := range d.events {
+			out[canon] = true
+		}
+	}
+
+	return out
+}()
 
 // ValidEvent reports whether event is a canonical hook event.
 func ValidEvent(event string) bool {
-	switch event {
-	case EventNotification, EventPostTool, EventPreTool, EventSessionStart, EventStop:
-		return true
-	default:
-		return false
-	}
+	return canonicalEvents[event]
 }
 
 // CanonEvent maps a host event name of one dialect to the canonical event.
@@ -64,10 +102,14 @@ func CanonEvent(format Format, hostEvent string) (string, bool) {
 	return canon, ok
 }
 
-// HostEvent maps a canonical event to the host event name of one dialect.
+// HostEvent maps a canonical event to the host event name of one dialect. The
+// table is walked in sorted key order, so the answer never depends on map
+// iteration order.
 func HostEvent(format Format, canonEvent string) (string, bool) {
-	for hostEvent, canon := range canonEventsFor(format) {
-		if canon == canonEvent {
+	events := canonEventsFor(format)
+
+	for _, hostEvent := range slices.Sorted(maps.Keys(events)) {
+		if events[hostEvent] == canonEvent {
 			return hostEvent, true
 		}
 	}
@@ -76,14 +118,14 @@ func HostEvent(format Format, canonEvent string) (string, bool) {
 }
 
 // MatcherEvent reports whether a canonical event carries a matcher in the
-// dialect: only pre-tool and post-tool do.
+// dialect: only pre-tool and post-tool do, and only in a dialect that has
+// matchers at all.
 func MatcherEvent(format Format, canonEvent string) bool {
-	switch format {
-	case FormatClaude, FormatCodex, FormatGemini, FormatCursor:
-		return canonEvent == EventPreTool || canonEvent == EventPostTool
-	default:
+	if !dialects[format].matcher {
 		return false
 	}
+
+	return canonEvent == EventPreTool || canonEvent == EventPostTool
 }
 
 // hookHandler is one raw handler before the canon filters it.
@@ -188,7 +230,10 @@ func hooksFromEntry(format Format, file, canon string, data json.RawMessage) ([]
 		return nil, []string{warning(format, file, "hook entry is neither a matcher group nor a handler; ignored")}
 	}
 
-	matcher, matcherWarns := handlerMatcher(format, file, raw)
+	matcher, matcherOK, matcherWarns := handlerMatcher(format, file, raw)
+	if !matcherOK {
+		return nil, matcherWarns
+	}
 
 	handlerData, err := json.Marshal(withDefaultType(raw))
 	if err != nil {
@@ -205,7 +250,10 @@ func hooksFromEntry(format Format, file, canon string, data json.RawMessage) ([]
 
 // hooksFromGroup decodes one nested matcher group.
 func hooksFromGroup(format Format, file, canon string, raw map[string]json.RawMessage) ([]Hook, []string) {
-	matcher, warns := handlerMatcher(format, file, raw)
+	matcher, matcherOK, warns := handlerMatcher(format, file, raw)
+	if !matcherOK {
+		return nil, warns
+	}
 
 	var handlers []json.RawMessage
 
@@ -231,23 +279,28 @@ func hooksFromGroup(format Format, file, canon string, raw map[string]json.RawMe
 
 // handlerMatcher reads the matcher of a group or flat handler; "*" and empty
 // are both kept as "".
-func handlerMatcher(format Format, file string, raw map[string]json.RawMessage) (string, []string) {
+//
+// A matcher that is present but is not a string is a **fail-closed** case: an
+// unreadable filter is not treated as an absent one. Keeping the hook with an
+// empty matcher would widen it to every tool call, so the entry is dropped
+// and the reason is reported.
+func handlerMatcher(format Format, file string, raw map[string]json.RawMessage) (string, bool, []string) {
 	value, ok := raw["matcher"]
 	if !ok {
-		return "", nil
+		return "", true, nil
 	}
 
 	var matcher string
 
 	if err := json.Unmarshal(value, &matcher); err != nil {
-		return "", []string{warning(format, file, "hook matcher is not a string; ignored")}
+		return "", false, []string{warning(format, file, "hook matcher is not a string; hook ignored")}
 	}
 
 	if matcher == "*" {
-		return "", nil
+		return "", true, nil
 	}
 
-	return matcher, nil
+	return matcher, true, nil
 }
 
 // withDefaultType gives a flat handler the documented default type.

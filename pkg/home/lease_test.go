@@ -395,12 +395,9 @@ func TestLeaseStatusReadsBeforeReleasingProbe(t *testing.T) {
 		So(err, ShouldBeNil)
 		mkFile(t, path, string(data), 0o600)
 
-		restore := leaseRead
-		defer func() { leaseRead = restore }()
-
 		probeLocked := make(chan bool, 1)
 
-		leaseRead = func(readPath string) (Lease, error) {
+		read := func(readPath string) (Lease, error) {
 			probe := flock.New(readPath)
 
 			locked, probeErr := probe.TryLock()
@@ -414,7 +411,7 @@ func TestLeaseStatusReadsBeforeReleasingProbe(t *testing.T) {
 		}
 
 		Convey("When LeaseStatus probes it", func() {
-			info, held, statusErr := LeaseStatus(path)
+			info, held, statusErr := leaseStatus(path, read)
 
 			Convey("Then the probe lock is still held while the content is read", func() {
 				So(statusErr, ShouldBeNil)
