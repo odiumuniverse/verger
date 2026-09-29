@@ -236,7 +236,17 @@ func splitAddress(address string) []string {
 
 // RequireKeyring returns the probe's verdict as a typed error, so a caller
 // that was told to use the keyring and cannot is told why in one call.
+//
+// A nil probe is a caller that wired nothing — an unset option, a host with
+// no keyring support, a front end that never built one — and it gets the
+// same answer as a machine with no keychain, because that is what it is.
+// Asking the question used to dereference it, which turned a missing
+// dependency into a crash inside a diagnostic.
 func RequireKeyring(probe KeyringProbe) error {
+	if probe == nil {
+		return &KeyringUnavailableError{Reason: UnavailableMessage}
+	}
+
 	ok, reason := probe.Available()
 	if ok {
 		return nil
