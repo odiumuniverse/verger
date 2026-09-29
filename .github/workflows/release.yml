@@ -3,6 +3,17 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # A full dry run of the release pipeline before the first tag exists: build
+  # and the three smoke runs happen exactly as they would for a tag, but
+  # nothing is published and the tap is not bumped. The version comes from the
+  # input, so a release candidate can be exercised under the name it will
+  # actually be published under.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 0.1.1-rc)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,6 +26,28 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
+      # One definition of the version for the whole file, so a dispatch run and
+      # a tag run cannot disagree about what they are building. On a tag it is
+      # the tag; on a dispatch it is the input. A dispatch on a branch has
+      # GITHUB_REF_NAME set to the BRANCH name, which is why reading it blindly
+      # would name the artifacts after a branch.
+      - name: Resolve the version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::no version: push a v* tag, or pass one to workflow_dispatch" >&2
+            exit 1
+          fi
+          echo "building version ${version} (${EVENT})"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
@@ -51,17 +84,26 @@ jobs:
       # than committed, because a checked-in page rots the moment a flag moves.
       - name: Generate the man pages
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           mkdir -p dist/man
           go run -mod=vendor ./cmd/gendocs -out dist/man -version "${version}" -date "$(date -u '+%b %Y')"
           ls -l dist/man | head
 
-      # A page that does not render is not a page. This is the same command a
-      # user would type after brew installs the formula.
+      # mandoc, not `man -l` and not groff: the macOS runner ships BSD man,
+      # whose -l flag does not exist, and it ships no groff at all. mandoc is
+      # in /usr/bin on every macOS runner and renders roff natively.
+      #
+      # Warning level, not error level, and not `man -l`/groff: the macOS
+      # runner ships BSD man, whose -l flag does not exist, and it ships no
+      # groff at all. mandoc is in /usr/bin on every macOS runner and renders
+      # roff natively. Every page is linted, not just verger.1, because a
+      # subcommand page is what a user hits when they run `verger secret set
+      # --help`; a clean root page says nothing about the other forty.
       - name: Smoke the man pages
         run: |
-          man -l dist/man/verger.1 > /dev/null || groff -man -Tascii dist/man/verger.1 > /dev/null
-          echo "man renders"
+          mandoc -T lint -W warning dist/man/*.1
+          mandoc -T ascii dist/man/verger.1 > /dev/null
+          echo "mandoc: all $(ls dist/man/*.1 | wc -l | tr -d ' ') pages lint clean and verger.1 renders"
 
       # Each tarball carries a bare `verger` at its root, because the formula
       # does `bin.install "verger"`, and a `man/` directory beside it, because
@@ -76,7 +118,7 @@ jobs:
 
       - name: Build every artifact
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           mkdir -p build/darwin-arm64 build/darwin-amd64 dist
           # A platform tarball without a page is a packaging bug, not a
           # downstream problem, so it fails here rather than in a user's brew.
@@ -108,7 +150,7 @@ jobs:
 
       - name: Pack the man pages
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           tar -czf "dist/verger-man-${version}.tar.gz" -C dist/man .
 
       # sha256 of every published artifact, so a user can verify a download
@@ -153,6 +195,7 @@ jobs:
   # one run reports all three.
   smoke:
     needs: build
+
     strategy:
       fail-fast: false
       matrix:
@@ -165,6 +208,21 @@ jobs:
             asset: linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
+      # The smoke job names the same tarballs the build job produced, so it
+      # resolves the version the same way rather than re-deriving it from the
+      # ref, which on a dispatch would be a branch name.
+      - name: Resolve the version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -172,7 +230,7 @@ jobs:
 
       - name: Run the packaged binary on this runner
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           tarball="dist/verger-${version}-${{ matrix.asset }}.tar.gz"
           mkdir -p unpack
           tar -xzf "$tarball" -C unpack
@@ -200,8 +258,24 @@ jobs:
 
   publish:
     needs: [build, smoke]
+    # A dispatch run proves the pipeline without publishing: no GitHub release
+    # is created and the tap is not bumped, so a candidate can be exercised as
+    # often as needed. Only a real tag publishes.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve the version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
       - uses: actions/download-artifact@v4
         with:
           name: darwin-universal
@@ -241,7 +315,7 @@ jobs:
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$VERSION"
           if [ -z "$TAP_TOKEN" ]; then
             echo "::error::TAP_TOKEN is not set; the homebrew-tap formula cannot be bumped" >&2
             exit 1

@@ -42,3 +42,4 @@ go.work.sum
 
 # Local design notes, specs and review reports (not published)
 /docs/
+/gendocs
