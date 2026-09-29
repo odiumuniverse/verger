@@ -134,7 +134,12 @@ Second line.
 			{"ascii", strings.Repeat("a", 130)},
 			{"cyrillic", strings.Repeat("я", 130)},
 			{"emoji", strings.Repeat("😀", 130)},
-			{"mixed multibyte boundary", strings.Repeat("a", 119) + "€"},
+			// Longer than 120 runes with a multibyte character *inside* the
+			// cut, so the truncation branch runs and a byte-based cut is
+			// distinguishable from a rune-based one. The previous 119+"€"
+			// was exactly 120 runes: it never entered the branch, so it could
+			// not kill a byte-truncating mutant.
+			{"mixed multibyte boundary", strings.Repeat("a", 118) + "€" + strings.Repeat("b", 20)},
 		}
 
 		for _, item := range cases {
