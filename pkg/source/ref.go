@@ -6,6 +6,7 @@ package source
 import (
 	"fmt"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,13 @@ type Ref struct {
 
 // Parse parses one reference of the §2.1 grammar.
 func Parse(input string) (Ref, error) {
+	return ParseWithBase(input, "")
+}
+
+// ParseWithBase parses one reference, resolving relative local paths against
+// baseDir (the directory containing verger.toml). An empty baseDir resolves
+// against the process working directory.
+func ParseWithBase(input, baseDir string) (Ref, error) {
 	switch {
 	case input == "":
 		return Ref{}, &RefError{Input: input, Reason: "empty reference"}
@@ -62,21 +70,9 @@ func Parse(input string) (Ref, error) {
 		return Ref{}, &RefError{Input: input, Reason: "reference contains a NUL byte"}
 	}
 
-	switch {
-	case strings.HasPrefix(input, "github:"):
-		return parseGitHub(input, strings.TrimPrefix(input, "github:"))
-	case strings.HasPrefix(input, "git+"):
-		return parseGitURL(input)
-	case strings.HasPrefix(input, "npm:"):
-		return parseNPM(input)
-	case strings.HasPrefix(input, "mcp:"):
-		return parseMCP(input)
-	case strings.HasPrefix(input, "file://"),
-		strings.HasPrefix(input, "http://"),
-		strings.HasPrefix(input, "https://"):
-		return parseArchiveURL(input)
-	case strings.HasPrefix(input, "./"):
-		return parseLocal(input)
+	ref, ok, err := parseByScheme(input, baseDir)
+	if ok {
+		return ref, err
 	}
 
 	if host, rest, ok := strings.Cut(input, ":"); ok {
@@ -88,6 +84,128 @@ func Parse(input string) (Ref, error) {
 	}
 
 	return parseRegistryID(input)
+}
+
+// ParseSource parses a `[[source]]` URL, which is configuration rather than
+// a package reference.
+//
+// The two differ in one rule and one rule only. A ref typed on a command
+// line may not climb out of where it was pointed — a package ref names one
+// package, and `..` is a way to reach something the user did not name. A
+// source is a configured root, written by hand into a file the user owns,
+// and the ordinary way to name the packages sitting beside `verger.toml` is
+// `../pkgs`. Refusing that turned a whole vault into "nothing to do".
+//
+// Everything else is the same grammar, so everything else still fails the
+// same way: a missing path, a file where a directory belongs. A reason is
+// always given.
+func ParseSource(input, baseDir string) (Ref, error) {
+	if strings.Contains(input, "..") {
+		return parseSourceWithParent(input, baseDir)
+	}
+
+	return ParseWithBase(input, baseDir)
+}
+
+// parseSourceWithParent is parseLocal with the containment rule lifted. It
+// keeps every other check, including refusing a path that is not there, so a
+// typo stays a named error rather than becoming a silent skip.
+func parseSourceWithParent(input, baseDir string) (Ref, error) {
+	trimmed := strings.TrimPrefix(strings.TrimPrefix(input, "local:"), "file:")
+	expanded := expandTilde(trimmed)
+
+	if filepath.Clean(expanded) == "." {
+		return Ref{}, &RefError{Input: input, Reason: "local sources need a path"}
+	}
+
+	abs, err := resolveLocalPath(expanded, baseDir)
+	if err != nil {
+		return Ref{}, &RefError{Input: input, Reason: err.Error()}
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return Ref{}, &RefError{Input: input, Reason: fmt.Sprintf("local path %q does not exist", abs)}
+	}
+
+	if !info.IsDir() {
+		return Ref{}, &RefError{Input: input, Reason: fmt.Sprintf("local path %q is not a directory", abs)}
+	}
+
+	return Ref{Kind: KindLocal, Raw: input, ID: filepath.Base(abs), Path: abs}, nil
+}
+
+// IsLocalURL reports whether input is one of the local-path spellings
+// ParseWithBase routes to parseLocal. It is the single answer to that
+// question: a caller that decides "this is a local source" with its own
+// prefix test and then hands the string to Parse will disagree with the
+// parser on exactly the spellings the two tables list differently, and the
+// disagreement surfaces as "local path … does not exist".
+func IsLocalURL(input string) bool {
+	return strings.HasPrefix(input, "./") ||
+		strings.HasPrefix(input, "../") ||
+		input == ".." ||
+		strings.HasPrefix(input, "local:") ||
+		strings.HasPrefix(input, "file:") ||
+		filepath.IsAbs(input)
+}
+
+// parseByScheme dispatches the schemes the grammar names explicitly. The third
+// result is false when input carries no scheme this table owns, which is the
+// caller's signal to fall through to the host/registry forms.
+//
+// It is a function rather than a second switch inside ParseWithBase because the
+// dispatch table and the validation that precedes it are different concerns:
+// one is "what does this look like", the other is "is it allowed at all".
+func parseByScheme(input, baseDir string) (Ref, bool, error) {
+	switch {
+	case strings.HasPrefix(input, "github:"):
+		ref, err := parseGitHub(input, strings.TrimPrefix(input, "github:"))
+
+		return ref, true, err
+	case strings.HasPrefix(input, "git+"):
+		ref, err := parseGitURL(input)
+
+		return ref, true, err
+	case strings.HasPrefix(input, "npm:"):
+		ref, err := parseNPM(input)
+
+		return ref, true, err
+	case strings.HasPrefix(input, "mcp:"):
+		ref, err := parseMCP(input)
+
+		return ref, true, err
+	case strings.HasPrefix(input, "http://"),
+		strings.HasPrefix(input, "https://"):
+		ref, err := parseArchiveURL(input)
+
+		return ref, true, err
+	case strings.HasPrefix(input, "file://"):
+		// A file:// URL names whatever follows it. A directory is the
+		// grammar's own local form and is far more common in a spec than an
+		// archive, so it is tried first; an archive is still reachable, it
+		// just has to fail the directory test to get there.
+		if ref, err := parseLocal(strings.TrimPrefix(input, "file://"), baseDir); err == nil {
+			ref.Raw = input
+
+			return ref, true, nil
+		}
+
+		ref, err := parseArchiveURL(input)
+
+		return ref, true, err
+	case IsLocalURL(input):
+		ref, err := parseLocal(strings.TrimPrefix(strings.TrimPrefix(input, "local:"), "file:"), baseDir)
+		if err != nil {
+			return Ref{}, true, err
+		}
+
+		ref.Raw = input
+
+		return ref, true, nil
+	}
+
+	return Ref{}, false, nil
 }
 
 // ParseAll parses refs in order and stops at the first invalid one.
@@ -317,26 +435,80 @@ func parseMCP(input string) (Ref, error) {
 	return Ref{Kind: KindMCP, Raw: input, ID: id, MCP: id}, nil
 }
 
-// parseLocal parses `./relative/path` into an absolute directory; `..` never
-// appears in a local ref.
-func parseLocal(input string) (Ref, error) {
+// parseLocal parses a local path into an absolute directory. Relative paths
+// resolve against baseDir (the verger.toml directory); `~` expands to the
+// user's home. `..` never appears in a local ref.
+func parseLocal(input, baseDir string) (Ref, error) {
 	for segment := range strings.SplitSeq(input, "/") {
 		if segment == ".." {
 			return Ref{}, &RefError{Input: input, Reason: "local refs must not contain .."}
 		}
 	}
 
-	clean := filepath.Clean(input)
+	expanded := expandTilde(input)
+	clean := filepath.Clean(expanded)
+
 	if clean == "." {
 		return Ref{}, &RefError{Input: input, Reason: "local refs need a path"}
 	}
 
-	abs, err := filepath.Abs(clean)
+	abs, err := resolveLocalPath(clean, baseDir)
 	if err != nil {
-		return Ref{}, &RefError{Input: input, Reason: "cannot resolve the local path"}
+		return Ref{}, &RefError{Input: input, Reason: err.Error()}
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return Ref{}, &RefError{Input: input, Reason: fmt.Sprintf("local path %q does not exist", abs)}
+	}
+
+	// A local ref names a directory, and Ref.Path is documented as one. A
+	// plain file here is an archive that the caller wanted fetched, not a
+	// package tree — refusing it here is also what lets `file://` fall
+	// through to the archive grammar instead of binding a file forever.
+	if !info.IsDir() {
+		return Ref{}, &RefError{Input: input, Reason: fmt.Sprintf("local path %q is not a directory", abs)}
 	}
 
 	return Ref{Kind: KindLocal, Raw: input, ID: filepath.Base(abs), Path: abs}, nil
+}
+
+// expandTilde replaces a leading ~ with the user's home directory.
+func expandTilde(path string) string {
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return path
+		}
+
+		return home
+	}
+
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return path
+		}
+
+		return filepath.Join(home, path[2:])
+	}
+
+	return path
+}
+
+// resolveLocalPath resolves a local path against baseDir. Absolute paths are
+// used as-is; relative paths resolve against baseDir (or cwd if baseDir is
+// empty).
+func resolveLocalPath(path, baseDir string) (string, error) {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path), nil
+	}
+
+	if baseDir == "" {
+		return filepath.Abs(path)
+	}
+
+	return filepath.Join(baseDir, path), nil
 }
 
 // githubURL renders the canonical clone URL of a GitHub repo.

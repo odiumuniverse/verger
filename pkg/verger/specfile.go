@@ -10,6 +10,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/fsutil"
+	"github.com/odiumuniverse/verger/pkg/receipt"
 	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/spec"
 )
@@ -103,9 +104,30 @@ func SourceName(ref source.Ref) string {
 }
 
 // AddSpecSource records one fetched ref as a spec source; an existing source
-// with the same URL is kept as-is.
+// with the same URL is kept as-is. It records the ref exactly as the caller
+// wrote it — use AddSpecSourceAt when the spec's own directory is known, so a
+// local path can be stored in a form that survives a clone.
 func AddSpecSource(doc *spec.Spec, ref source.Ref) bool {
-	raw := ref.Raw
+	return addSpecSource(doc, ref, "")
+}
+
+// AddSpecSourceAt records one fetched ref, rewriting a local path that lies
+// under specDir into a path relative to it.
+//
+// This is the difference between a vault that works on the machine that
+// created it and one that works everywhere. An absolute path is only correct
+// on the machine that wrote it: clone the repo to a laptop and the source
+// points at a directory that does not exist. source.Parse already resolves a
+// relative local ref against the spec's own directory, so storing "./x" is
+// enough — and `..` is never needed, because a path that is not under
+// specDir keeps its absolute spelling and is reported instead.
+func AddSpecSourceAt(doc *spec.Spec, ref source.Ref, specDir string) bool {
+	return addSpecSource(doc, ref, specDir)
+}
+
+// addSpecSource is the shared body; an empty specDir disables the rewrite.
+func addSpecSource(doc *spec.Spec, ref source.Ref, specDir string) bool {
+	raw, _ := portableSourceURL(ref, specDir)
 	name := SourceName(ref)
 
 	for _, src := range doc.Sources {
@@ -122,6 +144,61 @@ func AddSpecSource(doc *spec.Spec, ref source.Ref) bool {
 	doc.Sources = append(doc.Sources, spec.Source{Name: name, URL: raw})
 
 	return true
+}
+
+// NonPortableSources returns the spec's local sources that will not resolve
+// on another machine — an absolute path, or one outside the spec's own
+// directory.
+//
+// It is derived rather than stored: a flag written into the document would
+// need a schema field and a migration to mean something the paths already
+// mean on their own. `verger doctor` reports what this returns, so a vault
+// that would break on clone is visible before anyone clones it.
+func NonPortableSources(doc *spec.Spec, specDir string) []string {
+	if doc == nil || specDir == "" {
+		return nil
+	}
+
+	var out []string
+
+	for _, src := range doc.Sources {
+		if !isLocalSourceURL(src.URL) {
+			continue
+		}
+
+		// A relative source is resolved against the spec's own directory,
+		// which is exactly what source.Parse does with it. Comparing the
+		// stored spelling directly would call "./x" non-portable.
+		abs := src.URL
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(specDir, abs)
+		}
+
+		rel, err := filepath.Rel(specDir, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			out = append(out, src.URL)
+		}
+	}
+
+	return out
+}
+
+// portableSourceURL returns the URL to store for one ref and whether it will
+// still resolve on another machine.
+func portableSourceURL(ref source.Ref, specDir string) (url string, portable bool) {
+	if ref.Kind != source.KindLocal || ref.Path == "" || specDir == "" {
+		return ref.Raw, true
+	}
+
+	rel, err := filepath.Rel(specDir, ref.Path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// Outside the spec directory: a relative spelling would need "..",
+		// which a local ref is not allowed to contain, and an absolute one
+		// only works here.
+		return ref.Path, false
+	}
+
+	return "./" + filepath.ToSlash(rel), true
 }
 
 // RemoveSpecSource drops every source with the name.
@@ -142,6 +219,23 @@ func RemoveSpecSource(doc *spec.Spec, name string) int {
 	doc.Sources = kept
 
 	return removed
+}
+
+// ReceiptFilesPresent reports whether every artifact one receipt claims is
+// still on disk.
+//
+// A receipt is machine-local evidence, not a portable claim: when a vault is
+// cloned, the receipts either stay behind or arrive describing files this
+// machine never had. Neither a receipt nor a lock cell says anything about
+// what is on this disk, so both status and sync have to look.
+func ReceiptFilesPresent(record receipt.Receipt) bool {
+	for _, artifact := range record.Artifacts {
+		if _, err := os.Stat(artifact.Path); err != nil {
+			return false
+		}
+	}
+
+	return true
 }
 
 // matchesID reports whether a stored package id answers a caller query: the

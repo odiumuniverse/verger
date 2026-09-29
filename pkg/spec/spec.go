@@ -230,7 +230,18 @@ func parse(data []byte, path string) (*Spec, error) {
 // Marshal encodes the spec deterministically. Known fields are regenerated
 // from the typed spec; unknown fields are merged back at every level, so a
 // rewrite never drops them (DESIGN §3.3 round-trip raw).
+//
+// The schema guard lives here rather than only in Save, so it covers every
+// caller. That matters for Digest: a hand-built Spec with Schema 0 used to
+// marshal happily and hand back a real content hash, so a spec that could
+// never have been written by verger was still something a trust decision could
+// be taken against. Path is empty because Marshal has nowhere to name one;
+// Save checks first, so a write reports the path it refused.
 func (s *Spec) Marshal() ([]byte, error) {
+	if err := checkSchema(s.Schema, ""); err != nil {
+		return nil, err
+	}
+
 	typed, err := toml.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec: %w", err)
