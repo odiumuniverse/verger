@@ -4,6 +4,12 @@ github.com/beorn7/perks/quantile
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
+# github.com/cpuguy83/go-md2man/v2 v2.0.6
+## explicit; go 1.12
+github.com/cpuguy83/go-md2man/v2/md2man
+# github.com/fsnotify/fsnotify v1.4.9
+## explicit; go 1.13
+github.com/fsnotify/fsnotify
 # github.com/gofrs/flock v0.13.1
 ## explicit; go 1.25.0
 github.com/gofrs/flock
@@ -44,6 +50,9 @@ github.com/prometheus/common/model
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
+# github.com/russross/blackfriday/v2 v2.1.0
+## explicit
+github.com/russross/blackfriday/v2
 # github.com/smarty/assertions v1.15.0
 ## explicit; go 1.18
 github.com/smarty/assertions
@@ -58,6 +67,7 @@ github.com/smartystreets/goconvey/convey/reporting
 # github.com/spf13/cobra v1.10.2
 ## explicit; go 1.15
 github.com/spf13/cobra
+github.com/spf13/cobra/doc
 # github.com/spf13/pflag v1.0.9
 ## explicit; go 1.12
 github.com/spf13/pflag
