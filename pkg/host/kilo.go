@@ -53,7 +53,9 @@ type kilo struct {
 // NewKilo builds the Kilo adapter; the adapter is immutable after construction
 // and safe for concurrent use.
 func NewKilo(opts ...Option) Host {
-	return &kilo{base: newBase(opts)}
+	// The host's own default goes first, so a caller's WithOracleWait still
+	// overrides it rather than being overwritten by the constructor.
+	return &kilo{base: newBase(append([]Option{withKiloOracleWait()}, opts...))}
 }
 
 // ID implements Host.
@@ -177,10 +179,19 @@ type kiloOracle struct {
 	base *Base
 }
 
-// kiloOracleWait bounds the oracle call: kilo is a Node CLI that boots in
-// seconds and talks to no server here, but a bounded wait keeps a wedged
-// process from hanging the caller.
+// kiloOracleWait is this host's own default bound: kilo is a Node CLI that
+// boots in seconds and talks to no server here, so it legitimately needs more
+// than DefaultOracleWait. It is a *default*, not a private rule — it goes
+// through the same accessor every other host uses, so WithOracleWait and a
+// caller's own budget both still apply. When they did not, a test that
+// shortened the wait to keep itself quick still sat the full thirty seconds.
 const kiloOracleWait = 30 * time.Second
+
+// withKiloOracleWait declares kilo's own default. It is applied first so an
+// explicit WithOracleWait still overrides it.
+func withKiloOracleWait() Option {
+	return withDefaultOracleWait(kiloOracleWait)
+}
 
 // List implements Oracle: `kilo debug config` prints the resolved
 // configuration as one JSON document — the merged `plugin` list with its
@@ -189,15 +200,17 @@ const kiloOracleWait = 30 * time.Second
 // are reported by the host's own `kilo mcp list`, and are deliberately left
 // out so an adopt lookup can never mistake a server for a package.
 func (o *kiloOracle) List(ctx context.Context) ([]Installed, error) {
-	ctx, cancel := context.WithTimeout(ctx, kiloOracleWait)
+	spent := o.base.effectiveOracleWait()
+
+	bounded, cancel := context.WithTimeout(ctx, spent)
 	defer cancel()
 
-	out, err := o.base.run(ctx, wordKilo, []string{"debug", "config"})
+	out, err := o.base.run(bounded, wordKilo, []string{"debug", "config"})
 	if err != nil {
-		if ctx.Err() != nil {
+		if bounded.Err() != nil {
 			return nil, &OracleError{
 				Host:  string(Kilo),
-				Cause: fmt.Errorf("%s debug config did not answer within %s", wordKilo, kiloOracleWait),
+				Cause: fmt.Errorf("%s debug config did not answer within %s", wordKilo, spent.Round(time.Millisecond)),
 			}
 		}
 

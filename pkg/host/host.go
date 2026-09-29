@@ -261,16 +261,17 @@ const DefaultLockWait = 30 * time.Second
 
 // Base holds the shared adapter dependencies; adapters embed it read-only.
 type Base struct {
-	home       string
-	lockWait   time.Duration
-	oracleWait time.Duration
-	runner     hostcli.Runner
-	logger     embedlog.Logger
-	secrets    *secret.Store
-	store      *store.Store
-	trash      *store.Trash
-	ownership  PathOwner
-	resolver   *hostcli.Resolver
+	home        string
+	lockWait    time.Duration
+	oracleWait  time.Duration
+	defaultWait time.Duration
+	runner      hostcli.Runner
+	logger      embedlog.Logger
+	secrets     *secret.Store
+	store       *store.Store
+	trash       *store.Trash
+	ownership   PathOwner
+	resolver    *hostcli.Resolver
 }
 
 // Option configures a Base.
@@ -283,10 +284,21 @@ func WithLockWait(wait time.Duration) Option {
 }
 
 // WithOracleWait sets how long a service-backed oracle call waits before it
-// reports the note; the zero value keeps DefaultOracleWait. A test injects a
-// short wait instead of sitting through the real bound.
+// reports the note. It overrides whatever default the adapter carries, so the
+// seam behaves the same on every host: a test injects a short wait instead of
+// sitting through the real bound, and a caller with a budget of its own can
+// impose one.
 func WithOracleWait(wait time.Duration) Option {
 	return func(b *Base) { b.oracleWait = wait }
+}
+
+// withDefaultOracleWait is the adapter-level half of the same seam: a host
+// that genuinely needs longer than DefaultOracleWait declares that as its own
+// default, and WithOracleWait still wins over it. Without this the two
+// defaults have to be kept out of the shared accessor, and a host that took
+// the other path silently stops honouring the option.
+func withDefaultOracleWait(wait time.Duration) Option {
+	return func(b *Base) { b.defaultWait = wait }
 }
 
 // WithHome sets the fallback user home used for config paths.
@@ -347,10 +359,13 @@ func newBase(opts []Option) *Base {
 	return b
 }
 
-// effectiveOracleWait is the oracle wait of this adapter.
 func (b *Base) effectiveOracleWait() time.Duration {
 	if b.oracleWait > 0 {
 		return b.oracleWait
+	}
+
+	if b.defaultWait > 0 {
+		return b.defaultWait
 	}
 
 	return DefaultOracleWait

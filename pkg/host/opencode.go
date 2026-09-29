@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/odiumuniverse/verger/pkg/hostcli"
 	"github.com/odiumuniverse/verger/pkg/hostpath"
@@ -569,23 +570,63 @@ type openCodeOracle struct {
 func (o *openCodeOracle) List(ctx context.Context) ([]Installed, error) {
 	wait := o.base.effectiveOracleWait()
 
-	ctx, cancel := context.WithTimeout(ctx, wait)
+	// The caller's own deadline can be the shorter one — doctor gives every
+	// host a shared budget — so what this call may wait is the smaller of the
+	// two, and that is the number the note has to name. It is read before
+	// the call, because afterwards the deadline has passed and the
+	// remaining budget is zero whatever was really spent.
+	spent := wait
+	if deadline, ok := ctx.Deadline(); ok {
+		if left := time.Until(deadline); left > 0 && left < spent {
+			spent = left
+		}
+	}
+
+	bounded, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 
-	out, err := o.base.run(ctx, wordOpenCode, []string{wordPlugin, wordList})
+	out, err := o.base.run(bounded, wordOpenCode, []string{wordPlugin, wordList})
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, &OracleError{
-				Host: string(OpenCode),
-				Cause: fmt.Errorf("%s did not answer within %s: its background service is not reachable (start it with `opencode service start`; a port taken by another OpenCode instance makes the CLI retry forever)",
-					strings.Join([]string{wordOpenCode, wordPlugin, wordList}, " "), wait),
-			}
+		if bounded.Err() != nil {
+			return nil, o.serviceError(ctx, spent)
 		}
 
 		return nil, err
 	}
 
 	return parseOpenCodePlugins(string(out)), nil
+}
+
+// serviceLivenessWait bounds the liveness question. The verb does not touch
+// the background service, so it either answers at once or the binary itself is
+// wedged; there is nothing to wait for.
+const serviceLivenessWait = 2 * time.Second
+
+// serviceError says which of the two failures it is. A binary that answers
+// while the listing does not means nothing is listening — a fact with a
+// command attached — and calling that a timeout sends the reader off to wait
+// longer for a service that was never running.
+func (o *openCodeOracle) serviceError(ctx context.Context, spent time.Duration) error {
+	// The liveness question is asked on a context of its own. The one that
+	// arrived here has just spent its whole budget on the listing, so a
+	// child of it is born expired and every probe would "fail" — which is
+	// how a healthy binary gets reported as wedged.
+	live, cancel := context.WithTimeout(context.WithoutCancel(ctx), serviceLivenessWait)
+	defer cancel()
+
+	if _, err := o.base.run(live, wordOpenCode, []string{"--version"}); err != nil {
+		return &OracleError{
+			Host: string(OpenCode),
+			Cause: fmt.Errorf("%s did not answer within %s and the binary does not answer either, so the background service behind these verbs is wedged rather than down: start it with `opencode service start`",
+				strings.Join([]string{wordOpenCode, wordPlugin, wordList}, " "), spent.Round(time.Millisecond)),
+		}
+	}
+
+	return &OracleError{
+		Host: string(OpenCode),
+		Cause: fmt.Errorf("the %s service is not listening: %s did not answer within %s (start it with `opencode service start`; a port taken by another OpenCode instance makes the CLI retry forever)",
+			wordOpenCode, strings.Join([]string{wordOpenCode, wordPlugin, wordList}, " "), spent.Round(time.Millisecond)),
+	}
 }
 
 // Validate implements Oracle: opencode 2.0.18 validates a package only inside

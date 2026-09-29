@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/receipt"
 	"github.com/odiumuniverse/verger/pkg/secret"
 	"github.com/odiumuniverse/verger/pkg/verger"
@@ -104,6 +107,7 @@ func (a *app) runDoctor(ctx context.Context) error {
 	}
 
 	checks := a.collectChecks(ctx, client, paths)
+	hostChecks := hostFindings(checks)
 
 	// Apply the safe fixes, if any were asked for (W7-UX-SPEC §3.3).
 	var applied []string
@@ -118,8 +122,11 @@ func (a *app) runDoctor(ctx context.Context) error {
 			return err
 		}
 
-		// Re-collect, so the output describes the machine as it is now.
-		checks = a.collectChecks(ctx, client, paths)
+		// Re-collect, so the output describes the machine as it is now. The
+		// host findings are carried over: nothing just repaired can change
+		// whether a host answers, and asking again would double the slowest
+		// part of the run for no new fact.
+		checks = a.collectChecksExceptHosts(ctx, client, paths, hostChecks)
 	}
 
 	if a.jsonOut {
@@ -165,6 +172,17 @@ func (a *app) runDoctor(ctx context.Context) error {
 // after the repairs — so the machine is described as it is now, not as it was
 // when the run started.
 func (a *app) collectChecks(ctx context.Context, client *verger.Client, paths verger.Paths) []doctorCheck {
+	return a.collectChecksExceptHosts(ctx, client, paths, nil)
+}
+
+// collectChecksExceptHosts runs every probe except the host sweep, and runs
+// the host sweep only when reuse is nil. `--fix` re-reads the machine to
+// describe it as it is now, and hands back the sweep it already took: the
+// repairs create a home and a store, and neither says anything about whether
+// a host's oracle answers.
+func (a *app) collectChecksExceptHosts(
+	ctx context.Context, client *verger.Client, paths verger.Paths, reuse []doctorCheck,
+) []doctorCheck {
 	checks := []doctorCheck{
 		a.checkDir(client.Home().Root(), "home"),
 		a.checkDir(client.Store().Root(), "store"),
@@ -172,9 +190,12 @@ func (a *app) collectChecks(ctx context.Context, client *verger.Client, paths ve
 		a.checkReceipts(paths),
 	}
 	checks = append(checks, a.checkSpecs(client, paths)...)
-	checks = append(checks, a.checkHosts(ctx, client)...)
 
-	return checks
+	if reuse != nil {
+		return append(checks, reuse...)
+	}
+
+	return append(checks, a.checkHosts(ctx, client)...)
 }
 
 // applyFix applies a safe fix for one finding.
@@ -486,31 +507,84 @@ func fileExistsIn(path string) bool {
 }
 
 // checkHosts probes every registered host adapter and its oracle.
+//
+// The sweep is parallel and shares one deadline. Sequentially the cost is the
+// sum of the hosts' times, so the one host that is slow — a service-backed
+// one whose background process is not running — sets the wall clock for the
+// whole diagnostic. Overlapped it is the slowest single host, and the budget
+// below caps even that.
 func (a *app) checkHosts(ctx context.Context, client *verger.Client) []doctorCheck {
+	adapters := a.hosts(client)
+
 	userHome, err := os.UserHomeDir()
 	if err != nil {
 		return []doctorCheck{{Severity: severityError, Subject: "hosts", Message: err.Error()}}
 	}
 
-	var checks []doctorCheck
+	ctx, cancel := context.WithTimeout(ctx, doctorOracleWait)
+	defer cancel()
 
-	for _, adapter := range a.hosts(client) {
-		name := string(adapter.ID())
+	found := make([]doctorCheck, len(adapters))
 
-		if !adapter.Detect(userHome) {
-			checks = append(checks, doctorCheck{Severity: severityInfo, Subject: "host:" + name, Message: "not detected"})
+	var wg sync.WaitGroup
 
-			continue
+	for i, adapter := range adapters {
+		wg.Go(func() {
+			// Each probe writes its own slot and reads none, so the sweep
+			// needs no lock and the output keeps the adapter order whatever
+			// order the answers arrive in.
+			found[i] = probeHost(ctx, adapter, userHome)
+		})
+	}
+
+	wg.Wait()
+
+	checks := make([]doctorCheck, 0, len(found))
+
+	for _, check := range found {
+		if check.Subject != "" {
+			checks = append(checks, check)
 		}
-
-		if _, err := adapter.Oracle().List(ctx); err != nil {
-			checks = append(checks, doctorCheck{Severity: severityError, Subject: "host:" + name, Message: err.Error()})
-
-			continue
-		}
-
-		checks = append(checks, doctorCheck{Severity: severityInfo, Subject: "host:" + name, Message: "detected; oracle responds"})
 	}
 
 	return checks
+}
+
+// doctorOracleWait bounds one host probe inside doctor. It is well under
+// host.DefaultOracleWait on purpose: that bound exists so a write that needs
+// the answer fails loudly instead of hanging, while a diagnostic already has
+// a budget of its own and is the command people reach for when something is
+// wrong and they are waiting to find out what.
+const doctorOracleWait = 3 * time.Second
+
+// probeHost answers one question about one host: is it there, and does it
+// answer.
+func probeHost(ctx context.Context, adapter host.Host, userHome string) doctorCheck {
+	name := string(adapter.ID())
+
+	if !adapter.Detect(userHome) {
+		return doctorCheck{Severity: severityInfo, Subject: "host:" + name, Message: "not detected"}
+	}
+
+	if _, err := adapter.Oracle().List(ctx); err != nil {
+		return doctorCheck{Severity: severityError, Subject: "host:" + name, Message: err.Error()}
+	}
+
+	return doctorCheck{
+		Severity: severityInfo, Subject: "host:" + name, Message: "detected; oracle responds",
+	}
+}
+
+// hostFindings picks the host section back out of a full check list, so a
+// `--fix` re-read can reuse it rather than probing every host a second time.
+func hostFindings(checks []doctorCheck) []doctorCheck {
+	var hosts []doctorCheck
+
+	for _, check := range checks {
+		if strings.HasPrefix(check.Subject, "host:") {
+			hosts = append(hosts, check)
+		}
+	}
+
+	return hosts
 }
