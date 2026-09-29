@@ -41,13 +41,43 @@ type WatchEvent struct {
 	At    time.Time
 }
 
-// WatchOption is an engine option. It stays opaque to the facade: the facade
-// passes the options it was given straight through and never inspects one.
+// WatchOption is an engine option. It stays opaque to ordinary callers: the
+// facade passes the options it was given straight through and never inspects
+// one itself. A binder that translates them to a real engine applies them to
+// a *WatchConfig, which is the one thing they are defined to understand.
 type WatchOption func(any)
+
+// WatchConfig is the readable form of a set of WatchOptions. A binder builds
+// one, applies every option to it, and reads the result — that is how the
+// facade's own WithDebounce reaches an engine that has its own option type,
+// without either package importing the other.
+type WatchConfig struct {
+	// Debounce is the per-host window; zero means the engine's default.
+	Debounce time.Duration
+}
+
+// NewWatchConfig returns a config with no options applied.
+func NewWatchConfig() *WatchConfig { return &WatchConfig{} }
+
+// FoldWatchOptions folds opts into cfg and returns it, so a binder writes
+// `cfg := verger.FoldWatchOptions(verger.NewWatchConfig(), opts...)` once.
+func FoldWatchOptions(cfg *WatchConfig, opts ...WatchOption) *WatchConfig {
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cfg)
+		}
+	}
+
+	return cfg
+}
 
 // WithDebounce sets the engine's per-host debounce window.
 func WithDebounce(d time.Duration) WatchOption {
-	return func(any) {}
+	return func(v any) {
+		if cfg, ok := v.(*WatchConfig); ok {
+			cfg.Debounce = d
+		}
+	}
 }
 
 // WatchEngine is the W5 contract the facade binds to.
@@ -116,6 +146,14 @@ type Lease struct {
 	Acquired time.Time `json:"acquired,omitzero"`
 }
 
+// Lease owners. The lease is taken by exactly two front ends, and a lease
+// naming anything else is a file a person cannot reason about when they read
+// "held by …".
+const (
+	LeaseOwnerVerger = "verger"
+	LeaseOwnerBeadle = "beadle"
+)
+
 // String renders one lease for a log line.
 func (l Lease) String() string {
 	return fmt.Sprintf("%s (pid %d, since %s)", l.Owner, l.PID, l.Acquired.Format(time.RFC3339))
@@ -171,6 +209,16 @@ func (c *Client) Watch(ctx context.Context, opts WatchOptions) error {
 		return &UsageError{Cause: errors.New("watch needs an owner name for the lease")}
 	}
 
+	// The lease names who holds the watcher, and the only two front ends that
+	// hold one are these. A free-form owner is how a lease file ends up
+	// naming something nobody recognises, and the next person to read
+	// "held by …" cannot tell a second verger from a crashed beadle.
+	if opts.Owner != LeaseOwnerVerger && opts.Owner != LeaseOwnerBeadle {
+		return &UsageError{Cause: fmt.Errorf(
+			"watch owner %q is not a known front end: use %q or %q",
+			opts.Owner, LeaseOwnerVerger, LeaseOwnerBeadle)}
+	}
+
 	handle, err := c.AcquireLease(opts.Owner)
 	if err != nil {
 		return err
@@ -200,6 +248,16 @@ func (c *Client) Watch(ctx context.Context, opts WatchOptions) error {
 		runErr <- engine(ctx, targets, events, engineOpts...)
 	}()
 
+	return c.pumpWatchEvents(ctx, events, runErr, opts)
+}
+
+// pumpWatchEvents is the watch loop: it reconciles every event the engine
+// reports until the engine ends, the context is cancelled, or a reconcile
+// fails. It is separate from Watch because a loop with three ways out reads
+// as the thing it is, not as part of setting the watcher up.
+func (c *Client) pumpWatchEvents(
+	ctx context.Context, events <-chan WatchEvent, runErr <-chan error, opts WatchOptions,
+) error {
 	for {
 		select {
 		case <-ctx.Done():
