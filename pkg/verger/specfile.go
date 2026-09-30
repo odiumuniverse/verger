@@ -128,6 +128,17 @@ func AddSpecSourceAt(doc *spec.Spec, ref source.Ref, specDir string) bool {
 // addSpecSource is the shared body; an empty specDir disables the rewrite.
 func addSpecSource(doc *spec.Spec, ref source.Ref, specDir string) bool {
 	raw, _ := portableSourceURL(ref, specDir)
+
+	// A ref that names no place of its own — a bare `owner/name`, which the
+	// grammar reads as GitHub and which the spec's own sources may well have
+	// answered instead — has no address to write down. Recording its id as a
+	// url produced a source pointing at itself (`url = 'acme/caveman'`): a
+	// second false address for a package that already had a real one, and one
+	// more on every install.
+	if !refNamesAPlace(ref) {
+		return false
+	}
+
 	name := SourceName(ref)
 
 	for _, src := range doc.Sources {
@@ -144,6 +155,13 @@ func addSpecSource(doc *spec.Spec, ref source.Ref, specDir string) bool {
 	doc.Sources = append(doc.Sources, spec.Source{Name: name, URL: raw})
 
 	return true
+}
+
+// refNamesAPlace reports whether a ref carries a location that can be written
+// into a spec. A local path, a git or url specifier and an npm name all do; a
+// bare `owner/name` does not — it is an id, and an id is not an address.
+func refNamesAPlace(ref source.Ref) bool {
+	return ref.Kind != source.KindGitHub || ref.Raw != ref.ID
 }
 
 // NonPortableSources returns the spec's local sources that will not resolve
