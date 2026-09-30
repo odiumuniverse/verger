@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
@@ -250,57 +251,120 @@ func (c *Client) ApproveHooks(pkg host.Package) error {
 // overrides the spec default; an approved content hash skips the question; a
 // dry run previews the default answer without writing; anything else asks
 // through the Confirmer.
-func (c *Client) HooksDecision(pkg host.Package, mode HooksMode, confirm Confirmer, dryRun bool) (bool, error) {
+//
+// It returns pending as the package id when the question was never put to anyone,
+// and "" when it was answered (or never asked). pending is a value the caller
+// records on the run it is building, not state written here: one client serves
+// many runs — beadle's watch holds one and reconciles with it repeatedly — and a
+// record that outlived its run made every later run report a consent failure for
+// a package it had never even looked at.
+func (c *Client) HooksDecision(pkg host.Package, mode HooksMode, confirm Confirmer, dryRun bool) (allow bool, pending string, err error) {
 	// A payload can carry hooks without a declarative hook: a host module in
 	// runtime/<host>/hooks/{pre,post}/ is code the host runs on every session,
 	// so it asks the same question (pkg/host.HasHookModules).
 	if len(pkg.Hooks) == 0 && !host.HasHookModules(pkg.Root) {
-		return false, nil
+		return false, "", nil
 	}
 
 	switch mode {
 	case HooksSkip:
-		return false, nil
+		return false, "", nil
 	case HooksYes:
 		if dryRun {
-			return true, nil
+			return true, "", nil
 		}
 
-		return true, c.ApproveHooks(pkg)
+		return true, "", c.ApproveHooks(pkg)
 	default:
-		store, err := c.ConsentStore()
-		if err != nil {
-			return false, err
+		store, storeErr := c.ConsentStore()
+		if storeErr != nil {
+			return false, "", storeErr
 		}
 
 		hash := consent.HookHash(pkg.ID, pkg.Version, pkg.Hooks)
 		if store.HooksApproved(pkg.ID, pkg.Version, hash) {
-			return true, nil
+			return true, "", nil
 		}
 
 		if dryRun {
-			return true, nil // a preview: the default answer, nothing is written
+			// A preview: the default answer, nothing is written, and nothing is
+			// pending because nobody was asked to settle it.
+			return true, "", nil
 		}
 
-		if confirm == nil {
-			return true, c.ApproveHooks(pkg)
+		// A confirmer that resolves with the default did not answer: nobody was
+		// asked, so it is not consent. The default answer to "install these
+		// hooks?" is not yes, and approving here is how `-y` came to install
+		// hooks no human had agreed to.
+		if unanswered(confirm) {
+			return false, pkg.ID, nil
 		}
 
-		allow, err := confirm.Confirm(context.Background(), apply.Question{
+		allow, err = confirm.Confirm(context.Background(), apply.Question{
 			Kind:    "hooks",
 			Package: pkg.ID,
 			Message: fmt.Sprintf("Install hooks of %s %s on all agents?", pkg.ID, pkg.Version),
 		})
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 
 		if allow {
-			return true, c.ApproveHooks(pkg)
+			return true, "", c.ApproveHooks(pkg)
 		}
 
-		return false, nil
+		return false, "", nil
 	}
+}
+
+// isAutoConfirmer reports whether a confirmer resolves questions with the default
+// rather than putting them to a human. `-y` builds one; an interactive prompt does
+// not. A question an auto confirmer "answered" was never asked, so it is
+// unanswered.
+func isAutoConfirmer(confirm Confirmer) bool {
+	auto, ok := confirm.(interface{ AutoAnswers() bool })
+
+	return ok && auto.AutoAnswers()
+}
+
+// unanswered reports whether a question put to this confirmer was really put to
+// anyone. `-y` builds a confirmer that resolves with the default, and the default
+// answer to "install these hooks?" is not consent, so a question it "answered" is
+// one nobody saw. A nil confirmer is the same: there was nobody to ask.
+func unanswered(confirm Confirmer) bool {
+	return confirm == nil || isAutoConfirmer(confirm)
+}
+
+// PendingConsentError reports that a run shipped a package's files but withheld
+// its hooks, because nobody answered the consent question. The package is
+// installed and working; the hooks are not, and the only thing that changes that
+// is a human saying so.
+type PendingConsentError struct {
+	Packages []string
+}
+
+// Error implements error. It names the command that would settle each package,
+// because a message that reports a problem without naming the fix makes the
+// reader go looking for one.
+func (e *PendingConsentError) Error() string {
+	if len(e.Packages) == 0 {
+		return "hooks were not installed: nobody answered the consent question"
+	}
+
+	return fmt.Sprintf(
+		"hooks skipped for %s: no consent was given, so the files are installed and the "+
+			"hooks are not. Answer with `verger install <id> --hooks yes`, or approve each "+
+			"with `verger approve <id>`",
+		strings.Join(e.Packages, ", "),
+	)
+}
+
+// Is reports this error as the unanswered question it is. The classifier reads
+// apply.ErrConfirmationRequired for every question the tool could not put to
+// anyone, and a question nobody answered belongs to the same class as one that
+// could not be asked.
+func (e *PendingConsentError) Is(target error) bool {
+	return target == apply.ErrConfirmationRequired
 }
 
 // RequireTrust refuses a project-scoped write when the project spec is absent
@@ -357,6 +421,10 @@ type yesConfirmer struct{}
 func (yesConfirmer) Confirm(context.Context, apply.Question) (bool, error) {
 	return false, nil
 }
+
+// AutoAnswers reports that this confirmer resolves with the default rather than
+// asking a human. See unanswered: a question it "answered" was never asked.
+func (yesConfirmer) AutoAnswers() bool { return true }
 
 // YesConfirmer returns the confirmer `-y` uses: it accepts defaults and never
 // resolves a destructive conflict (rule 14). A second front end that wants the

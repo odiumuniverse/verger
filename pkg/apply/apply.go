@@ -126,6 +126,12 @@ type Report struct {
 	Cells    []CellResult
 	Notes    []string
 	Breakers []CircuitState
+	// PendingConsent names the packages whose hooks this run delivered nothing
+	// for, because nobody answered. It is part of the result rather than state on
+	// whoever ran it: a client outlives a run, and a record that outlived its run
+	// made every later run report a consent failure for a package it had never
+	// looked at.
+	PendingConsent []string
 }
 
 // Confirmer asks the user one question and reports the answer.

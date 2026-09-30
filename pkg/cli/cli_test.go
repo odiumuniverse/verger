@@ -293,8 +293,15 @@ func (w *world) warmHome(t *testing.T) {
 	}
 }
 
-// fixture writes a Claude-format package with one skill and one hook under the
-// world root and returns the local ref.
+// fixture writes a Claude-format package with one skill under the world root and
+// returns the local ref.
+//
+// It carries no hooks on purpose. A hook makes the package ask a consent
+// question, and `-y` does not answer that question — the default answer to
+// "install these hooks?" is not consent — so a hooked fixture turns every
+// ordinary "install works" test into a pending-consent test. That is how 40-odd
+// tests here came to fail with exit 5 when the rule landed. A test that is about
+// hooks asks for w.hookedFixture instead.
 func (w *world) fixture(t *testing.T) string {
 	t.Helper()
 
@@ -305,6 +312,29 @@ func (w *world) fixture(t *testing.T) string {
 
 // fixtureIn writes the fixture package inside dir.
 func (w *world) fixtureIn(t *testing.T, dir string) {
+	t.Helper()
+
+	pkgDir := filepath.Join(dir, "fixture")
+	writeWorldFile(t, filepath.Join(pkgDir, ".claude-plugin", "plugin.json"), `{
+  "name": "caveman",
+  "version": "1.2.3",
+  "description": "Caveman toolkit."
+}`)
+	writeWorldFile(t, filepath.Join(pkgDir, "skills", "one", "SKILL.md"), "# one\n")
+}
+
+// hookedFixture writes the same package with a SessionStart hook, so it asks the
+// consent question. Only a test that is about consent or hooks should use it.
+func (w *world) hookedFixture(t *testing.T) string {
+	t.Helper()
+
+	w.hookedFixtureIn(t, w.root)
+
+	return "./fixture"
+}
+
+// hookedFixtureIn writes the hooked package inside dir.
+func (w *world) hookedFixtureIn(t *testing.T, dir string) {
 	t.Helper()
 
 	manifestDoc := `{

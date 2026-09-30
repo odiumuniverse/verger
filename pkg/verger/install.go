@@ -74,6 +74,18 @@ type PlanOptions struct {
 // targets, the cells a caller renders before anything is written, and the
 // actions the executor will run (DESIGN §9.1). A caller renders Plan.Cells,
 // asks its own Confirmer, and hands the plan back to Apply.
+//
+// A Plan's values come from Client.Plan and the planning that follows it. A Plan
+// built by hand carries no pending consent, and Apply delivers that plan's hooks
+// exactly as its AllowHooks says — the caller has decided, and Apply does not
+// ask again or second-guess it. Hand-building a plan is the library caller's
+// equivalent of passing `--hooks yes`: an explicit choice, owned by whoever made
+// it.
+//
+// The one thing a hand-built plan cannot carry is the answer to a question nobody
+// was asked. That answer is produced where the question is actually put — inside
+// the planning that Install and Sync run — and it is readable afterwards through
+// PendingConsent.
 type Plan struct {
 	Paths    Paths            `json:"-"`
 	Cells    []Cell           `json:"cells"`
@@ -90,6 +102,23 @@ type Plan struct {
 	// Actions are the executor's operations. The operation that owns the plan
 	// (install, remove, sync) builds them; only Apply runs them.
 	Actions []apply.Action `json:"-"`
+	// pendingConsent names the packages this plan withholds hooks for because
+	// nobody answered. It is per-plan because it is a fact about this run, and it
+	// travels onto the Report so a caller reads it off the result it was handed
+	// rather than off the client that produced it.
+	pendingConsent []string
+}
+
+// PendingConsent names the packages this plan withholds hooks for because nobody
+// answered. It is part of the plan's own value, and readable, so that a caller
+// holding a plan can see what the plan decided without running it and without
+// asking the client that built it.
+//
+// Every public route to a result goes through Apply, and Apply copies this onto
+// the report, so the report is a function of the plan: there is no way to run a
+// plan whose pending consent exists and then read a result that has forgotten it.
+func (p *Plan) PendingConsent() []string {
+	return slices.Clone(p.pendingConsent)
 }
 
 // AdoptPlan is one agent-installed package adopted into the spec and delivered
@@ -513,6 +542,13 @@ func bareID(ref source.Ref) bool {
 // front end codes against: the trust gate, the executor and the progress events
 // all live here, so `Install`, `Remove` and `Adopt` differ only in what they put
 // in the plan and what they record around it.
+//
+// The result repeats whatever the plan decided: Apply copies the plan's pending
+// consent onto the report unconditionally, so a caller reading the report is
+// reading the plan's own answer and not a fresh judgement. A plan built by hand
+// carries none, and that is the caller's choice — Apply delivers such a plan's
+// hooks exactly as its AllowHooks says, because the caller has already decided
+// and is not being asked again.
 func (c *Client) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*apply.Report, error) {
 	if err := c.RequireTrust(plan.Paths); err != nil {
 		return nil, err
@@ -554,6 +590,11 @@ func (c *Client) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*app
 	}
 
 	report.Notes = append(report.Notes, plan.Notes...)
+	// The run's answer to the hooks question travels with the run's result, so a
+	// caller holding this Report can tell what this delivery left out without
+	// asking the client that produced it — and without being told about a run it
+	// did not ask for.
+	report.PendingConsent = append(report.PendingConsent, plan.pendingConsent...)
 
 	return &report, nil
 }
@@ -653,16 +694,42 @@ func (c *Client) Install(ctx context.Context, plan *Plan, opts ApplyOptions) (*a
 		}
 	}
 
-	// A cell the executor refused is not a quiet success. This is the same
-	// verdict Sync returns, for the same reason: the run printed "nothing
-	// was written" and a caller that reads only the exit code would call
-	// that a completed install. The report comes back alongside the error,
-	// because the error names the situation and the report names the cell.
-	if refused := refusedCells(report); len(refused) > 0 {
-		return report, &HandsOffError{Cells: refused}
+	// Every path that delivers packages ends here, so the verdict lives in one
+	// place: an error Install raises for a reason Sync also has to raise is a
+	// reason Sync silently does not raise. See Client.deliveryVerdict.
+	if err := c.deliveryVerdict(report); err != nil {
+		return report, err
 	}
 
 	return report, nil
+}
+
+// deliveryVerdict is the error a finished delivery owes its caller, or nil.
+//
+// Two situations are not a quiet success:
+//
+//   - a cell the executor refused, because the run printed "nothing was written"
+//     and a caller that reads only the exit code would call that a completed
+//     install;
+//   - a package whose hooks nobody consented to, because its files are on disk
+//     and working while its hooks are not, which is exactly the gap a caller
+//     reading only the exit code would miss.
+//
+// The report comes back alongside the error in both cases, because the error
+// names the situation and the report names the cells.
+func (c *Client) deliveryVerdict(report *apply.Report) error {
+	// Read off the report, not off the client: "did anyone answer?" has one
+	// answer per run, and a client that remembered the last run's answer would
+	// answer it wrongly for every run after it.
+	if pending := report.PendingConsent; len(pending) > 0 {
+		return &PendingConsentError{Packages: pending}
+	}
+
+	if refused := refusedCells(report); len(refused) > 0 {
+		return &HandsOffError{Cells: refused}
+	}
+
+	return nil
 }
 
 // installAdopted records the adopted spec and then delivers the plan the adopt
@@ -728,9 +795,16 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 	for i := range plan.Packages {
 		item := &plan.Packages[i]
 
-		allow, err := c.HooksDecision(item.Package, opts.Hooks, opts.Confirm, opts.DryRun)
+		allow, pending, err := c.HooksDecision(item.Package, opts.Hooks, opts.Confirm, opts.DryRun)
 		if err != nil {
 			return err
+		}
+
+		// Recorded on the plan, which is this run's own scratch: a client that
+		// remembered it would fail every later run on the same client, including
+		// runs that asked nothing.
+		if pending != "" && !slices.Contains(plan.pendingConsent, pending) {
+			plan.pendingConsent = append(plan.pendingConsent, pending)
 		}
 
 		item.allow = allow

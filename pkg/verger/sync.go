@@ -180,12 +180,13 @@ func (c *Client) Sync(ctx context.Context, opts SyncOptions) (*SyncPlan, *apply.
 		return plan, nil, err
 	}
 
-	// A cell the executor refused is not a quiet success. Returning the
-	// report and no error is what made `verger sync` answer "done" over a
-	// file it had just declined to overwrite, which is the one answer a
-	// script must never be able to read.
-	if refused := refusedCells(report); len(refused) > 0 {
-		return plan, report, &HandsOffError{Cells: refused}
+	// The same verdict Install returns, for the same reasons: a cell the executor
+	// refused is not a quiet success, and neither is a package whose hooks nobody
+	// consented to. Sync delivers packages without going through Install, so
+	// asking here is not duplication — it is the only way these two paths can be
+	// held to one answer.
+	if err := c.deliveryVerdict(report); err != nil {
+		return plan, report, err
 	}
 
 	return plan, report, nil

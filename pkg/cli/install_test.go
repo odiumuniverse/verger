@@ -158,7 +158,7 @@ func TestInstallHooksModesAndDryRun(t *testing.T) {
 		w.target(t, "SKILL.md", "# installed\n")
 
 		Convey("When --hooks no is used", func() {
-			_, err := w.run("install", w.fixture(t), "-y", "--hooks", "no")
+			_, err := w.run("install", w.hookedFixture(t), "-y", "--hooks", "no")
 
 			Convey("Then hooks are not delivered", func() {
 				So(err, ShouldBeNil)
@@ -167,7 +167,7 @@ func TestInstallHooksModesAndDryRun(t *testing.T) {
 		})
 
 		Convey("When --hooks yes is used", func() {
-			_, err := w.run("install", w.fixture(t), "-y", "--hooks", "yes")
+			_, err := w.run("install", w.hookedFixture(t), "-y", "--hooks", "yes")
 
 			Convey("Then hooks are delivered", func() {
 				So(err, ShouldBeNil)
@@ -640,7 +640,7 @@ func TestApproveAndRevokeHooks(t *testing.T) {
 		w.chdir(t, w.root)
 		w.target(t, "SKILL.md", "# installed\n")
 
-		ref := w.fixture(t)
+		ref := w.hookedFixture(t)
 
 		stdout, approveErr := w.run("approve", "local:caveman", ref)
 
@@ -678,7 +678,7 @@ func TestApproveRevokeDryRunWritesNothing(t *testing.T) {
 		w.chdir(t, w.root)
 		w.target(t, "SKILL.md", "# installed\n")
 
-		ref := w.fixture(t)
+		ref := w.hookedFixture(t)
 
 		before := snapshot(t, w.root)
 
