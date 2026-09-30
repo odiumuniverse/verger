@@ -122,6 +122,25 @@ func (a *app) runRestore(ctx context.Context, id string) error {
 		return err
 	}
 
+	// A terminal gets a question, not a silent write. `requireConfirmation`
+	// above only stops a *detached* stdin, so on a terminal it returned nil
+	// and nothing else here asked: `verger restore` put deleted files back
+	// while the user was still reading. The default is no — a restore is the
+	// write a user most wants to interrupt, and -y stays the way to say yes
+	// without a prompt.
+	if a.interactive() {
+		ok, askErr := a.ask("Restore "+id+" from the trash?", false)
+		if askErr != nil {
+			return askErr
+		}
+
+		if !ok {
+			_, err := fmt.Fprintf(a.out, "%s: nothing was written\n", id)
+
+			return err
+		}
+	}
+
 	result, err := client.Restore(ctx, id, verger.RemoveOptions{Paths: paths, DryRun: a.dryRun})
 	if err != nil {
 		return err
