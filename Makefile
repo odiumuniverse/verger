@@ -47,9 +47,22 @@ test-short:
 runtime:
 	cd runtime && npm ci --no-audit --no-fund && npm run build
 
-## the runtime bundle's own tests: they run the built artifact under node
+## the runtime bundle's own tests: they run the built artifact under node.
+##
+## The count is asserted, because `node --test` EXITS 0 when it is handed a path
+## that matches nothing. That is how this suite ran for a whole batch without
+## running at all, and a green gate hid it: CI reported 17 passing tests that
+## did not exist. A test command that reports zero tests is a failure here, not
+## a pass.
 test-runtime:
-	cd runtime && npm ci --no-audit --no-fund && npm test
+	cd runtime && npm ci --no-audit --no-fund && npm test --silent 2>&1 | tee /tmp/verger-runtime-test.log
+	@n=`sed -n 's/^# tests \([0-9][0-9]*\).*/\1/p;s/^. tests \([0-9][0-9]*\).*/\1/p' /tmp/verger-runtime-test.log | tail -1`; \
+	if [ -z "$$n" ] || [ "$$n" -lt 1 ] 2>/dev/null; then \
+	  echo "runtime tests reported $$n tests; a zero is a failure, not a pass" >&2; \
+	  rm -f /tmp/verger-runtime-test.log; exit 1; \
+	fi; \
+	echo "runtime bundle tests: $$n ran"; \
+	rm -f /tmp/verger-runtime-test.log
 
 fmt:
 	golangci-lint fmt ./cmd/... ./pkg/...
