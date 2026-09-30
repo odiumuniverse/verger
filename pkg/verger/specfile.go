@@ -44,16 +44,18 @@ func SaveSpec(path string, doc *spec.Spec) error {
 	return doc.Save(path)
 }
 
-// AddSpecPackage inserts a package entry when absent and reports whether the
-// spec changed.
-func AddSpecPackage(doc *spec.Spec, id, version string) bool {
-	for _, pkg := range doc.Packages {
-		if pkg.ID == id {
+// AddSpecPackage records one package entry when the spec does not carry its id
+// yet, and reports whether the spec changed. Every path that writes an entry —
+// install, adopt, import — goes through it, so they all leave the same file the
+// same way.
+func AddSpecPackage(doc *spec.Spec, pkg spec.Package) bool {
+	for _, existing := range doc.Packages {
+		if existing.ID == pkg.ID {
 			return false
 		}
 	}
 
-	doc.Packages = append(doc.Packages, spec.Package{ID: id, Version: version})
+	doc.Packages = append(doc.Packages, pkg)
 
 	return true
 }

@@ -203,6 +203,8 @@ func cloneSpec(spec *Spec) *Spec {
 		Sources:   cloneSources(spec.Sources),
 		Packages:  clonePackages(spec.Packages),
 		raw:       maps.Clone(spec.raw),
+		src:       slices.Clone(spec.src),
+		bom:       spec.bom,
 	}
 }
 

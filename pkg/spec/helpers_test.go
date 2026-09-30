@@ -83,3 +83,13 @@ func asList(t *testing.T, value any) []any {
 
 	return list
 }
+
+// withoutSource drops the document a spec was parsed from. Two specs read from
+// two documents are the same model, and where they were read from is not part
+// of the model.
+func withoutSource(spec *Spec) *Spec {
+	cloned := *spec
+	cloned.src, cloned.bom = nil, false
+
+	return &cloned
+}

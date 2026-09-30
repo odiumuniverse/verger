@@ -326,10 +326,7 @@ func TestTrashPutFailureRollsBack(t *testing.T) {
 			// cross-device fallback moved to fsutil when MoveTree learned to
 			// take a file source, and it is tested there
 			// (TestMoveTreeFileSourceCrossDevice).
-			restore := moveTree
-			moveTree = func(context.Context, string, string) error { return errors.New("boom") }
-
-			defer func() { moveTree = restore }()
+			tr.moveTree = func(context.Context, string, string) error { return errors.New("boom") }
 
 			src := filepath.Join(t.TempDir(), "file.txt")
 			mkFile(t, src, "keep me", 0o600)
@@ -346,10 +343,7 @@ func TestTrashPutFailureRollsBack(t *testing.T) {
 		})
 
 		Convey("When writing entry.json fails", func() {
-			restore := writeEntryFile
-			writeEntryFile = func(string, []byte, fs.FileMode) error { return errors.New("disk full") }
-
-			defer func() { writeEntryFile = restore }()
+			tr.writeEntryFile = func(string, []byte, fs.FileMode) error { return errors.New("disk full") }
 
 			src := filepath.Join(t.TempDir(), "file.txt")
 			mkFile(t, src, "precious", 0o600)
@@ -443,21 +437,19 @@ func TestTrashMoveDirUsesMoveTree(t *testing.T) {
 			calls []call
 		)
 
-		restore := moveTree
-		moveTree = func(_ context.Context, from, to string) error {
+		st := newStore(t, time.Now)
+		tr := st.Trash()
+
+		realMove := fsutil.MoveTree
+		tr.moveTree = func(_ context.Context, from, to string) error {
 			mu.Lock()
 
 			calls = append(calls, call{from: from, to: to})
 
 			mu.Unlock()
 
-			return restore(context.Background(), from, to)
+			return realMove(context.Background(), from, to)
 		}
-
-		defer func() { moveTree = restore }()
-
-		st := newStore(t, time.Now)
-		tr := st.Trash()
 
 		src := filepath.Join(t.TempDir(), "tree")
 		mkFile(t, filepath.Join(src, "a.txt"), "a", 0o600)
@@ -1107,8 +1099,8 @@ func TestTrashHelperProcess(t *testing.T) {
 		// copy: the move completes first, which is exactly the window this
 		// helper needs — the payload exists while put-done has not been
 		// printed. The cross-device path is fsutil's to test now.
-		previous := writeEntryFile
-		writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
+		tr := st.Trash()
+		tr.writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
 			fmt.Println("payload-ready")
 
 			for range 1500 {
@@ -1119,7 +1111,7 @@ func TestTrashHelperProcess(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 			}
 
-			return previous(path, data, mode)
+			return fsutil.WriteFileAtomic(path, data, mode)
 		}
 
 		if _, err := st.Trash().Put(context.Background(), cfg.Src, PutOptions{}); err != nil {
@@ -1130,13 +1122,14 @@ func TestTrashHelperProcess(t *testing.T) {
 
 		fmt.Println("put-done")
 	case "hold":
-		writeEntryFile = func(string, []byte, fs.FileMode) error {
+		hold := st.Trash()
+		hold.writeEntryFile = func(string, []byte, fs.FileMode) error {
 			fmt.Println("payload-ready")
 
 			select {}
 		}
 
-		_, _ = st.Trash().Put(context.Background(), cfg.Src, PutOptions{})
+		_, _ = hold.Put(context.Background(), cfg.Src, PutOptions{})
 
 		os.Exit(4)
 	default:
@@ -1299,15 +1292,12 @@ func TestTrashPutPurgeRaceSameProcess(t *testing.T) {
 		blocked := make(chan struct{})
 		release := make(chan struct{})
 
-		previous := writeEntryFile
-		writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
+		tr.writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
 			close(blocked)
 			<-release
 
-			return previous(path, data, mode)
+			return fsutil.WriteFileAtomic(path, data, mode)
 		}
-
-		defer func() { writeEntryFile = previous }()
 
 		errCh := make(chan error, 1)
 
@@ -1462,15 +1452,12 @@ func TestTrashPutRollbackMessage(t *testing.T) {
 
 		var bucket string
 
-		previous := writeEntryFile
-		writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
+		tr.writeEntryFile = func(path string, data []byte, mode fs.FileMode) error {
 			bucket = filepath.Dir(path)
 			_ = os.RemoveAll(bucket)
 
 			return errors.New("disk full")
 		}
-
-		defer func() { writeEntryFile = previous }()
 
 		_, err := tr.Put(context.Background(), src, PutOptions{})
 
@@ -1492,14 +1479,11 @@ func TestTrashPutRollbackKeepsBucket(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 
-		previous := writeEntryFile
-		writeEntryFile = func(string, []byte, fs.FileMode) error {
+		tr.writeEntryFile = func(string, []byte, fs.FileMode) error {
 			cancel() // the rollback move must fail before it touches the payload
 
 			return errors.New("disk full")
 		}
-
-		defer func() { writeEntryFile = previous }()
 
 		_, err := tr.Put(ctx, src, PutOptions{})
 

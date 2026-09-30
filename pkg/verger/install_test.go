@@ -10,6 +10,7 @@ import (
 
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
+	"github.com/odiumuniverse/verger/pkg/spec"
 )
 
 // TestFindInstalledMatchesTheHostsSelectorSpelling pins ORACLE-CLAUDE-1:
@@ -147,7 +148,7 @@ func TestSyncReportsNewerSchemaBeforeAnythingElse(t *testing.T) {
 
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
-		AddSpecPackage(doc, "acme/caveman", "1.2.3")
+		AddSpecPackage(doc, spec.Package{ID: "acme/caveman", Version: "1.2.3"})
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		lockPath := filepath.Join(client.Home().Root(), "verger.lock")

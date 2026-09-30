@@ -140,7 +140,7 @@ func TestParseDesignExample(t *testing.T) {
 
 				reparsed, err := Parse(data)
 				So(err, ShouldBeNil)
-				So(reparsed, ShouldResemble, spec)
+				So(withoutSource(reparsed), ShouldResemble, withoutSource(spec))
 				So(string(mustMarshal(t, reparsed)), ShouldEqual, string(data))
 
 				So(string(data), ShouldContainSubstring, "[[source]]")

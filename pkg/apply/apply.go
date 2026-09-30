@@ -148,6 +148,29 @@ var ErrConfirmationRequired = errors.New("confirmation required")
 // defaultParallel bounds concurrent host execution when Options.Parallel is 0.
 const defaultParallel = 4
 
+// loadLockForRun reads the lock from disk under the flock, falling back to the
+// caller's snapshot when the document cannot be read.
+//
+// A missing file is a first install, and that is not an error. A BROKEN path is
+// not either: the run must reach commit so the save fails there and the caller
+// gets the *LockError with its durable receipt, which is the contract
+// TestRunLockSaveFailureIsFatal pins. Only a lock from a NEWER verger is fatal
+// here - silently carrying on would overwrite a document this build has never
+// understood, which is the one loss that cannot be undone.
+func loadLockForRun(path string, fallback *lock.Lock) (*lock.Lock, error) {
+	doc, err := lock.ParseFile(path)
+	if err != nil {
+		var newer *lock.SchemaNewerError
+		if errors.As(err, &newer) {
+			return nil, err
+		}
+
+		return fallback, nil
+	}
+
+	return doc, nil
+}
+
 // Deps are the run dependencies; every member but LockPath is required.
 type Deps struct {
 	Home       *home.Home
@@ -262,6 +285,24 @@ func Run(ctx context.Context, deps Deps, plan Plan, opts Options) (Report, error
 	}
 
 	defer func() { _ = unlock() }()
+
+	// The lock is re-read HERE, inside the flock, not carried in from before it.
+	//
+	// deps.Lock was loaded before this process took the lock, so it is a snapshot
+	// from before every other writer finished. Two processes then each read {}, each
+	// took the flock in turn, and each SAVED ITS OWN SNAPSHOT plus its own cell -
+	// the second write silently erasing the first. Six concurrent installs left
+	// exactly one package in the lock while all six exited 0, because from the
+	// caller's side a lost update looks exactly like a success.
+	//
+	// Reading under the lock is what makes the read-modify-write atomic: the
+	// document read is the document no other writer has touched since it released.
+	fresh, err := loadLockForRun(deps.LockPath, deps.Lock)
+	if err != nil {
+		return Report{}, err
+	}
+
+	deps.Lock = fresh
 
 	r := newRunner(ctx, deps, plan, opts)
 

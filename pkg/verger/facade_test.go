@@ -571,7 +571,7 @@ func TestFacadeAbsorbRenamesAnEmptyTarget(t *testing.T) {
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
 
-		AddSpecPackage(doc, "acme/caveman", "1.2.3")
+		AddSpecPackage(doc, spec.Package{ID: "acme/caveman", Version: "1.2.3"})
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		// State the file-by-file merge does not model.
@@ -777,7 +777,7 @@ func TestFacadeSyncReconcilesWithTheSpec(t *testing.T) {
 		// resolves against the spec's own directory, and this fixture sits
 		// beside the world root, not beside the spec.
 		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
-		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
+		So(AddSpecPackage(doc, spec.Package{ID: "local:caveman", Version: "1.2.3"}), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		Convey("When the machine is reconciled with the spec", func() {
@@ -855,7 +855,7 @@ func TestFacadeUpdatePinAndOutdated(t *testing.T) {
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
 		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
-		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
+		So(AddSpecPackage(doc, spec.Package{ID: "local:caveman", Version: "1.2.3"}), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		_, _, err = client.Sync(t.Context(), SyncOptions{Paths: paths, Hooks: HooksSkip})
@@ -944,7 +944,7 @@ func TestFacadeWatchTakesTheLeaseAndReconciles(t *testing.T) {
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
 		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
-		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
+		So(AddSpecPackage(doc, spec.Package{ID: "local:caveman", Version: "1.2.3"}), ShouldBeTrue)
 		So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 
 		var (
@@ -1063,19 +1063,19 @@ func vergerYes() Confirmer {
 // delete — and a repeated absorb neither duplicates nor drops anything
 // (DESIGN §3.3).
 func TestFacadeAbsorbMigratesSecrets(t *testing.T) {
-	newTarget := func(t *testing.T, world *facadeWorld, name, spec string) *Client {
+	newTarget := func(t *testing.T, world *facadeWorld, name, contents string) *Client {
 		t.Helper()
 
 		target, err := Open(t.Context(), WithHome(filepath.Join(world.root, name)))
 		So(err, ShouldBeNil)
 
-		if spec != "" {
+		if contents != "" {
 			paths, pathsErr := target.Paths(User, "")
 			So(pathsErr, ShouldBeNil)
 
 			doc, _, loadErr := LoadSpec(paths.SpecPath)
 			So(loadErr, ShouldBeNil)
-			So(AddSpecPackage(doc, "acme/already-here", "1.0.0"), ShouldBeTrue)
+			So(AddSpecPackage(doc, spec.Package{ID: "acme/already-here", Version: "1.0.0"}), ShouldBeTrue)
 			So(SaveSpec(paths.SpecPath, doc), ShouldBeNil)
 		}
 
@@ -1292,8 +1292,8 @@ func TestFacadePinVocabularyIsComplete(t *testing.T) {
 		doc, _, err := LoadSpec(paths.SpecPath)
 		So(err, ShouldBeNil)
 		So(AddSpecSourceAt(doc, mustRef(t, ref), filepath.Dir(paths.SpecPath)), ShouldBeTrue)
-		So(AddSpecPackage(doc, "local:caveman", "1.2.3"), ShouldBeTrue)
-		So(AddSpecPackage(doc, "acme/never-installed", ""), ShouldBeTrue)
+		So(AddSpecPackage(doc, spec.Package{ID: "local:caveman", Version: "1.2.3"}), ShouldBeTrue)
+		So(AddSpecPackage(doc, spec.Package{ID: "acme/never-installed", Version: ""}), ShouldBeTrue)
 
 		// Declared but deliberately not delivered, rather than declared with no
 		// source to get it from: a package no source provides is a broken spec,

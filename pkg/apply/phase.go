@@ -1284,8 +1284,18 @@ func (r *runner) undoEntry(ref rmaRef, op receipt.Op, cause string, mode rmaMode
 
 	if !op.Existed {
 		trashID, err := r.trash(ref, op.Path, cause, current)
+		if err != nil {
+			return "", "", false, err
+		}
 
-		return "", trashID, false, err
+		// A delivery that created a directory and filled it — a rendered
+		// plugin, a copied skill tree — must not leave the empty shell
+		// behind in the host's own config root. Only a directory this
+		// delivery emptied is removed, and never one that still holds
+		// anything.
+		r.pruneEmptiedParent(op.Path)
+
+		return "", trashID, false, nil
 	}
 
 	if op.Backup == "" {
@@ -1293,6 +1303,26 @@ func (r *runner) undoEntry(ref rmaRef, op receipt.Op, cause string, mode rmaMode
 	}
 
 	return r.undoRestore(ref, op, cause, current)
+}
+
+// pruneEmptiedParent removes the directory of a reversed file when the
+// reversal left it empty. A directory that still holds anything, and a
+// directory verger did not create, are both left alone: the emptiness is the
+// whole test.
+func (r *runner) pruneEmptiedParent(path string) {
+	dir := filepath.Dir(path)
+
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) > 0 {
+		return
+	}
+
+	_ = os.Remove(dir)
 }
 
 // undoMissing handles a target that is already gone: an idempotent no-op, or a

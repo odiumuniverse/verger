@@ -403,11 +403,9 @@ func syncInstall(
 	// the fetch resolved are both in hand. Earlier there is nothing to compare,
 	// later the plan is already written.
 	if have, ok := installed[entry.ID]; ok {
-		if skipDowngrade(plan, entry, have, fetched.Package.Version, opts.AllowDowngrade) {
+		if installedIsSettled(plan, entry, have, fetched.Package.Version, opts.AllowDowngrade) {
 			return
 		}
-
-		return
 	}
 
 	// No receipt for this package on this machine means what we are about to
@@ -647,6 +645,26 @@ func (e *HandsOffError) Error() string {
 // Receipt is the receipt shape the facade returns to a caller that needs the
 // removed cells themselves rather than the actions that remove them.
 type Receipt = receipt.Receipt
+
+// installedIsSettled reports whether an installed package has nothing left
+// to do. It is separate because that decision IS the downgrade feature, and
+// burying it inline is how it went wrong the first time.
+//
+// Nothing to do when the channel resolves to what is already on disk. But an
+// ALLOWED downgrade is a move the user asked for, and returning
+// unconditionally made --allow-downgrade a flag that changed the message and
+// not the outcome: the plan said "not skipped" and then installed nothing.
+//
+// No unit test could see it, because they call skipDowngrade directly with a
+// version pair they chose. Only the end-to-end path compares against a
+// version that is really on disk.
+func installedIsSettled(plan *SyncPlan, entry spec.Package, have, got string, allow bool) bool {
+	if skipDowngrade(plan, entry, have, got, allow) {
+		return true
+	}
+
+	return source.CompareVersions(got, have) >= 0
+}
 
 // downgrades reports whether resolving a channel to `got` moves a package from
 // `have` backwards. A package with no channel is never a downgrade: a plain

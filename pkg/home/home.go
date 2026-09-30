@@ -117,15 +117,35 @@ func Discover(opts ...Option) (*Home, error) {
 	return &Home{root: filepath.Join(userHome, DirName), source: SourceDefault}, nil
 }
 
-// vaultAt returns <beadle>/verger when it is an existing directory, "" when it
-// is missing or not a directory.
+// vaultAt returns <beadle>/verger when the VAULT exists, "" when it does not.
+//
+// The subdirectory inside the vault is deliberately NOT required to exist. It
+// used to be, and that made the choice a trap: on a vault beadle had just
+// created, <beadle>/verger was not there yet, so discovery fell through to
+// ~/.verger and the first install created a second home beside the vault. Two
+// homes on one machine means two locks and two receipt trees, and the vault
+// and the CLI stop agreeing about what is installed - the exact state this
+// product refuses to create.
+//
+// Requiring the vault itself to exist is the right signal. Discovery is
+// read-only, so naming a directory that does not exist yet is neither a write
+// nor a risk: the subdir is verger's to create, the first time it needs it.
 func vaultAt(beadle string) string {
-	candidate := filepath.Join(beadle, BeadleSubdir)
-	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
-		return candidate
+	info, err := os.Stat(beadle)
+	if err != nil || !info.IsDir() {
+		return ""
 	}
 
-	return ""
+	candidate := filepath.Join(beadle, BeadleSubdir)
+
+	// Missing is fine - verger creates it. Present but NOT a directory is not:
+	// that is a beadle home somebody else put there, and delivering into it
+	// would fail later and less clearly than refusing it now.
+	if sub, subErr := os.Stat(candidate); subErr == nil && !sub.IsDir() {
+		return ""
+	}
+
+	return candidate
 }
 
 // resolveUserHome returns the injected user home or os.UserHomeDir.

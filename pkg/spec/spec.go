@@ -32,15 +32,21 @@ const DefaultCooldown = 24 * time.Hour
 const (
 	defaultsTable = "defaults"
 	packageTable  = "package"
+	sourceTable   = "source"
 	cooldownKey   = "cooldown"
+	hooksKey      = "hooks"
 )
+
+// bom is the UTF-8 byte order mark a hand-edited file from a Windows editor
+// may carry. It never changes what the document means and is written back.
+var bom = []byte{0xEF, 0xBB, 0xBF}
 
 // Keys of the typed schema, used to separate unknown fields from known ones.
 // They are fixed-size arrays: compile-time read-only tables that are never
 // mutated or appended to (decision T0.5 N2).
 var (
 	topKeys       = [...]string{"schema", defaultsTable, "propagate", "source", packageTable}
-	defaultsKeys  = [...]string{"hooks", cooldownKey}
+	defaultsKeys  = [...]string{hooksKey, cooldownKey}
 	propagateKeys = [...]string{
 		"install", "remove", "disable", "enable", "update", "adopt", "marketplace", "kind", "host",
 	}
@@ -51,6 +57,11 @@ var (
 )
 
 // Spec is the desired state of one verger.toml document.
+//
+// src and bom are the document this spec was read from, kept so that a save
+// can change what the user meant to change and leave the rest of their bytes
+// alone. A spec built in memory has neither and is written in the canonical
+// form.
 type Spec struct {
 	Schema    int       `toml:"schema"`
 	Defaults  Defaults  `toml:"defaults,omitempty"`
@@ -62,6 +73,8 @@ type Spec struct {
 	Packages []Package               `toml:"package,omitempty"`
 
 	raw map[string]any
+	src []byte
+	bom bool
 }
 
 // Defaults are the fallback answers a spec applies when a package does not
@@ -198,6 +211,7 @@ func ParseFile(path string) (*Spec, error) {
 }
 
 func parse(data []byte, path string) (*Spec, error) {
+	spec := Spec{bom: bytes.HasPrefix(data, bom)}
 	data = stripBOM(data)
 
 	var raw map[string]any
@@ -213,7 +227,6 @@ func parse(data []byte, path string) (*Spec, error) {
 		return nil, err
 	}
 
-	var spec Spec
 	if err := toml.Unmarshal(data, &spec); err != nil {
 		return nil, fmt.Errorf("parse spec%s: %w", pathSuffix(path), err)
 	}
@@ -223,6 +236,10 @@ func parse(data []byte, path string) (*Spec, error) {
 	if err := validate(&spec, path); err != nil {
 		return nil, err
 	}
+
+	// The document is kept verbatim: a save splices the change into these bytes
+	// instead of re-encoding what the user wrote by hand.
+	spec.src = slices.Clone(data)
 
 	return &spec, nil
 }
@@ -242,6 +259,19 @@ func (s *Spec) Marshal() ([]byte, error) {
 		return nil, err
 	}
 
+	tree, err := s.tree()
+	if err != nil {
+		return nil, err
+	}
+
+	return toml.Marshal(tree)
+}
+
+// tree is the canonical view of the spec: every known field regenerated from
+// the typed model, with the document's own unknown fields merged back at every
+// level. Both the canonical encoding and the spliced one are rendered from it,
+// so a table written out of hand and a table verger wrote say the same thing.
+func (s *Spec) tree() (map[string]any, error) {
 	typed, err := toml.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("marshal spec: %w", err)
@@ -254,22 +284,35 @@ func (s *Spec) Marshal() ([]byte, error) {
 
 	s.mergeRaw(tree)
 
-	return toml.Marshal(tree)
+	return tree, nil
 }
 
-// Save writes the spec to path atomically. New files get mode 0600; an
-// existing file keeps its mode. The parent directory must exist. A hand-built
-// spec with an out-of-range Schema is refused before anything is written:
-// Schema > Schema reports *SchemaNewerError, Schema <= 0 *SchemaInvalidError,
-// both with Path set.
+// Save writes the spec to path atomically, changing only what the model changed:
+// a spec read from a file is spliced into the bytes that file already has, so
+// its comments, its quoting and its layout are left alone. New files get mode
+// 0600; an existing file keeps its mode. The parent directory must exist. A
+// hand-built spec with an out-of-range Schema is refused before anything is
+// written: Schema > Schema reports *SchemaNewerError, Schema <= 0
+// *SchemaInvalidError, both with Path set.
 func (s *Spec) Save(path string) error {
 	if err := checkSchema(s.Schema, path); err != nil {
 		return err
 	}
 
-	data, err := s.Marshal()
+	return s.save(path, s.produce)
+}
+
+// save writes what produce returns, after proving that those bytes parse back
+// into this model. It is the one place a spec reaches the disk, and the check
+// is what makes a bad splice a refused write instead of a corrupted file.
+func (s *Spec) save(path string, produce func() ([]byte, error)) error {
+	data, err := produce()
 	if err != nil {
 		return err
+	}
+
+	if err := verifySplice(data, s); err != nil {
+		return fmt.Errorf("save spec %s: %w", path, err)
 	}
 
 	perm := fs.FileMode(0o600)
@@ -286,7 +329,95 @@ func (s *Spec) Save(path string) error {
 		return fmt.Errorf("save spec %s: %w", path, err)
 	}
 
+	// The next save splices into what was just written, not into the document
+	// this spec was read from.
+	s.src = slices.Clone(data)
+	s.bom = bytes.HasPrefix(data, bom)
+
 	return nil
+}
+
+// produce is the canonical encoding of a spec, spliced into the document it was
+// read from whenever the change can be expressed as byte edits. A change that
+// cannot — a reordered array, a construct the index does not model — falls
+// back to the canonical encoding rather than a partly rewritten file.
+func (s *Spec) produce() ([]byte, error) {
+	canonical, err := s.Marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(s.src) == 0 {
+		return s.withBOM(canonical), nil
+	}
+
+	spliced, err := s.splice()
+	switch {
+	case err == nil:
+		return spliced, nil
+	case errors.Is(err, errCannotPreserve):
+		return s.withBOM(canonical), nil
+	default:
+		return nil, err
+	}
+}
+
+func (s *Spec) withBOM(data []byte) []byte {
+	if !s.bom {
+		return data
+	}
+
+	return append(bytes.Clone(bom), data...)
+}
+
+// splice turns the difference between the document and the model into byte
+// edits. A change that cannot be expressed pointwise — a reordered array, a
+// construct the index does not model — answers errCannotPreserve, which the
+// caller reads as a decision to re-encode and never as a failure.
+func (s *Spec) splice() ([]byte, error) {
+	data, err := s.spliceBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	return s.withBOM(data), nil
+}
+
+func (s *Spec) spliceBytes() ([]byte, error) {
+	before, err := parse(s.src, "")
+	if err != nil {
+		// A document this package cannot read back cannot be spliced into.
+		return nil, errCannotPreserve
+	}
+
+	tree, err := s.tree()
+	if err != nil {
+		return nil, err
+	}
+
+	idx, err := buildIndex(s.src, func(array string, ordinal int) string {
+		return identityAt(before, array, ordinal)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errCannotPreserve, err)
+	}
+
+	beforeTables, err := modelTables(before)
+	if err != nil {
+		return nil, err
+	}
+
+	afterTables, err := modelTables(s)
+	if err != nil {
+		return nil, err
+	}
+
+	edits, err := planSplice(idx, beforeTables, afterTables, tree, s)
+	if err != nil {
+		return nil, err
+	}
+
+	return applyEdits(s.src, edits)
 }
 
 // Digest returns the canonical content hash of the spec (DESIGN §6 trust):
@@ -506,7 +637,7 @@ func validate(spec *Spec, path string) error {
 
 	if hooks := spec.Defaults.Hooks; hooks != "" && !hooks.valid() {
 		return &InvalidValueError{
-			Table: defaultsTable, Key: "hooks",
+			Table: defaultsTable, Key: hooksKey,
 			Value:  string(hooks),
 			Reason: "expected ask, yes or no",
 		}

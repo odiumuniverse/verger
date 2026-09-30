@@ -946,9 +946,7 @@ func (c *Client) CommitAdopt(paths Paths, adopts []AdoptPlan, dryRun bool) error
 	}
 
 	for _, adopt := range adopts {
-		if !hasSpecPackageID(doc, adopt.ID) {
-			doc.Packages = append(doc.Packages, spec.Package{ID: adopt.ID, AdoptedFrom: adopt.AdoptedFrom})
-		}
+		AddSpecPackage(doc, spec.Package{ID: adopt.ID, AdoptedFrom: adopt.AdoptedFrom})
 	}
 
 	return SaveSpec(paths.SpecPath, doc)

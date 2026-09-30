@@ -732,11 +732,15 @@ id = "caveman"
 		Convey("When pin runs", func() {
 			Convey("Then the spec pin is stored and unpin clears it", func() {
 				So(err, ShouldBeNil)
-				So(readWorldFile(t, filepath.Join(w.homeDir, "verger.toml")), ShouldContainSubstring, `version = '2.0.0'`)
+
+				// The pin joins the file the user wrote, in its own quotes:
+				// a command that changed one line must not restate the rest
+				// of the document in its own dialect.
+				So(readWorldFile(t, filepath.Join(w.homeDir, "verger.toml")), ShouldContainSubstring, `version = "2.0.0"`)
 
 				_, unpinErr := w.run("unpin", "caveman")
 				So(unpinErr, ShouldBeNil)
-				So(readWorldFile(t, filepath.Join(w.homeDir, "verger.toml")), ShouldNotContainSubstring, `version = '2.0.0'`)
+				So(readWorldFile(t, filepath.Join(w.homeDir, "verger.toml")), ShouldNotContainSubstring, "version = ")
 			})
 		})
 	})

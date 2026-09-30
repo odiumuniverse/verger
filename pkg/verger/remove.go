@@ -198,7 +198,7 @@ func (c *Client) recordInstall(paths Paths, packages []PlannedPackage) error {
 	specDir := filepath.Dir(paths.SpecPath)
 
 	for _, item := range packages {
-		AddSpecPackage(doc, item.Package.ID, item.Package.Version)
+		AddSpecPackage(doc, spec.Package{ID: item.Package.ID, Version: item.Package.Version})
 		AddSpecSourceAt(doc, item.Ref, specDir)
 	}
 

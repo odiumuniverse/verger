@@ -31,23 +31,31 @@ const (
 	trashLockRetry = 100 * time.Millisecond
 )
 
-// Test seams: production uses the fsutil implementations directly. These
-// unexported package vars are the accepted exception to "no production globals"
-// (the fsutil.renameForTest pattern, phase0-decisions verify-1 T0.4 Q4).
+// The two filesystem operations the trash needs are injected per Trash rather
+// than held as package vars. A test seam in a package var is a global that any
+// other test in the same binary can overwrite mid-run - and the tests that use
+// these are failure-injection tests, so they are exactly the ones that must not
+// run beside anything else. A field is scoped to the one Trash it was given.
 //
 // There are two, not three. There was a `renameEntry = os.Rename` seam for the
 // hand-written rename-with-EXDEV-fallback that `moveEntry` used to carry; with
 // fsutil.MoveTree accepting file and symlink sources, that fallback is
 // fsutil's and is tested there, so the seam went with the duplication.
-var (
-	moveTree       = fsutil.MoveTree
-	writeEntryFile = fsutil.WriteFileAtomic
-)
 
 // errOrphan marks a bucket without entry.json (a crashed put).
 var errOrphan = errors.New("orphan trash bucket")
 
 // lockTrash takes the exclusive trash mutator flock, waiting until ctx ends.
+// writeEntry writes one entry.json. It is the injected writeEntryFile, or
+// fsutil's when production left the field nil.
+func (t *Trash) writeEntry(path string, data []byte, mode fs.FileMode) error {
+	if t.writeEntryFile != nil {
+		return t.writeEntryFile(path, data, mode)
+	}
+
+	return fsutil.WriteFileAtomic(path, data, mode)
+}
+
 func (t *Trash) lockTrash(ctx context.Context) (func() error, error) {
 	fileLock, err := t.openTrashLock()
 	if err != nil {
@@ -130,6 +138,11 @@ type Trash struct {
 	dir       string
 	now       func() time.Time
 	retention time.Duration
+	// moveTree and writeEntryFile are the two filesystem operations, injected
+	// so a test can make either fail. Production leaves them nil and gets the
+	// fsutil implementations; see the note above.
+	moveTree       func(context.Context, string, string) error
+	writeEntryFile func(string, []byte, fs.FileMode) error
 }
 
 // Entry describes one trashed payload.
@@ -194,7 +207,7 @@ func (t *Trash) Put(ctx context.Context, src string, opts PutOptions) (Entry, er
 
 	payload := filepath.Join(bucket, payloadName)
 
-	if err := moveEntry(ctx, original, payload); err != nil {
+	if err := moveEntry(ctx, t.moveTree, original, payload); err != nil {
 		_ = os.RemoveAll(bucket)
 
 		return Entry{}, fmt.Errorf("move %s to trash: %w", original, err)
@@ -215,11 +228,11 @@ func (t *Trash) Put(ctx context.Context, src string, opts PutOptions) (Entry, er
 
 	data, err := encodeEntry(entry)
 	if err != nil {
-		return Entry{}, rollbackPut(ctx, bucket, payload, original, err)
+		return Entry{}, rollbackPut(ctx, t.moveTree, bucket, payload, original, err)
 	}
 
-	if err := writeEntryFile(filepath.Join(bucket, entryFileName), data, 0o600); err != nil {
-		return Entry{}, rollbackPut(ctx, bucket, payload, original, err)
+	if err := t.writeEntry(filepath.Join(bucket, entryFileName), data, 0o600); err != nil {
+		return Entry{}, rollbackPut(ctx, t.moveTree, bucket, payload, original, err)
 	}
 
 	return entry, nil
@@ -360,7 +373,7 @@ func (t *Trash) restoreLocked(ctx context.Context, bucket string, entry Entry) (
 		return Entry{}, err
 	}
 
-	if err := moveEntry(ctx, payload, entry.Original); err != nil {
+	if err := moveEntry(ctx, t.moveTree, payload, entry.Original); err != nil {
 		return Entry{}, fmt.Errorf("restore %s: %w", entry.Original, err)
 	}
 
@@ -556,8 +569,8 @@ func (t *Trash) loadEntry(id string) (Entry, error) {
 // rollbackPut returns the payload to its original path and drops the bucket;
 // when the move back fails the bucket is kept — the payload inside it is the
 // only copy — and the error names the bucket.
-func rollbackPut(ctx context.Context, bucket, payload, original string, cause error) error {
-	if moveErr := moveEntry(ctx, payload, original); moveErr != nil {
+func rollbackPut(ctx context.Context, move func(context.Context, string, string) error, bucket, payload, original string, cause error) error {
+	if moveErr := moveEntry(ctx, move, payload, original); moveErr != nil {
 		return fmt.Errorf("write entry: %w (rollback failed to restore %s; bucket not removed: %s: %w)",
 			cause, original, bucket, moveErr)
 	}
@@ -611,12 +624,16 @@ func lstatExists(path string) (bool, error) {
 // the local one was the weaker of the two: it copied straight onto the
 // destination instead of staging and renaming, so a crash mid-copy left a
 // half-written payload where the original had been.
-func moveEntry(ctx context.Context, from, to string) error {
+func moveEntry(ctx context.Context, move func(context.Context, string, string) error, from, to string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	return moveTree(ctx, from, to)
+	if move == nil {
+		move = fsutil.MoveTree
+	}
+
+	return move(ctx, from, to)
 }
 
 // RestoreConflictError reports a restore whose original path already exists.
