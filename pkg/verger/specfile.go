@@ -248,12 +248,29 @@ func RemoveSpecSource(doc *spec.Spec, name string) int {
 // what is on this disk, so both status and sync have to look.
 func ReceiptFilesPresent(record receipt.Receipt) bool {
 	for _, artifact := range record.Artifacts {
+		// Not every artifact names a place. A CLI-managed MCP server is
+		// recorded under its identity address (`<host>://mcp/<name>`): the
+		// host owns it and there is nothing to stat. Stat'ing it made a
+		// delivery whose every file was on disk read as missing — which is
+		// what the gemini e2e reported, with `.gemini/` full.
+		if !onDisk(artifact.Path) {
+			continue
+		}
+
 		if _, err := os.Stat(artifact.Path); err != nil {
 			return false
 		}
 	}
 
 	return true
+}
+
+// onDisk reports whether an artifact path names a filesystem location. An
+// absolute path never carries a URL scheme and an identity address always
+// does, which tells the two apart without asking each host about its own
+// naming.
+func onDisk(path string) bool {
+	return path != "" && !strings.Contains(path, "://")
 }
 
 // matchesID reports whether a stored package id answers a caller query: the
