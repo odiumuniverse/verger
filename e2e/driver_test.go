@@ -58,10 +58,17 @@ type Env struct {
 // cellDoc mirrors the stable `--json` cell document (pkg/cli §8); the driver
 // parses it as an external contract and never imports pkg/cli.
 type cellDoc struct {
-	Package  string   `json:"package"`
-	Host     string   `json:"host"`
-	Scope    string   `json:"scope"`
-	Status   string   `json:"status"`
+	Package string `json:"package"`
+	Host    string `json:"host"`
+	Scope   string `json:"scope"`
+	Status  string `json:"status"`
+	// Detail is the internal code beside the user-facing word: `status` says
+	// "delivered", `detail` says "current". A cell struct carrying only
+	// `status` read the word and compared it to a code - which is why the
+	// gemini canon leg failed at assertStatus on one platform and passed on
+	// another (N045): the two runs were different driver revisions, not
+	// different platforms.
+	Detail   string   `json:"detail,omitempty"`
 	Version  string   `json:"version,omitempty"`
 	Strategy string   `json:"strategy,omitempty"`
 	Kind     string   `json:"kind,omitempty"`
@@ -479,8 +486,10 @@ func assertStatus(t *testing.T, env Env, host, want string) cellDoc {
 	t.Helper()
 
 	cell := statusCell(t, env, host)
-	if cell.Status != want {
-		t.Fatalf("e2e: %s cell status = %q, want %q (notes %v, cell %+v)", host, cell.Status, want, cell.Notes, cell)
+	// The internal code, not the word: every caller asks for "current", which
+	// is what `detail` says. `status` is what the user reads.
+	if cell.Detail != want {
+		t.Fatalf("e2e: %s cell detail = %q, want %q (status %q, notes %v, cell %+v)", host, cell.Detail, want, cell.Status, cell.Notes, cell)
 	}
 
 	return cell
