@@ -481,10 +481,12 @@ func (c *Client) installAdopted(ctx context.Context, plan *Plan, opts ApplyOptio
 	}
 
 	if len(plan.Packages) == 0 {
-		report := apply.Report{Notes: plan.Notes}
-		for _, adopt := range plan.Adopts {
-			report.Notes = append(report.Notes, adopt.Notes...)
-		}
+		// An adoption is a delivery, even when there is no other host to
+		// deliver to: the package is now the spec's, recorded with
+		// `adopted_from`. Reporting it as a silent spec edit returned a
+		// report with no cells, and `adopt --json` printed an empty matrix
+		// for a run that had taken a package over.
+		report := apply.Report{Notes: plan.Notes, Cells: adoptedCells(plan.Adopts)}
 
 		return &report, nil
 	}
@@ -494,6 +496,29 @@ func (c *Client) installAdopted(ctx context.Context, plan *Plan, opts ApplyOptio
 	}
 
 	return c.Apply(ctx, plan, applyOpts)
+}
+
+// adoptedCells renders the adoptions of a plan as report cells, so a run that
+// only adopted still says what it took over.
+func adoptedCells(adopts []AdoptPlan) []apply.CellResult {
+	if len(adopts) == 0 {
+		return nil
+	}
+
+	cells := make([]apply.CellResult, 0, len(adopts))
+
+	for _, adopt := range adopts {
+		cells = append(cells, apply.CellResult{
+			Package: adopt.ID,
+			Host:    host.ID(adopt.AdoptedFrom),
+			Scope:   string(User),
+			Status:  apply.StatusCurrent,
+			Kind:    apply.ActionAdopt,
+			Notes:   adopt.Notes,
+		})
+	}
+
+	return cells
 }
 
 // buildInstallActions resolves the hooks consent and builds one install action

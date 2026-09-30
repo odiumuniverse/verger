@@ -43,6 +43,10 @@ const (
 	ActionInstall Kind = "install"
 	ActionUpdate  Kind = "update"
 	ActionRemove  Kind = "remove"
+	// ActionAdopt is a package taken over from a host's own list. It is a
+	// delivery like the others — the spec now declares it — and it is named
+	// separately because nothing was fetched to place it there.
+	ActionAdopt Kind = "adopt"
 )
 
 // Action is one explicit delivery or removal.
