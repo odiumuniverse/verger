@@ -84,6 +84,10 @@ type Delivery struct {
 	// is ignored at user scope. Empty means "no project", which leaves a
 	// project-scope delivery unsupported rather than guessing a root.
 	Project string
+	// Note is why this delivery was silenced, when it was. The ladder writes it
+	// from the adapter's own words, so the reason reaches the user unchanged
+	// rather than being re-derived here from a decision made elsewhere.
+	Note string
 }
 
 // Result reports what one delivery or uninstall did.
@@ -223,6 +227,22 @@ func deliverByStrategy(
 		stratum = func() (Result, error) { return install(ctx, home, d, true) }
 	case Loose:
 		stratum = func() (Result, error) { return loose(ctx, home, d) }
+	case Silenced:
+		// Silenced is a decision the ladder made, not a failure. It becomes an
+		// error only if a caller asks for a strategy it cannot have, which is
+		// what the default below still is: a strategy nobody chose, naming a
+		// host that cannot produce it, is a bug in the plan and says so.
+		//
+		// The reason travels in Notes, so the cell can be recorded as delivered-
+		// to-nothing with the explanation attached, and the user is told what
+		// would have to change rather than receiving an error from a stratum
+		// that was never going to be asked to do the work.
+		note := d.Note
+		if note == "" {
+			note = "the host has no surface for this package"
+		}
+
+		return Result{Strategy: Silenced, Notes: []string{"silenced: " + note}}, nil
 	default:
 		return Result{}, &UnsupportedStrategyError{Host: id, Strategy: d.Strategy}
 	}

@@ -244,3 +244,26 @@ func (c *Client) Fetch(ctx context.Context, ref source.Ref) (*source.Fetched, er
 func (c *Client) PrepareDelivery(ctx context.Context, pkg host.Package, strategy host.Strategy) (host.Package, []string, error) {
 	return c.prepareDelivery(ctx, pkg, strategy)
 }
+
+// PickStrategyFor is the whole ladder, native → synth → loose → silenced, for
+// one adapter. It is PickStrategy with the last rung reached through the
+// optional host.Silencer, which is the only part of the ladder that needs to
+// know something about the adapter rather than about the payload: every other
+// rung asks "can this package be installed/rendered/written", which the
+// strategy can answer on its own, while the last asks "does this host have any
+// surface for this package at all", which only the host can answer.
+//
+// An adapter that does not implement Silencer has no opinion, so the ladder
+// ends at loose exactly as before. That is why this is a separate function
+// rather than a change to PickStrategy: the exported preview entry point keeps
+// its signature and its answers, and a caller with an adapter in hand can opt
+// into the last rung.
+func PickStrategyFor(adapter host.Host, pkg host.Package, kind source.Kind) (host.Strategy, string) {
+	if s, ok := adapter.(host.Silencer); ok {
+		if reason, hint, silenced := s.Silence(pkg, pkg.Scope); silenced {
+			return host.Silenced, "silenced: " + reason + " " + hint
+		}
+	}
+
+	return PickStrategy(pkg, adapter.ID(), kind)
+}

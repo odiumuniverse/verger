@@ -891,11 +891,16 @@ func TestGeminiInstallRefusals(t *testing.T) {
 		})
 
 		Convey("When Silenced is requested", func() {
-			_, err := h.Deliver(t.Context(), home, host.Delivery{Package: geminiPackage(t), Strategy: host.Silenced})
+			res, err := h.Deliver(t.Context(), home, host.Delivery{
+				Package: geminiPackage(t), Strategy: host.Silenced,
+				Note: "this host has no layout for this package",
+			})
 
-			Convey("Then the adapter refuses the strategy", func() {
-				_, ok := errors.AsType[*host.UnsupportedStrategyError](err)
-				So(ok, ShouldBeTrue)
+			Convey("Then it is recorded as silenced, not refused", func() {
+				So(err, ShouldBeNil)
+				So(res.Strategy, ShouldEqual, host.Silenced)
+				So(strings.Join(res.Notes, " "), ShouldContainSubstring, "no layout")
+				So(res.Artifacts, ShouldBeEmpty)
 			})
 		})
 	})

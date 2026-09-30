@@ -1103,10 +1103,25 @@ func TestOmpPolicyIsolation(t *testing.T) {
 				pkg := ompPackage(t)
 				pkg.Marketplace = "https://github.com/acme/plugins.git"
 
-				_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Silenced})
+				_, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: "not-a-strategy"})
 				unsupported, ok := errors.AsType[*host.UnsupportedStrategyError](err)
 				So(ok, ShouldBeTrue)
-				So(unsupported.Strategy, ShouldEqual, host.Silenced)
+				So(unsupported.Strategy, ShouldEqual, host.Strategy("not-a-strategy"))
+			})
+		})
+
+		Convey("When Silenced is requested", func() {
+			Convey("Then nothing runs and the decision is recorded", func() {
+				pkg := ompPackage(t)
+				pkg.Marketplace = "https://github.com/acme/plugins.git"
+
+				res, err := h.Deliver(t.Context(), home, host.Delivery{
+					Package: pkg, Strategy: host.Silenced,
+					Note: "this host has no layout for this package",
+				})
+				So(err, ShouldBeNil)
+				So(res.Strategy, ShouldEqual, host.Silenced)
+				So(res.Artifacts, ShouldBeEmpty)
 			})
 		})
 	})

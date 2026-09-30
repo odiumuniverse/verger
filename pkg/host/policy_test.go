@@ -369,7 +369,11 @@ func TestPolicyStrategyValidatedFirst(t *testing.T) {
 		fakeClaude(t)
 		home := policyHome(t, `{"blockedMarketplaces": ["`+policySourceRef+`"]}`)
 
-		for _, strategy := range []host.Strategy{host.Silenced, "bogus"} {
+		// Silenced is not one of these: it is a rung the ladder can now choose,
+		// so it is a delivered outcome rather than a strategy the adapter never
+		// delivers. Using it here would have tested the old contract and kept
+		// passing for the wrong reason after the change.
+		for _, strategy := range []host.Strategy{"bogus", "not-a-strategy"} {
 			Convey("When the strategy "+string(strategy)+" is requested", func() {
 				h, runner := newClaude(t, home, nil)
 

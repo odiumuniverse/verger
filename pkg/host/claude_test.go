@@ -555,14 +555,30 @@ func TestClaudeNativeRefusals(t *testing.T) {
 		home := t.TempDir()
 		h, _ := newClaude(t, home, nil)
 
-		_, err := h.Deliver(t.Context(), home, host.Delivery{Package: claudePackage(t), Strategy: host.Silenced})
+		res, err := h.Deliver(t.Context(), home, host.Delivery{
+			Package: claudePackage(t), Strategy: host.Silenced,
+			Note: "this host has no layout for this package",
+		})
 
 		Convey("When it is delivered", func() {
-			Convey("Then it is an *UnsupportedStrategyError", func() {
-				typed, ok := errors.AsType[*host.UnsupportedStrategyError](err)
-				So(ok, ShouldBeTrue)
-				So(typed.Host, ShouldEqual, host.Claude)
-				So(typed.Strategy, ShouldEqual, host.Silenced)
+			Convey("Then it is not a failure", func() {
+				// Silenced is a rung of the ladder, not a rejected request: the
+				// plan decided nothing can be delivered here and said why. An
+				// error would turn that decision into a crash the user has to
+				// interpret, which is what this rung exists to stop.
+				So(err, ShouldBeNil)
+			})
+
+			Convey("Then the result records the strategy that was applied", func() {
+				So(res.Strategy, ShouldEqual, host.Silenced)
+			})
+
+			Convey("Then the adapter's own reason reaches the caller", func() {
+				So(strings.Join(res.Notes, " "), ShouldContainSubstring, "no layout")
+			})
+
+			Convey("Then nothing was written to the host", func() {
+				So(res.Artifacts, ShouldBeEmpty)
 			})
 		})
 	})
