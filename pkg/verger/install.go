@@ -11,6 +11,7 @@ import (
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/spec"
+	"github.com/odiumuniverse/verger/pkg/store"
 )
 
 // PlannedPackage is one fetched package of a plan.
@@ -283,6 +284,76 @@ func refuseUnsupportedRefs(refs []source.Ref) error {
 	return nil
 }
 
+// specSourceFetcher resolves one ref through the sources the spec declares.
+// It returns nil, nil when no declared source offers the id, which is the
+// caller's cue to refuse the ref rather than look for it elsewhere.
+func specSourceFetcher(ctx context.Context, st *store.Store, sources []spec.Source, ref source.Ref) (*source.Fetched, error) {
+	fetcher, err := source.NewFetcher(source.WithStore(st))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, src := range sources {
+		offers, offerErr := offerFromSource(ctx, fetcher, src, ref.ID)
+		if offerErr != nil {
+			return nil, offerErr
+		}
+
+		for _, got := range offers {
+			if got.Package.ID == ref.ID {
+				return got, nil
+			}
+
+			// A source that offered something else is not the package the
+			// user named, and its cache entry must not outlive the probe.
+			_ = got.Cleanup()
+		}
+	}
+
+	return nil, nil
+}
+
+// offerFromSource asks one declared source what it offers. A source whose
+// location cannot be read offers nothing rather than failing the install: a
+// broken entry in the spec should not read as "this package is missing" when
+// a later source may well have it.
+func offerFromSource(ctx context.Context, fetcher *source.Fetcher, src spec.Source, id string) ([]*source.Fetched, error) {
+	if src.Name == "" || src.URL == "" {
+		return nil, nil
+	}
+
+	srcRef, err := source.ParseWithBase(src.URL, "")
+	if err != nil {
+		return nil, nil //nolint:nilerr // an unreadable source offers nothing
+	}
+
+	offers, err := fetcher.FetchLocalOffers(ctx, srcRef)
+	if err != nil {
+		return nil, nil //nolint:nilerr // see above
+	}
+
+	return offers, nil
+}
+
+// UndeclaredSourceError reports a ref that no declared source offers. The
+// install refuses it instead of falling back to a default registry: the spec
+// said where its packages come from, and going somewhere else — silently, and
+// over the network — is how a name the user controls turns into a name
+// somebody else publishes.
+type UndeclaredSourceError struct {
+	Ref     string
+	Sources []string
+}
+
+// Error implements error.
+func (e *UndeclaredSourceError) Error() string {
+	if len(e.Sources) == 0 {
+		return "no source declares " + e.Ref
+	}
+
+	return fmt.Sprintf("%s is not offered by any source the spec declares (%s)", e.Ref, strings.Join(e.Sources, ", "))
+}
+
 // fetchPackages fetches every ref into one host package.
 func (c *Client) fetchPackages(ctx context.Context, refs []source.Ref, opts PlanOptions, adapters []host.Host) ([]PlannedPackage, error) {
 	fetcher, err := source.NewFetcher(source.WithStore(c.Store()))
@@ -290,10 +361,12 @@ func (c *Client) fetchPackages(ctx context.Context, refs []source.Ref, opts Plan
 		return nil, err
 	}
 
+	sources := declaredSources(opts.Paths)
+
 	var packages []PlannedPackage
 
 	for _, ref := range refs {
-		fetched, err := fetcher.Fetch(ctx, ref)
+		fetched, err := c.resolve(ctx, fetcher, sources, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -312,6 +385,56 @@ func (c *Client) fetchPackages(ctx context.Context, refs []source.Ref, opts Plan
 	}
 
 	return packages, nil
+}
+
+// declaredSources reads the sources a spec declares. A spec that cannot be
+// read declares nothing, which leaves ref resolution exactly as it was.
+func declaredSources(paths Paths) []spec.Source {
+	doc, _, err := LoadSpec(paths.SpecPath)
+	if err != nil {
+		return nil
+	}
+
+	return doc.Sources
+}
+
+// resolve fetches one ref, going through the spec's declared sources first.
+//
+// A bare `owner/name` is the one ref shape that has to guess: the grammar
+// reads it as GitHub, and that guess sent an install to github.com for a
+// package the spec had already said lived somewhere else. When the spec
+// declares sources, the guess is replaced by them, and a ref none of them
+// offers is refused rather than fetched from the default registry — a name
+// the user controls must not turn into somebody else's package.
+func (c *Client) resolve(ctx context.Context, fetcher *source.Fetcher, sources []spec.Source, ref source.Ref) (*source.Fetched, error) {
+	if len(sources) == 0 || !bareID(ref) {
+		return fetcher.Fetch(ctx, ref)
+	}
+
+	got, err := specSourceFetcher(ctx, c.Store(), sources, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	if got == nil {
+		names := make([]string, 0, len(sources))
+
+		for _, src := range sources {
+			names = append(names, src.Name)
+		}
+
+		return nil, &UndeclaredSourceError{Ref: ref.ID, Sources: names}
+	}
+
+	return got, nil
+}
+
+// bareID reports whether ref is an unqualified `owner/name`, the shape that
+// parses as GitHub but names nothing about where it lives. An explicit
+// `github:` prefix, a URL, a path and an npm specifier all say where they
+// come from, so they keep their own kind.
+func bareID(ref source.Ref) bool {
+	return ref.Kind == source.KindGitHub && ref.Raw == ref.ID && ref.ID != ""
 }
 
 // Apply executes one plan (DESIGN §9.1). It is the single entry point a second
