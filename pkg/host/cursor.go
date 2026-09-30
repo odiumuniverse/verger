@@ -29,7 +29,11 @@ const (
 	// cursorHooksDoc is the host's own hook document. The loader (live
 	// cursor-agent bundle 2026.06.15-18-00-12-6f5a2cf, chunk 2097.index.js)
 	// reads `~/.cursor/hooks.json` at user scope, `<project>/.cursor/hooks.json`
-	// at project scope, `<root>/team-hooks/hooks.json` for a team, and an
+	// at project scope, `<root>/.cursor/managed/active-team-hooks/hooks.json`
+	// for a team — the path was `team-hooks/hooks.json` here until two live
+	// bundles refuted it (docs/reviews/W4-CURSOR-HOOKS-verify-1.md §finding 2:
+	// `n.join(e, ".cursor", "managed", "active-team-hooks", "hooks.json")` in
+	// both) — and an
 	// enterprise document at /Library/Application Support/Cursor/hooks.json on
 	// macOS and /etc/cursor/hooks.json on Linux. It also reads the Claude
 	// settings files as hook sources; those are separate documents and nothing
