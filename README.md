@@ -38,6 +38,7 @@ found and asks once before creating anything. Once a home exists, a bare `verger
 | `verger update [id]` | re-apply the spec's packages |
 | `verger status` | show the package × host matrix |
 | `verger outdated` | list version skew and missing cells |
+| `verger info <id>` | show what one package is and where it is installed |
 | `verger why <id> <host>` | explain one cell: strategy, version, blockers |
 | `verger adopt <host:ref>` | adopt a package a host installed natively |
 | `verger enable <id>` | turn one package's delivery on in the spec |
