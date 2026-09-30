@@ -74,6 +74,16 @@ func (a *app) runWatch(ctx context.Context, owner string, debounce time.Duration
 		return err
 	}
 
+	// The watcher says which home it took, before it starts. That home is what
+	// decides whether verger and beadle share one lease or run two watchers in
+	// two roots, and a silent start leaves the operator no way to tell. The
+	// line goes to stderr with the rest of the progress, so
+	// `verger watch > log` still captures the events alone.
+	if _, err := fmt.Fprintf(a.errW, "watching home %s (source: %s)\n",
+		client.Home().Root(), client.Home().Source()); err != nil {
+		return err
+	}
+
 	opts := verger.WatchOptions{
 		Paths:    paths,
 		Owner:    owner,
