@@ -201,9 +201,20 @@ func TestKiloLooseGolden(t *testing.T) {
 				So(web["url"], ShouldEqual, "https://example.com/mcp")
 			})
 
-			Convey("Then the hooks are skipped with the runtime reason", func() {
-				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "T2.3")
+			Convey("Then the hooks are skipped, and the note says why", func() {
+				So(err, ShouldBeNil)
+				So(res.Strategy, ShouldEqual, host.Loose)
+
+				// Kilo has no declarative hook surface, and a module in its
+				// plugin directory IS a hook it runs — so a blocked host gets
+				// no module either, and never a cell claiming the hooks.
 				So(fileExists(filepath.Join(kiloConfigDir(home), "hooks.json")), ShouldBeFalse)
+				So(fileExists(filepath.Join(kiloConfigDir(home), "plugin", "verger-acme-caveman.ts")), ShouldBeFalse)
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "hook(s) skipped")
+				// The note says WHY, and the reason changes as the evidence does;
+				// what must hold is that a skipped hook is always accompanied by a
+				// reason at all - an unexplained skip is the failure mode.
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "hook(s) skipped: ")
 			})
 		})
 	})

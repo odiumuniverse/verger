@@ -21,22 +21,36 @@ import (
 // comment said there was no XDG relocation "there, and none here", which
 // stopped being true when hostpath started modelling it.
 const (
-	wordKilo           = "kilo"
-	kiloDirName        = "kilo"
-	kiloJSONC          = "kilo.jsonc"
-	kiloJSON           = "kilo.json"
-	kiloLegacyDirName  = ".kilo"
+	wordKilo    = "kilo"
+	kiloDirName = "kilo"
+	// kiloPluginSubdir is the directory Kilo scans for plugin modules.
+	kiloPluginSubdir  = "plugin"
+	kiloJSONC         = "kilo.jsonc"
+	kiloJSON          = "kilo.json"
+	kiloLegacyDirName = ".kilo"
+	// kiloHooksBlocked is the reason a hook component is skipped. The shim
+	// placement exists and is proven to LOAD; what is not yet proven is that a
+	// hook delivered through it EXECUTES, so the host stays blocked and says
+	// so rather than reporting hooks as delivered.
+	// kiloHooksBlocked is the reason a hook component is skipped, and it is a
+	// mechanism fact, not an unfinished probe. kilo has exactly ONE plugin
+	// mechanism - `kilo plugin <module>` - and its positional is an NPM MODULE
+	// NAME: it installs from the registry and updates config. verger builds local
+	// modules and cannot put one there. The fallback, a loose file under
+	// .config/kilo/plugin, is never loaded: a probe module there produced no
+	// output at all under `kilo --mode rpc`, with and without a package.json
+	// beside it. So neither the extension bus nor the event names are known.
+	kiloHooksBlocked = "kilo's only plugin mechanism is `kilo plugin <module>`, which takes an NPM MODULE NAME " +
+		"and updates config - verger cannot register a locally-built module through it, and a loose module written to " +
+		".config/kilo/plugin is never loaded (probed on kilo 7.8.1: no probe output at all, with and without a " +
+		"package.json beside it), so its extension bus and event names are unknown and no delivered hook can be " +
+		"shown executing (NIGHT-pR-8)"
 	kiloSkillsDir      = "skills"
 	kiloAgentsDir      = "agents"
 	kiloCommandsDir    = "commands"
 	kiloMCPPrefix      = "mcp."
 	kiloVoiceCheckHint = "kilo mcp list"
 )
-
-// kiloHooksBlocked is the reason a hook component is skipped: Kilo's plugin
-// system is the v1 OpenCode one (`plugin: [...]` in the legacy opencode.json
-// carries hooks and tools only), and the module runtime arrives with T2.3.
-const kiloHooksBlocked = "the Kilo runtime adapter arrives with T2.3; a Kilo plugin is a module in the v1 plugin list, not a file"
 
 // kilo is the Kilo Code adapter. Its write surfaces are the host's own user
 // files — skills, agents, commands and the MCP container of kilo.jsonc
@@ -144,13 +158,25 @@ func kiloSpec(userHome string) looseSpec {
 	dir := kiloConfigDir(userHome)
 
 	return looseSpec{
-		host:          Kilo,
-		binary:        wordKilo,
-		home:          userHome,
-		skillsDir:     filepath.Join(dir, kiloSkillsDir),
-		agentsDir:     filepath.Join(dir, kiloAgentsDir),
-		commandsDir:   filepath.Join(dir, kiloCommandsDir),
-		hooksBlocked:  kiloHooksBlocked,
+		host:         Kilo,
+		binary:       wordKilo,
+		home:         userHome,
+		skillsDir:    filepath.Join(dir, kiloSkillsDir),
+		agentsDir:    filepath.Join(dir, kiloAgentsDir),
+		commandsDir:  filepath.Join(dir, kiloCommandsDir),
+		hooksBlocked: kiloHooksBlocked,
+		// Kilo loads every module in its plugin directory (live on 7.8.1),
+		// so the shim is one file there — no config entry, no package.json.
+		// The placement is written and pinned, but the block stays until a
+		// live test shows a delivered hook EXECUTING: a module that loads
+		// and a hook that runs are different claims, and only the first is
+		// proven.
+		runtimePlugin: &runtimePluginSpec{
+			host:    string(Kilo),
+			dialect: "v1",
+			layout:  layoutModule,
+			surface: func(home, _ string) string { return filepath.Join(kiloConfigDir(home), kiloPluginSubdir) },
+		},
 		renderAgent:   func(agent render.Agent, _ string) ([]byte, error) { return agent.OpenCodeMarkdown() },
 		renderCommand: func(cmd render.Command) ([]byte, error) { return cmd.OpenCodeMarkdown() },
 		mcpConfig: &mcpConfigSpec{

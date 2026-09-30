@@ -40,14 +40,14 @@ const (
 	openCodeMCPPrefixV1 = "mcp."
 
 	openCodeMCPKey = "mcp"
-)
 
-// openCodeHooksBlocked is the reason a hook component is skipped: OpenCode
-// carries hooks in plugin modules, not in files, and the module runtime
-// arrives with T2.3. The same reason applies to both dialects — a v1
-// `plugin: [...]` entry carries hooks and tools only, a v2 `plugins: [...]`
-// entry needs a rendered plugin package.
-const openCodeHooksBlocked = "the OpenCode runtime adapter arrives with T2.3; OpenCode hooks are plugin modules, not files"
+	// openCodeHooksBlocked is the reason a hook component is skipped. opencode has
+	// no session-start event to register on: the v2 event table carries null for
+	// session-start, so a delivered module has nothing to fire on except a tool
+	// call, and a tool call needs a model. The note names WHICH missing event, so
+	// the block lifts the moment one exists (NIGHT-pR-8).
+	openCodeHooksBlocked = "opencode has no session-start event to register on: the v2 event table carries null for session-start, so a delivered module fires only on a tool call, which needs a model (NIGHT-pR-8)"
+)
 
 // Host output markers captured live on opencode 2.0.18.
 const (
@@ -67,6 +67,16 @@ const (
 	openCodeV1 opencodeDialect = iota
 	openCodeV2
 )
+
+// String names the dialect the way the runtime's event table spells it, so
+// the shim is rendered for the host that will load it.
+func (d opencodeDialect) String() string {
+	if d == openCodeV1 {
+		return "v1"
+	}
+
+	return "v2"
+}
 
 // opencode is the OpenCode adapter. OpenCode 2.x hosts the plugin manager
 // itself — `opencode plugin add|list|remove` (live-verified on 2.0.18, see
@@ -201,12 +211,12 @@ func (h *opencode) installedMajor(ctx context.Context) (int, bool) {
 // mcpPrefix resolves the MCP container of the config document: the container
 // the file already declares (so a delivery never grows a second one next to
 // the servers the host reads), else the dialect's default.
-func (h *opencode) mcpPrefix(ctx context.Context, home string) string {
+func (h *opencode) mcpPrefix(home string, dialect opencodeDialect) string {
 	if prefix, ok := openCodeDeclaredMCPPrefix(openCodeConfigFile(openCodeConfigDir(home))); ok {
 		return prefix
 	}
 
-	if h.dialect(ctx, home) == openCodeV2 {
+	if dialect == openCodeV2 {
 		return openCodeMCPPrefixV2
 	}
 
@@ -268,17 +278,29 @@ func openCodeDeclaredMCPPrefix(path string) (string, bool) {
 // the container the dialect declares.
 //
 //nolint:dupl // kilo and OpenCode share the OpenCode dialect; only the config roots differ
-func openCodeSpec(userHome, prefix string) looseSpec {
+func openCodeSpec(userHome, prefix, dialect string) looseSpec {
 	dir := openCodeConfigDir(userHome)
 
 	return looseSpec{
-		host:          OpenCode,
-		binary:        wordOpenCode,
-		home:          userHome,
-		skillsDir:     filepath.Join(dir, openCodeSkillsDir),
-		agentsDir:     filepath.Join(dir, openCodeAgentsDir),
-		commandsDir:   filepath.Join(dir, openCodeCommandDir),
-		hooksBlocked:  openCodeHooksBlocked,
+		host:         OpenCode,
+		binary:       wordOpenCode,
+		home:         userHome,
+		skillsDir:    filepath.Join(dir, openCodeSkillsDir),
+		agentsDir:    filepath.Join(dir, openCodeAgentsDir),
+		commandsDir:  filepath.Join(dir, openCodeCommandDir),
+		hooksBlocked: openCodeHooksBlocked,
+		// OpenCode has no declarative hook document: it runs hooks by
+		// importing a module, so the shim is that module. The placement is
+		// proven to LOAD against real 2.0.18, and that is all: no test here
+		// shows a delivered hook EXECUTING, so the host stays blocked rather
+		// than reporting hooks as delivered.
+		runtimePlugin: &runtimePluginSpec{
+			host:       string(OpenCode),
+			dialect:    dialect,
+			layout:     layoutDirectory,
+			surface:    func(home, _ string) string { return openCodeConfigDir(home) },
+			configFile: openCodeConfigFile,
+		},
 		renderAgent:   func(agent render.Agent, _ string) ([]byte, error) { return agent.OpenCodeMarkdown() },
 		renderCommand: func(cmd render.Command) ([]byte, error) { return cmd.OpenCodeMarkdown() },
 		mcpConfig: &mcpConfigSpec{
@@ -294,7 +316,12 @@ func openCodeSpec(userHome, prefix string) looseSpec {
 func (h *opencode) deliverLoose(ctx context.Context, home string, d Delivery) (Result, error) {
 	userHome := h.base.effectiveHome(home)
 
-	return deliverSurface(ctx, h.base, openCodeSpec(userHome, h.mcpPrefix(ctx, userHome)), d)
+	// One probe answers both questions: the dialect decides the plugin shape
+	// and the MCP container, and a delivery that asks the host twice for the
+	// same answer is a delivery that can be slow for no reason.
+	dialect := h.dialect(ctx, userHome)
+
+	return deliverSurface(ctx, h.base, openCodeSpec(userHome, h.mcpPrefix(userHome, dialect), dialect.String()), d)
 }
 
 // openCodeInstall is one native plugin install.

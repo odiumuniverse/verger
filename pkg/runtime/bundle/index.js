@@ -4,6 +4,21 @@
 import { appendFileSync, readFileSync as readFileSync2, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+// src/bus.ts
+function busOf(api) {
+  const ctx = api ?? {};
+  if (typeof ctx.on === "function") {
+    return ctx;
+  }
+  for (const candidate of [ctx.events, ctx.pi]) {
+    const bus = candidate;
+    if (typeof bus?.on === "function") {
+      return bus;
+    }
+  }
+  return void 0;
+}
+
 // events.json
 var events_default = {
   schema: 1,
@@ -87,6 +102,9 @@ var claudeEvents = {
   SessionStart: "session-start",
   Notification: "notification"
 };
+function canonicalEvent(name) {
+  return claudeEvents[name] ?? name;
+}
 function claudeEvent(canon) {
   for (const [name, value] of Object.entries(claudeEvents)) {
     if (value === canon) {
@@ -414,8 +432,19 @@ var Runtime = class {
   get packageID() {
     return this.#manifest?.package ?? "unknown";
   }
+  // #hooks is the manifest's hooks in CANONICAL event names. The manifest
+  // speaks the Claude dialect — what a package author writes and what
+  // `pkg/manifest` stores — while everything downstream (which handler to
+  // register, which hook a received event selects) is keyed by the canonical
+  // name. Comparing the two without normalising meant `SessionStart` never
+  // matched `session-start`: no handler was registered, no candidate was ever
+  // selected, and the plugin loaded and wrote its heartbeat while doing
+  // nothing at all.
   #hooks() {
-    return this.#manifest?.hooks ?? [];
+    return (this.#manifest?.hooks ?? []).map((hook) => ({
+      ...hook,
+      event: canonicalEvent(hook.event)
+    }));
   }
   // handle runs every hook of one canonical event for one tool call and folds
   // their verdicts: any deny blocks.
@@ -427,6 +456,13 @@ var Runtime = class {
       (hook) => hook.event === canon && matcherMatches(hook.matcher, hostTool, canonical === "" ? null : canonical)
     );
     const blocking = hookTable.events[canon]?.blocking === true;
+    this.#log({
+      event: canon,
+      tool: hostTool,
+      canonical,
+      phase: "received",
+      candidates: candidates.length
+    });
     if (this.#lockReason !== "") {
       const reason = `verger: ${this.#lockReason}`;
       this.#log({ event: canon, tool: hostTool, decision: blocking ? "deny" : "allow", reason });
@@ -437,7 +473,13 @@ var Runtime = class {
       this.#log({ event: canon, tool: hostTool, decision: "deny", reason });
       return { block: true, reason };
     }
+    if (candidates.length === 0) {
+      this.#log({ event: canon, tool: hostTool, phase: "no-match", decision: "allow" });
+    } else {
+      this.#log({ event: canon, tool: hostTool, phase: "matched", hooks: candidates.length });
+    }
     for (const hook of candidates) {
+      this.#log({ event: canon, tool: hostTool, phase: "launched", command: hook.command });
       const result = await runHook(hook, this.#payload(canon, hostTool, input), {
         cwd: this.#options.cwd,
         env: this.#options.env
@@ -446,8 +488,11 @@ var Runtime = class {
       this.#log({
         event: canon,
         tool: hostTool,
+        phase: "exit",
         command: hook.command,
         code: result.code,
+        timedOut: result.timedOut,
+        spawnError: result.spawnError,
         decision: verdict.block ? "deny" : "allow",
         reason: verdict.reason
       });
@@ -512,12 +557,13 @@ var Runtime = class {
   // pi registers the runtime on a Pi ExtensionAPI: tool_call blocks by
   // returning { block, reason }, the other events only observe.
   pi(api) {
+    const bus = busOf(api);
     for (const canon of Object.keys(hookTable.events)) {
       const key = hookKey("pi", canon);
       if (key === null || !this.#hooks().some((hook) => hook.event === canon)) {
         continue;
       }
-      api.on?.(key, async (event) => {
+      bus?.on?.(key, async (event) => {
         const verdict = await this.handle(canon, event ?? {});
         if (verdict.block && canon === "pre-tool") {
           return { block: true, reason: verdict.reason };
@@ -534,6 +580,10 @@ async function load(options) {
     server: () => runtime.server()
   };
 }
+function piDispatcher(options) {
+  const runtime = new Runtime(options);
+  return (canon, event) => runtime.handle(canon, event ?? {});
+}
 function piExtension(options) {
   const runtime = new Runtime(options);
   return (api) => {
@@ -541,6 +591,7 @@ function piExtension(options) {
   };
 }
 export {
+  busOf,
   canonicalTool,
   claudeEvent,
   decision,
@@ -550,6 +601,7 @@ export {
   hookTable,
   load,
   matcherMatches,
+  piDispatcher,
   piExtension,
   readManifest,
   runHook,

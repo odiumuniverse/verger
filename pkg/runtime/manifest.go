@@ -45,7 +45,11 @@ type Manifest struct {
 // manifest. scripts are the hook script files the caller resolved; their
 // digests are recorded here and re-checked by the runtime on every load.
 func NewManifest(pkg, version string, hooks []manifest.Hook, scripts map[string]digest.Hash) Manifest {
-	out := Manifest{Schema: ManifestSchema, Package: pkg, Version: version}
+	// Both lists start empty rather than nil: the bundle iterates them
+	// unconditionally, and a nil slice serializes as JSON `null`, which
+	// locked the runtime with "scripts is not iterable" — while the module
+	// still loaded and the delivery still reported success.
+	out := Manifest{Schema: ManifestSchema, Package: pkg, Version: version, Hooks: []Hook{}, Scripts: []Script{}}
 
 	for _, hook := range hooks {
 		out.Hooks = append(out.Hooks, Hook{

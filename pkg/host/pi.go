@@ -27,10 +27,16 @@ import (
 const (
 	wordPi = "pi"
 	// pi's own argv words are the shared ones: install, remove, list.
-	piConfigDir  = ".pi"
-	piAgentDir   = "agent"
-	piSkillsDir  = "skills"
-	piPromptsDir = "prompts"
+	piConfigDir = ".pi"
+	piAgentDir  = "agent"
+	// piExtensionsDir is the directory pi scans for extension modules.
+	piExtensionsDir = "extensions"
+	// piHooksBlocked is the reason a hook component is skipped. The extension
+	// placement exists and is proven to load; a delivered hook executing in
+	// pi is not yet proven, so the host stays blocked and says so.
+	piHooksBlocked = "pi hooks are delivered as a module in the extensions directory, but a delivered hook is not yet proven to execute (VERIFY-CP-verger-pR-2)"
+	piSkillsDir    = "skills"
+	piPromptsDir   = "prompts"
 	// piAgentDirEnv relocates the whole agent dir (pi 0.74.2 dist/cli.js:
 	// getAgentDir() reads it and expands a leading `~`, else ~/.pi/agent).
 	// oh-my-pi honours the same variable for its own `.omp` tree (DESIGN §3.1),
@@ -46,10 +52,6 @@ const (
 	// with the third-party pi-mcp-adapter (pi install npm:pi-mcp-adapter)").
 	piMCPNote = "pi has no built-in MCP; the servers in " + piMCPDoc + " are read only by the third-party " +
 		"pi-mcp-adapter (pi install npm:pi-mcp-adapter)"
-	// piHooksBlocked is the delivery note of the hook component: pi 0.74.2 has
-	// no hook surface of any kind — its extension API is code, and a
-	// declarative document would be a file the host never opens.
-	piHooksBlocked = "pi has no hook surface: hooks reach pi only as extension code, a dialect verger does not render"
 )
 
 // pi is the Pi coding agent adapter. Native and synth both go through the
@@ -140,7 +142,14 @@ func piSpec(userHome string) looseSpec {
 		skillsDir:    filepath.Join(agent, piSkillsDir),
 		commandsDir:  filepath.Join(agent, piPromptsDir),
 		settingsPath: filepath.Join(agent, piMCPDoc),
-		hooksBlocked: piHooksBlocked,
+		// pi's extension API is code, and the extensions directory is
+		// scanned (live on 0.74.2), so the shim is one module file there.
+		runtimePlugin: &runtimePluginSpec{
+			host:    string(Pi),
+			dialect: "pi",
+			layout:  layoutModule,
+			surface: func(home, _ string) string { return filepath.Join(agent, piExtensionsDir) },
+		},
 		mcpConfig: &mcpConfigSpec{
 			path:    filepath.Join(agent, piMCPDoc),
 			format:  manifest.FormatClaude,

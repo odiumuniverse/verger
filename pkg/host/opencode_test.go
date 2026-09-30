@@ -394,12 +394,19 @@ func TestOpenCodeLooseGolden(t *testing.T) {
 				So(web["headers"], ShouldResemble, map[string]any{"Authorization": "Bearer web-token"})
 			})
 
-			Convey("Then the hooks are skipped with the runtime reason", func() {
+			Convey("Then the hooks ride in a plugin, and no hook document is written", func() {
 				So(err, ShouldBeNil)
-				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "T2.3")
+				So(res.Strategy, ShouldEqual, host.Loose)
 
+				// OpenCode has no declarative hook surface: the hooks are
+				// delivered as a module it imports, so a hooks document in
+				// the config root would be a file the host never reads.
 				_, readErr := os.Stat(filepath.Join(dir, "hooks.json"))
 				So(errors.Is(readErr, os.ErrNotExist), ShouldBeTrue)
+				// A plugin module IS a hook opencode runs, and a delivered hook
+				// executing there is not yet proven, so the blocked host writes
+				// none of it.
+				So(fileExists(filepath.Join(dir, "verger-acme-caveman", "index.js")), ShouldBeFalse)
 			})
 		})
 	})
@@ -521,10 +528,14 @@ func TestOpenCodeHooksRefusedWithoutConsent(t *testing.T) {
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: openCodePackage(t), Strategy: host.Loose})
 
 		Convey("When it is delivered", func() {
-			Convey("Then no hook document exists and the note names the reason", func() {
+			Convey("Then no hook document and no plugin exist without consent", func() {
 				So(err, ShouldBeNil)
-				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "T2.3")
+				So(res.Strategy, ShouldEqual, host.Loose)
 				So(fileExists(filepath.Join(dir, "hooks.json")), ShouldBeFalse)
+
+				// Without consent there is no shim either: a plugin the host
+				// loads would run hooks the user has not agreed to.
+				So(fileExists(filepath.Join(dir, "verger-acme-caveman")), ShouldBeFalse)
 			})
 		})
 	})

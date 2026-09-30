@@ -132,25 +132,62 @@ func renderPiShim(opts ShimOptions, table Table) ([]byte, error) {
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "const RUNTIME = %s\n", mustJSON(BundlePath(opts.RuntimeDir)))
 
-	piKeys := table.BlockingKeys("pi")
-
 	b.WriteString(`
 // The fallback has no imports of its own: it must work when the runtime
 // cannot be imported at all.
 const fail = () => ({ block: true, reason: "verger: runtime unavailable for ` + opts.Package + `" })
 
+// Registration is synchronous and the runtime is not. The host fires its
+// first event while this function is still on the stack — pi emits
+// session_start with reason "startup" the moment the extension loads — so a
+// handler that only appears after the dynamic import resolves misses it, and
+// the miss is invisible: the module loads, the heartbeat is written, and no
+// hook ever runs. Every key of the dialect is therefore registered before this
+// function returns, and each waits for the runtime.
 export default function (pi) {
-  import(RUNTIME)
-    .then((runtime) => runtime.piExtension(OPTIONS)(pi))
-    .catch(() => {
-      for (const key of ` + mustJSON(piKeys) + `) {
-        pi?.on?.(key, fail)
-      }
+  let dispatch = null
+  const ready = import(RUNTIME).then((runtime) => { dispatch = runtime.piDispatcher(OPTIONS) })
+
+  // The bus is resolved HERE, synchronously, and not after the import: the
+  // host fires session_start while this function is still on the stack, so a
+  // shim that waited for the module to resolve registers too late and misses
+  // it. It is therefore the one piece of host knowledge the generated code
+  // cannot borrow from the runtime - and it is pinned from both sides, by
+  // TestShimBusResolutionAgreesWithTheRuntime here and by the node test over
+  // the same three contexts, so a change to one without the other fails.
+  //
+  // The shapes (probed live on omp 18.4.3): pi hands the extension the API
+  // itself with on() on it; omp hands a context of
+  // {pi, extension, runtime, cwd, events, ...} with no top-level on, where
+  // pi's API is a module namespace and the bus is under events. Registering on
+  // the context itself is a silent no-op.
+  const bus = typeof pi?.on === "function" ? pi : pi?.events ?? pi?.pi
+
+  for (const [key, canon] of ` + mustJSON(piEntries(table)) + `) {
+    bus?.on?.(key, async (event) => {
+      await ready
+      await dispatch(canon, event)
     })
+  }
 }
 `)
 
 	return []byte(b.String()), nil
+}
+
+// piEntries pairs every host key of the pi dialect with the canonical event
+// the runtime dispatches under. The shim needs both: the key to register, and
+// the canonical name to hand the dispatcher.
+func piEntries(table Table) [][2]string {
+	var entries [][2]string
+
+	for _, canon := range table.CanonicalEvents() {
+		if key, ok := table.HookKey("pi", canon); ok {
+			entries = append(entries, [2]string{key, canon})
+		}
+	}
+
+	return entries
 }
 
 // shimOptionsDoc is the options object the shim hands the runtime.

@@ -32,7 +32,11 @@ sign: build
 clean:
 	rm -rf bin/ coverage.out coverage.html
 
-test:
+# The runtime bundle's tests run the BUILT artifact, not the sources - they are
+# the only tests that can see a build that broke the published shape. They were
+# reachable only as `make test-runtime`, which nothing calls, so they silently
+# did not run and every mutation to them survived.
+test: test-runtime
 	$(GO) test -race ./...
 
 test-short:

@@ -46,12 +46,28 @@ const (
 	// (docs/reviews/omp-grammar.probe.log; OMPDOC
 	// plugin-manager-installer-plumbing.md#lock-state-management-details).
 	ompPluginLock = ".omp-plugin.verger.lock"
-	// ompHooksBlocked is the delivery note of the declarative hook component:
-	// omp has no hook document at all, only TS/JS modules under
-	// hooks/{pre,post}/, which the payload carries as host modules instead
-	// (hookModulesDir).
-	ompHooksBlocked = "omp hooks are TS/JS modules under hooks/{pre,post}/ and have no declarative surface"
-	ompHooksDir     = "hooks" // hook modules, below the agent dir: hooks/{pre,post}/<name>.{ts,js}
+	ompHooksDir   = "hooks" // hook modules, below the agent dir: hooks/{pre,post}/<name>.{ts,js}
+	// ompExtensionsDir is the directory omp scans for extension modules.
+	ompExtensionsDir = "extensions"
+	// ompHooksBlocked is the reason a hook component is skipped, and it is now a
+	// measurement rather than a gap.
+	//
+	// PROVEN on a live omp 18.4.3, with a real authenticated model call
+	// (credentials copied into an isolated HOME from ~/.omp/agent/agent.db,
+	// keychain untouched - omp's keychain strings are browser automation, not
+	// provider auth): the model answered, and NOTHING fired. Fourteen lifecycle
+	// names were registered on omp's own EventEmitter during that live session
+	// and none of them fired.
+	//
+	// PROVEN separately: registration itself is fine. An extension that
+	// registers on that bus has its handler invoked when the bus fires, and the
+	// dispatched hook runs - TestLiveOmpDeliversARunningHookOnItsOwnBus passes.
+	//
+	// So the missing half is not credentials, not timing, and not our mapping:
+	// omp's extension API exposes no lifecycle event stream an extension could
+	// subscribe to. A delivered module would load, register, and wait forever.
+	// Saying "delivered" would claim a hook runs when nothing can ever fire it.
+	ompHooksBlocked = "omp's extension API has no lifecycle event stream: during a real authenticated model call (NIGHT-pR-11), fourteen lifecycle names registered on omp's own EventEmitter fired NONE, while registration itself is proven to work. A delivered module would load, register, and wait forever, so no hook can be claimed delivered here"
 	// ompDefaultProfile is the profile name the host treats as "no profile".
 	ompDefaultProfile = "default"
 	// ompHookProbePrompt and ompHookProbeTime bound the only load check omp
@@ -143,7 +159,28 @@ func ompSpec(userHome string) looseSpec {
 		commandsDir:  filepath.Join(agentDir, ompCommandsDir),
 		rulesDir:     filepath.Join(agentDir, ompRulesDir),
 		settingsPath: filepath.Join(agentDir, ompMCPDoc),
+		// omp has no hook document, and its hooks are modules — so the shim
+		// is one module in the extensions directory it scans (probed live on
+		// 18.4.3). The payload's own pre/post hook modules keep their
+		// separate path below.
+		// The shim is placed and the module loads, but omp does not fire a
+		// session event at boot the way pi does, so no delivered hook has been
+		// seen running there. Blocked until one has.
 		hooksBlocked: ompHooksBlocked,
+		// The shim is placed, the module loads and the runtime imports, but
+		// no delivered hook has been seen executing: omp hands the extension
+		// a different context, and where its event bus lives and what it
+		// emits is not yet established. Blocked until one has.
+		runtimePlugin: &runtimePluginSpec{
+			host: string(Omp),
+			// omp is the same lineage as pi — the same PI_* environment,
+			// the same `--mode rpc` extension host, the same extensions
+			// directory — so its hook vocabulary is pi's. The runtime's
+			// table names the dialect it maps, not the host it came from.
+			dialect: "pi",
+			layout:  layoutModule,
+			surface: func(home, _ string) string { return filepath.Join(ompAgentDir(home), ompExtensionsDir) },
+		},
 		// The declarative hook document has no omp surface (hooksBlocked), but
 		// the payload's host modules do: runtime/omp/hooks/{pre,post}/<name>.ts.
 		hookModulesDir: filepath.Join(agentDir, ompHooksDir),

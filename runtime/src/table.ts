@@ -42,6 +42,14 @@ const claudeEvents: Record<string, string> = {
   Notification: "notification",
 }
 
+// canonicalEvent maps a manifest's event name onto the canonical one. An
+// unknown name is passed through rather than dropped: a hook the table has
+// never heard of still has to be registrable, or a host that adds an event
+// first would silently lose the hook that uses it.
+export function canonicalEvent(name: string): string {
+  return claudeEvents[name] ?? name
+}
+
 // claudeEvent is the reverse map, for the hook stdin payload the scripts read.
 export function claudeEvent(canon: string): string {
   for (const [name, value] of Object.entries(claudeEvents)) {

@@ -355,15 +355,66 @@ func TestShimGolden(t *testing.T) {
 		}, table)
 
 		Convey("When it is rendered", func() {
-			Convey("Then it is a Pi extension with the tool_call deny fallback", func() {
+			Convey("Then it registers every dialect key synchronously and defers only the call", func() {
 				So(renderErr, ShouldBeNil)
 
 				shim := string(data)
 				So(shim, ShouldContainSubstring, "export default function (pi)")
-				So(shim, ShouldContainSubstring, "runtime.piExtension(OPTIONS)(pi)")
+				So(shim, ShouldContainSubstring, "runtime.piDispatcher(OPTIONS)")
+
+				// The registration loop is what has to be synchronous: the
+				// host fires session_start while this function is still on
+				// the stack, so a handler that only appears after the import
+				// resolves misses it, and the miss is invisible.
+				So(shim, ShouldContainSubstring, "bus?.on?.(key")
+
+				// omp hands an extension {pi, extension, runtime, …} with no
+				// top-level on, so the shim resolves the bus before it
+				// registers: on the context itself it is a silent no-op.
+				So(shim, ShouldContainSubstring, `typeof pi?.on === "function" ? pi : pi?.events ?? pi?.pi`)
+
+				So(shim, ShouldContainSubstring, "await ready")
+
+				// Both keys of the pi dialect, blocking or not: a hook on a
+				// non-blocking event still has to be registered to run.
 				So(shim, ShouldContainSubstring, `"tool_call"`)
+				So(shim, ShouldContainSubstring, `"session_start"`)
 				So(shim, ShouldContainSubstring, "block: true")
 			})
+		})
+	})
+}
+
+// TestShimBusResolutionAgreesWithTheRuntime is the guard on the one piece of
+// host knowledge the shim cannot borrow: the bus must be resolved
+// synchronously, because the host fires its first event while the extension's
+// default export is still on the stack. runtime/bus.ts holds the same shapes
+// for the runtime's own piExtension, and the node test runs both over the same
+// three contexts - so changing one without the other fails there.
+func TestShimBusResolutionAgreesWithTheRuntime(t *testing.T) {
+	table, tableErr := runtime.LoadTable()
+
+	Convey("Given a renderable pi shim", t, func() {
+		So(tableErr, ShouldBeNil)
+
+		shim, err := runtime.RenderShim(runtime.ShimOptions{
+			Host: "pi", Dialect: "pi", Package: "acme/probe", Version: "1.0.0",
+			RuntimeDir: "/store/runtime/pi/0.1.0", ManifestPath: "/store/runtime/pi/0.1.0/package.json",
+			ManifestSHA256: "abc123", Consent: "abc", LogPath: "/store/runtime/pi/verger-runtime.log",
+		}, table)
+		So(err, ShouldBeNil)
+		So(string(shim), ShouldContainSubstring, `const bus = typeof pi?.on === "function" ? pi : pi?.events ?? pi?.pi`)
+
+		Convey("Then the dialect is registered on the resolved bus, never on the context", func() {
+			// Registering on the context is the original bug and it is silent:
+			// omp's context has no top-level on, so the optional call is a no-op
+			// and the hook simply never runs.
+			So(string(shim), ShouldNotContainSubstring, "pi?.on?.(")
+			So(string(shim), ShouldContainSubstring, "bus?.on?.(key,")
+
+			// and the resolution precedes the registration: done after the import
+			// it would miss the host's first event.
+			So(strings.Index(string(shim), "const bus =") < strings.Index(string(shim), "for (const [key, canon]"), ShouldBeTrue)
 		})
 	})
 }
@@ -446,6 +497,42 @@ func TestBundleIsSelfContained(t *testing.T) {
 			Convey("Then it never requires anything at runtime", func() {
 				So(bundle, ShouldNotContainSubstring, "require(")
 			})
+		})
+	})
+}
+
+// TestTheBundleTestsAreActuallyRunnable pins the wiring, not the code: the
+// runtime's own tests run the BUILT bundle and are the only tests that can see
+// a build which broke the published shape. Their npm script used a glob this
+// node does not expand, so `npm test` found no file at all, exited quietly, and
+// every mutation to the dispatch log survived a green gate. A test that only
+// exists but never runs is not a test.
+func TestTheBundleTestsAreActuallyRunnable(t *testing.T) {
+	Convey("Given the runtime package", t, func() {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "runtime", "package.json"))
+		So(err, ShouldBeNil)
+
+		var doc struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+
+		So(json.Unmarshal(raw, &doc), ShouldBeNil)
+		So(doc.Scripts, ShouldContainKey, "test")
+
+		Convey("Then the test script names a path node resolves", func() {
+			// A quoted glob is the trap: node 20 takes it literally, finds
+			// nothing, and reports success.
+			test := doc.Scripts["test"]
+			So(test, ShouldNotContainSubstring, "**")
+			So(test, ShouldContainSubstring, "test/")
+		})
+
+		Convey("Then make test runs them", func() {
+			makefile, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+			So(err, ShouldBeNil)
+
+			// A target nothing calls is a target that does not run.
+			So(string(makefile), ShouldContainSubstring, "test: test-runtime")
 		})
 	})
 }

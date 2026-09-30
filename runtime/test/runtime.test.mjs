@@ -9,6 +9,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 
 import {
+  busOf,
   canonicalTool,
   decision,
   denyByDefault,
@@ -17,6 +18,7 @@ import {
   hookTable,
   load,
   matcherMatches,
+  piDispatcher,
   piExtension,
   runHook,
   verifyConsent,
@@ -367,3 +369,98 @@ function fakePiAPI() {
     },
   }
 }
+
+// The dispatch log is the only thing that distinguishes four failures that look
+// identical from outside: a hook that was never selected, one that was selected
+// but never launched, one that launched and failed, and one that ran. Each is a
+// separate line and names itself, so a missing one says which half is broken.
+test("every dispatch decision writes its own JSONL line", async () => {
+  const manifest = {
+    schema: 1,
+    package: "acme/dispatch",
+    version: "1.0.0",
+    hooks: [{ event: "pre-tool", matcher: "Bash", command: 'echo \'{"decision":"allow"}\' >/dev/null', timeout: 5 }],
+    scripts: [],
+  }
+  const file = writeManifest("dispatch", manifest)
+  const consent = hookHash(manifest.package, manifest.version, manifest.hooks)
+  const logPath = path.join(home, "dispatch.jsonl")
+
+  const options = { dialect: "pi", manifestPath: file, manifestSha: manifestSha(file), consent, logPath }
+  const pi = fakePiAPI()
+  piExtension(options)(pi)
+
+  await pi.handlers.tool_call({ toolName: "bash" })
+  // A classified tool the hook's matcher does not cover: the event arrived and
+  // nothing was selected. (An UNclassified tool is a different decision
+  // entirely - a blocking event denies it outright, below that point.)
+  await pi.handlers.tool_call({ toolName: "Read" })
+
+  const lines = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+  const phases = lines.map((entry) => entry.phase)
+
+  // The matched event: received, then matched, then launched, then exit. Each
+  // of the four is its own line, in the order the decisions are actually made.
+  assert.deepEqual(phases, ["received", "matched", "launched", "exit", "received", "no-match"])
+  assert.equal(lines[0].candidates, 1)
+  assert.equal(lines[1].hooks, 1)
+  assert.equal(lines[2].command, manifest.hooks[0].command)
+  assert.equal(lines[3].code, 0)
+  assert.equal(lines[3].decision, "allow")
+  assert.equal(lines[3].timedOut, false)
+  assert.equal(typeof lines[3].at, "string")
+
+  // The unmatched tool: same event, arrived (candidates 0), nothing selected.
+  assert.equal(lines[4].candidates, 0)
+  assert.equal(lines[5].decision, "allow")
+
+  // An unclassified tool under a NARROW matcher is not this test's business:
+  // the table's rule is that only a broad blocking matcher may refuse a tool
+  // it does not classify, so it falls through to the same no-match as above.
+  await pi.handlers.tool_call({ toolName: "NotATool" })
+  assert.equal(readFileSync(logPath, "utf8").trim().split("\n").length, 8)
+
+  // Under a broad one it is a distinct decision, written before the phases and
+  // carrying no phase at all - a refusal, not a dispatch.
+  const broad = {
+    ...manifest,
+    package: "acme/dispatch-broad",
+    hooks: [{ event: "pre-tool", matcher: "*", command: "cat > /dev/null", timeout: 5 }],
+  }
+  const broadFile = writeManifest("dispatch-broad", broad)
+  const broadLog = path.join(home, "dispatch-broad.jsonl")
+  const broadPI = fakePiAPI()
+  piExtension({
+    dialect: "pi",
+    manifestPath: broadFile,
+    manifestSha: manifestSha(broadFile),
+    consent: hookHash(broad.package, broad.version, broad.hooks),
+    logPath: broadLog,
+  })(broadPI)
+
+  await broadPI.handlers.tool_call({ toolName: "NotATool" })
+
+  const denied = JSON.parse(readFileSync(broadLog, "utf8").trim().split("\n").at(-1))
+  assert.equal(denied.phase, undefined)
+  assert.equal(denied.decision, "deny")
+  assert.match(denied.reason, /not classified/)
+})
+
+// The generated shim resolves the bus itself, synchronously, because the host
+// fires its first event while the extension's default export is still on the
+// stack. That makes it the one place host knowledge is duplicated, so both are
+// run over the same shapes here: a change to one without the other fails.
+test("the shim and the runtime resolve the same bus from every known shape", async () => {
+  // the expression the generated shim ships, verbatim
+  const shim = (pi) => (typeof pi?.on === "function" ? pi : pi?.events ?? pi?.pi)
+
+  const piAPI = { on: () => {} }
+  const ompContext = { pi: { ALL_SEGMENT_IDS: [] }, extension: {}, events: { on: () => {} }, cwd: "." }
+  const nothing = { cwd: "." }
+
+  assert.equal(busOf(piAPI), shim(piAPI))
+  assert.equal(busOf(ompContext), shim(ompContext))
+  assert.equal(busOf(ompContext), ompContext.events)
+  assert.equal(busOf(nothing), undefined)
+  assert.equal(shim(nothing), undefined)
+})

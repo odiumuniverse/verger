@@ -146,10 +146,11 @@ type looseSpec struct {
 	// record verger wrote keeps its own digest and a hand edit inside it is
 	// hands-off instead of an overwrite. nil leaves whole-document ownership.
 	hookRecordPath func(event, command string) string
-	hooksBlocked   string            // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
-	hookModulesDir string            // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
-	mcpConfig      *mcpConfigSpec    // config-document MCP surface (Codex, Gemini)
-	variables      map[string]string // host-specific braced variables (Gemini extensionPath)
+	hooksBlocked   string             // non-empty: the host has no declarative hook surface, hooks are skipped with this reason
+	runtimePlugin  *runtimePluginSpec // host that loads a rendered runtime module as a plugin
+	hookModulesDir string             // host directory of pre/post hook modules (<dir>/pre/<name>.ts); the payload's runtime hook modules are copied verbatim
+	mcpConfig      *mcpConfigSpec     // config-document MCP surface (Codex, Gemini)
+	variables      map[string]string  // host-specific braced variables (Gemini extensionPath)
 
 	// project is the trusted project root for a project-scope delivery, or
 	// "" at user scope. When it is set, projectScope rewrites the surface
@@ -450,6 +451,34 @@ type loosePlanner struct {
 
 	configs []*pendingConfig
 	missing []string
+	// prunedDirs are directories this delivery created and filled; a removal
+	// that empties one removes it too, so the host's config root is left as it
+	// was found.
+	prunedDirs []string
+}
+
+// planSurfaces runs the payload steps in canonical order: the components, then
+// the hook surface of this host (a declarative document, a module directory, or
+// a rendered runtime plugin), then the MCP surface. The order is what makes a
+// plan reviewable, so it lives in one place rather than at the call site.
+func (p *loosePlanner) planSurfaces(ctx context.Context) error {
+	if err := p.components(); err != nil {
+		return err
+	}
+
+	if err := p.hooks(); err != nil {
+		return err
+	}
+
+	if err := p.hookModules(); err != nil {
+		return err
+	}
+
+	if err := p.runtimePlugin(ctx); err != nil {
+		return err
+	}
+
+	return p.mcp(ctx)
 }
 
 // planLoose reads the payload, rewrites variables, resolves secrets and checks
@@ -489,19 +518,7 @@ func planLoose(ctx context.Context, base *Base, spec looseSpec, d Delivery) (*lo
 
 	planner.dataDir = dataDirPath(base, d.Package, spec.host)
 
-	if err := planner.components(); err != nil {
-		return nil, err
-	}
-
-	if err := planner.hooks(); err != nil {
-		return nil, err
-	}
-
-	if err := planner.hookModules(); err != nil {
-		return nil, err
-	}
-
-	if err := planner.mcp(ctx); err != nil {
+	if err := planner.planSurfaces(ctx); err != nil {
 		return nil, err
 	}
 
@@ -981,6 +998,13 @@ func (p *loosePlanner) hooks() error {
 	if p.spec.hooksBlocked != "" {
 		p.note("%d hook(s) skipped: %s", len(p.pkg.Hooks), p.spec.hooksBlocked)
 
+		return nil
+	}
+
+	// A host that loads hooks as a module it imports has no document for
+	// verger to edit: runtimePlugin places the shim that carries them, under
+	// the same policy gate as any other hook delivery.
+	if p.spec.runtimePlugin != nil {
 		return nil
 	}
 

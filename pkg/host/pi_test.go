@@ -178,6 +178,9 @@ func TestPiLooseGolden(t *testing.T) {
 			Convey("Then skills, prompts, the rule wrapper and mcp.json land; nothing else", func() {
 				So(err, ShouldBeNil)
 				So(homeFiles(t, home), ShouldResemble, []string{
+					// The hooks ride in the module pi scans for, and pi is the
+					// first host with a delivered hook proven to execute.
+					".pi/agent/extensions/verger-acme-caveman.ts",
 					".pi/agent/mcp.json",
 					".pi/agent/prompts/dev.md",
 					".pi/agent/skills/alpha/SKILL.md",
@@ -191,9 +194,12 @@ func TestPiLooseGolden(t *testing.T) {
 			Convey("Then the components pi cannot take are named, never written outside the home", func() {
 				notes := strings.Join(res.Notes, "\n")
 				So(notes, ShouldContainSubstring, `agent component "reviewer" is not expressible in loose pi`)
-				So(notes, ShouldContainSubstring, "1 hook(s) skipped")
-				So(notes, ShouldContainSubstring, "pi has no hook surface")
 				So(notes, ShouldContainSubstring, "rule is delivered as a skill wrapper")
+
+				// The hooks are a module pi imports, and one is proven to run
+				// there (NIGHT-pR-7), so the host is no longer blocked.
+				So(notes, ShouldNotContainSubstring, "hook(s) skipped")
+				So(fileExists(filepath.Join(piAgentDir(home), "extensions", "verger-acme-caveman.ts")), ShouldBeTrue)
 			})
 
 			Convey("Then the MCP document is pi's override shape and the adapter note names the third-party reader", func() {

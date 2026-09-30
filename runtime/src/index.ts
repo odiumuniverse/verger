@@ -13,7 +13,8 @@
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { Dialect, Hook, Manifest } from "./table.ts"
-import { canonicalTool, claudeEvent, denyByDefault, hookKey, hookTable, matcherMatches } from "./table.ts"
+import { busOf } from "./bus.ts"
+import { canonicalEvent, canonicalTool, claudeEvent, denyByDefault, hookKey, hookTable, matcherMatches } from "./table.ts"
 import { verifyConsent, verifyManifest } from "./consent.ts"
 import { decision, runHook } from "./hooks.ts"
 
@@ -136,8 +137,19 @@ class Runtime {
     return this.#manifest?.package ?? "unknown"
   }
 
+  // #hooks is the manifest's hooks in CANONICAL event names. The manifest
+  // speaks the Claude dialect — what a package author writes and what
+  // `pkg/manifest` stores — while everything downstream (which handler to
+  // register, which hook a received event selects) is keyed by the canonical
+  // name. Comparing the two without normalising meant `SessionStart` never
+  // matched `session-start`: no handler was registered, no candidate was ever
+  // selected, and the plugin loaded and wrote its heartbeat while doing
+  // nothing at all.
   #hooks(): Hook[] {
-    return this.#manifest?.hooks ?? []
+    return (this.#manifest?.hooks ?? []).map((hook) => ({
+      ...hook,
+      event: canonicalEvent(hook.event),
+    }))
   }
 
   // handle runs every hook of one canonical event for one tool call and folds
@@ -152,6 +164,19 @@ class Runtime {
     )
 
     const blocking = hookTable.events[canon]?.blocking === true
+
+    // The two decisions that used to be silent, and are exactly the ones that
+    // make a broken dispatch diagnosable: that the event arrived at all, and
+    // that nothing matched it. Without them a host that never calls handle and
+    // a hook whose event name is wrong look identical from outside — an empty
+    // log, with the plugin loaded and its heartbeat written.
+    this.#log({
+      event: canon,
+      tool: hostTool,
+      canonical,
+      phase: "received",
+      candidates: candidates.length,
+    })
 
     if (this.#lockReason !== "") {
       // The manifest or a hook script changed since approval: no hook of this
@@ -172,7 +197,20 @@ class Runtime {
       return { block: true, reason }
     }
 
+    // The four dispatch decisions, one log line each. They used to be one
+    // line written after the hook returned, which is the wrong shape for
+    // diagnosis: a hook that never launched, a hook that launched and failed,
+    // and a hook that was never selected all look the same from outside. Each
+    // phase is its own line, so a missing one names itself.
+    if (candidates.length === 0) {
+      this.#log({ event: canon, tool: hostTool, phase: "no-match", decision: "allow" })
+    } else {
+      this.#log({ event: canon, tool: hostTool, phase: "matched", hooks: candidates.length })
+    }
+
     for (const hook of candidates) {
+      this.#log({ event: canon, tool: hostTool, phase: "launched", command: hook.command })
+
       const result = await runHook(hook, this.#payload(canon, hostTool, input), {
         cwd: this.#options.cwd,
         env: this.#options.env,
@@ -182,8 +220,11 @@ class Runtime {
       this.#log({
         event: canon,
         tool: hostTool,
+        phase: "exit",
         command: hook.command,
         code: result.code,
+        timedOut: result.timedOut,
+        spawnError: result.spawnError,
         decision: verdict.block ? "deny" : "allow",
         reason: verdict.reason,
       })
@@ -264,14 +305,15 @@ class Runtime {
 
   // pi registers the runtime on a Pi ExtensionAPI: tool_call blocks by
   // returning { block, reason }, the other events only observe.
-  pi(api: { on?: (event: string, handler: (event: unknown) => unknown) => unknown }): void {
+  pi(api: unknown): void {
+    const bus = busOf(api)
     for (const canon of Object.keys(hookTable.events)) {
       const key = hookKey("pi", canon)
       if (key === null || !this.#hooks().some((hook) => hook.event === canon)) {
         continue
       }
 
-      api.on?.(key, async (event: unknown) => {
+      bus?.on?.(key, async (event: unknown) => {
         const verdict = await this.handle(canon, (event ?? {}) as Record<string, unknown>)
         if (verdict.block && canon === "pre-tool") {
           return { block: true, reason: verdict.reason }
@@ -293,6 +335,18 @@ export async function load(options: Options): Promise<Plugin> {
   }
 }
 
+// piDispatcher is the per-event entry point a Pi shim proxies to. It is
+// SYNCHRONOUS to create: `new Runtime` only reads the options, and the
+// manifest is read on first use, so nothing here waits on I/O. That is the
+// point — the host fires session_start while the extension's default export is
+// still on the stack, so a shim that registers its handlers from a resolved
+// import misses it. The shim registers synchronously and defers only the CALL.
+export function piDispatcher(options: Options): (canon: string, event: unknown) => Promise<Decision> {
+  const runtime = new Runtime(options)
+
+  return (canon, event) => runtime.handle(canon, (event ?? {}) as Record<string, unknown>)
+}
+
 // piExtension builds the default export of a Pi extension module.
 export function piExtension(options: Options): (api: unknown) => void {
   const runtime = new Runtime(options)
@@ -304,5 +358,6 @@ export function piExtension(options: Options): (api: unknown) => void {
 
 // runtime exposes the pieces a host adapter (and its tests) needs.
 export { canonicalTool, claudeEvent, denyByDefault, hookKey, hookTable, matcherMatches } from "./table.ts"
+export { busOf } from "./bus.ts"
 export { decision, runHook } from "./hooks.ts"
 export { hookHash, verifyConsent, verifyManifest } from "./consent.ts"

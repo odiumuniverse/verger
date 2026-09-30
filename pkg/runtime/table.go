@@ -91,6 +91,22 @@ func (t Table) BlockingKeys(dialect string) []string {
 	return sortedUnique(keys)
 }
 
+// Keys returns every host hook key of a dialect, blocking or not. The shim
+// registers all of them: a hook on a non-blocking event — a session start, a
+// turn end — is a hook the host is expected to run, and registering only the
+// blocking ones left those hooks with no handler at all.
+func (t Table) Keys(dialect string) []string {
+	var keys []string
+
+	for _, canon := range t.CanonicalEvents() {
+		if key, ok := t.HookKey(dialect, canon); ok {
+			keys = append(keys, key)
+		}
+	}
+
+	return sortedUnique(keys)
+}
+
 // CanonicalEvents lists the canonical events in table order.
 func (t Table) CanonicalEvents() []string {
 	events := make([]string, 0, len(t.Events))

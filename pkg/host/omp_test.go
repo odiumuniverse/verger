@@ -411,8 +411,8 @@ Speak like caveman.
 }
 
 // TestOmpHooksSilenced pins the hook component: omp has no declarative hook
-// document at all, so consent does not matter and the cell carries the reason
-// as a delivery note.
+// document at all, so the hooks reach it only as a module — the shim in the
+// extensions directory — and never as a file in the hooks tree.
 func TestOmpHooksSilenced(t *testing.T) {
 	Convey("Given a package carrying a hook", t, func() {
 		h, _, home := ompWorld(t)
@@ -423,12 +423,20 @@ func TestOmpHooksSilenced(t *testing.T) {
 		res, err := h.Deliver(t.Context(), home, host.Delivery{Package: pkg, Strategy: host.Loose, AllowHooks: true})
 
 		Convey("When it is delivered with hooks allowed", func() {
-			Convey("Then no hook document is written and the note names the reason", func() {
+			Convey("Then the hooks are skipped, and the note says why", func() {
 				So(err, ShouldBeNil)
+
+				// `hooks/{pre,post}/` carries the payload's own host modules,
+				// not the declarative hooks: a file there would be a command
+				// hook, which is a different thing.
 				So(fileExists(filepath.Join(ompHomeAgent(home), "hooks")), ShouldBeFalse)
 				So(homeFiles(t, home), ShouldNotContain, ".omp/agent/hooks.json")
-				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "hooks/{pre,post}/")
+
+				// A module in omp's extensions directory IS a hook it runs, so
+				// the blocked host delivers none and says so.
+				So(fileExists(filepath.Join(ompHomeAgent(home), "extensions", "verger-acme-caveman.ts")), ShouldBeFalse)
 				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "1 hook(s) skipped")
+				So(strings.Join(res.Notes, "\n"), ShouldContainSubstring, "hook(s) skipped: ")
 			})
 		})
 	})
