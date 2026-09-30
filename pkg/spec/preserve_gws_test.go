@@ -600,14 +600,79 @@ func TestSaveRewritesOnlyTheTableItCouldNotSplice(t *testing.T) {
 			doc.Defaults.Hooks = HooksYes
 			So(doc.Save(path), ShouldBeNil)
 
+			// The whole document is re-encoded here, so the dialect of the
+			// re-encoding is part of what this test pins: a rewrite must not
+			// come back in a different quoting than verger writes everywhere
+			// else.
 			Convey("Then the document is re-encoded, the root table having no header to re-encode around", func() {
 				So(string(mustReadFile(t, path)), ShouldEqual, "schema = 1\n"+
 					"\n"+
 					"[defaults]\n"+
-					"hooks = 'yes'\n"+
+					"hooks = \"yes\"\n"+
 					"\n"+
 					"[[package]]\n"+
-					"id = 'acme/caveman'\n")
+					"id = \"acme/caveman\"\n")
+			})
+		})
+	})
+}
+
+// The dialect. Every spec verger writes - a new one, a re-encoded one, a block
+// spliced into a file that carries no strings to learn from - comes out with
+// double quotes, because that is what every fixture, example and doc in this
+// project uses. A file whose verger-written lines are in one dialect and whose
+// hand-written lines are in the other reads as though two tools had written it.
+func TestSaveWritesTheHouseDialect(t *testing.T) {
+	Convey("Given a spec that does not exist yet", t, func() {
+		path := filepath.Join(t.TempDir(), "verger.toml")
+
+		doc := New()
+		doc.Packages = []Package{{ID: "acme/caveman", Version: "1.2.3"}}
+
+		Convey("When it is saved", func() {
+			So(doc.Save(path), ShouldBeNil)
+
+			Convey("Then the new file is written with double quotes", func() {
+				So(string(mustReadFile(t, path)), ShouldEqual, "schema = 1\n"+
+					"\n"+
+					"[[package]]\n"+
+					"id = \"acme/caveman\"\n"+
+					"version = \"1.2.3\"\n")
+			})
+		})
+	})
+
+	Convey("Given a file whose only strings hold a double quote", t, func() {
+		// The value below is one go-toml writes as a `'literal'` and that
+		// cannot be restated with double quotes without escaping. Tidying the
+		// dialect must not turn the user's text into something else.
+		const document = "schema = 1\n" +
+			"\n" +
+			"[[package]]\n" +
+			"id = \"acme/caveman\"\n" +
+			"description = \"a \\\"quoted\\\" word\"\n"
+
+		path := filepath.Join(t.TempDir(), "verger.toml")
+		So(os.WriteFile(path, []byte(document), 0o600), ShouldBeNil)
+
+		doc, err := ParseFile(path)
+		So(err, ShouldBeNil)
+
+		doc.Packages = append(doc.Packages, Package{ID: "acme/second", Version: "2.0.0"})
+
+		Convey("When a package is added", func() {
+			So(doc.Save(path), ShouldBeNil)
+
+			Convey("Then the value is untouched and the new line follows the house style", func() {
+				after := string(mustReadFile(t, path))
+				So(after, ShouldContainSubstring, `description = "a \"quoted\" word"`)
+				So(after, ShouldContainSubstring, `id = "acme/second"`)
+
+				// And the file still parses: a tidied quote that broke the
+				// document would be caught by the writer itself, but the test
+				// says so out loud.
+				_, err := ParseFile(path)
+				So(err, ShouldBeNil)
 			})
 		})
 	})

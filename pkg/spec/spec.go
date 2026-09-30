@@ -264,7 +264,17 @@ func (s *Spec) Marshal() ([]byte, error) {
 		return nil, err
 	}
 
-	return toml.Marshal(tree)
+	encoded, err := toml.Marshal(tree)
+	if err != nil {
+		return nil, err
+	}
+
+	// go-toml writes a string with no escapes as a `'literal'`. Every spec this
+	// project ships, every fixture and every example uses `"`, and a file whose
+	// new lines came out in one dialect while the user's own lines are in the
+	// other is a file two tools appear to have written. A value that cannot be
+	// restated with double quotes keeps the spelling go-toml chose.
+	return []byte(requoteBlock(encoded, '"')), nil
 }
 
 // tree is the canonical view of the spec: every known field regenerated from

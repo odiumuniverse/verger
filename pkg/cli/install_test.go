@@ -47,7 +47,7 @@ func TestInstallAppliesWithYes(t *testing.T) {
 				So(parsed.Cells[0].Package, ShouldEqual, "local:caveman")
 
 				spec := readWorldFile(t, filepath.Join(w.homeDir, "verger.toml"))
-				So(spec, ShouldContainSubstring, `id = 'local:caveman'`)
+				So(spec, ShouldContainSubstring, `id = "local:caveman"`)
 			})
 
 			Convey("Then the JSON report carries the cell", func() {
@@ -572,8 +572,8 @@ func TestAdoptAddsSpecEntry(t *testing.T) {
 				So(err, ShouldBeNil)
 
 				spec := readWorldFile(t, filepath.Join(w.homeDir, "verger.toml"))
-				So(spec, ShouldContainSubstring, `adopted_from = 'claude'`)
-				So(spec, ShouldContainSubstring, `id = 'caveman'`)
+				So(spec, ShouldContainSubstring, `adopted_from = "claude"`)
+				So(spec, ShouldContainSubstring, `id = "caveman"`)
 				So(w.fake.lastAllowHooks, ShouldBeFalse)
 				So(stdout, ShouldContainSubstring, "adopted")
 			})

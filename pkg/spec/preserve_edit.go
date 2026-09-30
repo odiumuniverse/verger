@@ -686,10 +686,17 @@ func inlineSubtree(value any) (string, error) {
 
 // requoteBlock restates every literal string of a freshly encoded block, so a
 // table written out of hand comes back in the file's own quotes.
+//
+// A file with no strings to learn from - `schema = 1` and nothing else - is
+// written with double quotes, because that is the dialect every verger-written
+// spec, every fixture and every example in this repository uses. Falling back
+// to go-toml's literal quoting there would make the same command write `"` into
+// one user's file and `'` into the next, and a user reading both would conclude
+// two different tools had written them.
 func requoteBlock(block []byte, style byte) string {
 	const opening = " = '"
 
-	if style == 0 || style == '\'' {
+	if style == '\'' {
 		return string(block)
 	}
 
@@ -707,7 +714,10 @@ func requoteBlock(block []byte, style byte) string {
 		}
 
 		body := rest[len(prefix)+len(opening) : len(rest)-1]
-		if strings.Contains(body, "'") || strings.Contains(body, `\`) {
+		// A body holding either quote or a backslash cannot be restated with
+		// double quotes without escaping, and a value verger mangles while
+		// tidying its quotes is worse than a value left alone.
+		if strings.ContainsAny(body, "'\"\\") {
 			continue
 		}
 

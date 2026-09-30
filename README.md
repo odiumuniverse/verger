@@ -194,6 +194,7 @@ question. Anything touching something you wrote, or needing your consent, is lef
 | `verger pin <id>@<version>` | pin one package to a version |
 | `verger unpin <id>` | drop the version pin |
 | `verger restore <id>` | restore a removed package from the trash (≤30 days) |
+| `verger import` | write what your agents already installed into the spec |
 | `verger gc` | purge trash entries older than the retention window |
 
 `status --outdated-only` shows only skew and missing cells; `install` and `update` take
@@ -204,6 +205,12 @@ prints the command that would take it.
 `search` never reaches the network. It answers from the spec, the lock, the receipts and the
 offers of `local:` sources, and names every other source under `skipped` rather than passing over
 it in silence — a list you can trust is a list that says what it could not read.
+
+`import` is a batch `adopt`: it collects what the detected agents installed natively and writes
+one `[[package]]` per package into the spec. It touches the spec and nothing else — no agent file
+is written and nothing is delivered — so run `verger sync` afterwards to make the machine match
+what you just recorded. `--dry-run` prints the diff it would write, an agent whose listing cannot
+be read is named under `skipped`, and a second run has nothing left to do.
 
 `install` and `remove` never overwrite a file you edited since it was delivered — they refuse and
 tell you so. `--force` proceeds, and keeps what you wrote first: your version is copied under

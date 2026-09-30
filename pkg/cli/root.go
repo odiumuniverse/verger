@@ -378,6 +378,7 @@ func addCommands(root *cobra.Command, a *app) {
 		newDisableCmd(a),
 		newEnableCmd(a),
 		newRestoreCmd(a),
+		newImportCmd(a),
 		newSecretCmd(a),
 		newSourceCmd(a),
 		newPropagateCmd(a),

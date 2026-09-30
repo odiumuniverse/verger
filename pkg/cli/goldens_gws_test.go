@@ -179,6 +179,36 @@ func TestSearchJSONGolden(t *testing.T) {
 	})
 }
 
+// TestImportJSONGolden pins the `verger.import` document. `wrote` is the field
+// worth pinning: it is the only thing that tells a first run from the second one
+// over the same home, and a script that runs import in a loop has nothing else
+// to read.
+func TestImportJSONGolden(t *testing.T) {
+	Convey("Given an import that recorded one package and skipped one host", t, func() {
+		doc := importDoc{
+			Schema:  schemaOf(schemaImport),
+			Wrote:   1,
+			Added:   2,
+			Already: 1,
+			Candidates: []importCandidate{
+				{ID: "local:caveman", Version: "1.2.3", Host: "claude"},
+				{
+					ID: "local:old", Host: "claude", Disabled: true,
+					Notes: []string{"claude lists no version; recorded, not re-deliverable until it does"},
+				},
+			},
+			Skipped: []importSkipped{{Host: "codex", Reason: "plugin list failed: no such command"}},
+			Spec:    "/home/u/.verger/verger.toml",
+		}
+
+		Convey("Then the document is byte-stable", func() {
+			got, err := marshalJSON(doc)
+			So(err, ShouldBeNil)
+			So(string(got), ShouldEqual, goldenImport)
+		})
+	})
+}
+
 // TestWhyStatusMatchesTheStatusDocument is the cross-document pin: the same
 // cell, explained by two different commands, must carry the same word. This
 // is the bug that `why` had — it passed the raw internal status straight
@@ -220,4 +250,6 @@ const (
 	// and offered by a local source and nothing else. A collector that folds
 	// one flag into another changes these bytes.
 	goldenSearchStates = `{"schema":{"name":"verger.search","version":1},"query":"o","matches":[{"id":"local:caveman","source":"claude","in_spec":false,"in_lock":true,"installed":true},{"id":"local:ghost","in_spec":true,"in_lock":false,"installed":false},{"id":"local:offered","name":"offered","in_spec":false,"in_lock":false,"installed":false,"offered_by":"local"}],"skipped":[]}`
+
+	goldenImport = `{"schema":{"name":"verger.import","version":1},"wrote":1,"added":2,"already_in_spec":1,"candidates":[{"id":"local:caveman","version":"1.2.3","host":"claude"},{"id":"local:old","host":"claude","disabled":true,"notes":["claude lists no version; recorded, not re-deliverable until it does"]}],"skipped":[{"host":"codex","reason":"plugin list failed: no such command"}],"spec":"/home/u/.verger/verger.toml"}`
 )
