@@ -27,6 +27,10 @@ type carriedHome struct {
 	// running the test, so the test would pass only where an agent happens
 	// to be installed — and fail on a clean CI box.
 	host host.Host
+	// ref is the local spec source the first machine installed from. A test
+	// that installs again needs it, and reconstructing it here would let the
+	// two drift into different packages.
+	ref string
 }
 
 func newCarriedHome(t *testing.T) *carriedHome {
@@ -49,7 +53,7 @@ func newCarriedHome(t *testing.T) *carriedHome {
 	_, err = client.Install(t.Context(), plan, ApplyOptions{Now: fixedClock})
 	So(err, ShouldBeNil)
 
-	return &carriedHome{paths: paths, client: client, target: target, host: world.fake}
+	return &carriedHome{paths: paths, client: client, target: target, host: world.fake, ref: ref}
 }
 
 // carryTo copies only the portable part into a fresh home and opens a client

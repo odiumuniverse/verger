@@ -458,6 +458,15 @@ func (c *Client) Install(ctx context.Context, plan *Plan, opts ApplyOptions) (*a
 		}
 	}
 
+	// A cell the executor refused is not a quiet success. This is the same
+	// verdict Sync returns, for the same reason: the run printed "nothing
+	// was written" and a caller that reads only the exit code would call
+	// that a completed install. The report comes back alongside the error,
+	// because the error names the situation and the report names the cell.
+	if refused := refusedCells(report); len(refused) > 0 {
+		return report, &HandsOffError{Cells: refused}
+	}
+
 	return report, nil
 }
 
