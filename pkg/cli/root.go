@@ -368,6 +368,7 @@ func addCommands(root *cobra.Command, a *app) {
 		newTrustCmd(a),
 		newUntrustCmd(a),
 		newInfoCmd(a),
+		newSearchCmd(a),
 		newApproveCmd(a),
 		newRevokeCmd(a),
 		newUpdateCmd(a),

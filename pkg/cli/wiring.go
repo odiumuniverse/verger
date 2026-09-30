@@ -277,6 +277,7 @@ const (
 	schemaSource    = "verger.source"
 	schemaRemove    = "verger.remove"
 	schemaSecret    = "verger.secret"
+	schemaSearch    = "verger.search"
 )
 
 // schemaOf builds the first field of one document.

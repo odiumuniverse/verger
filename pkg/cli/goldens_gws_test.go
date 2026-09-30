@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/host"
 	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
 // TestReportJSONGolden closes W6-NITS N012 for `verger.report`. A golden is
@@ -97,6 +101,84 @@ func TestDoctorJSONGolden(t *testing.T) {
 	})
 }
 
+// TestSearchJSONGolden pins the `verger.search` document byte for byte.
+//
+// One fixture is not enough, and the second one has to come from a real home.
+// The three state booleans — `in_spec`, `in_lock`, `installed` — are different
+// facts, and a document built by hand pins only the values it was written
+// with: when the fixture says all three are true, a collector that folded
+// `in_lock` into `in_spec` produces the very same bytes and the golden sees
+// nothing. (It did: that mutation survived the first run of this suite.) So
+// the second fixture is produced by the collectors themselves, over a home
+// where the three states differ, and its bytes are pinned here.
+func TestSearchJSONGolden(t *testing.T) {
+	Convey("Given a search document", t, func() {
+		doc := searchDoc{
+			Schema: schemaOf(schemaSearch),
+			Query:  "cave",
+			Matches: []verger.SearchMatch{{
+				ID: "local:caveman", Name: "Caveman toolkit.",
+				InSpec: true, InLock: true, Installed: true,
+			}},
+			Skipped: []verger.SearchSkipped{{Source: "remote", Reason: "not a local ref"}},
+		}
+
+		Convey("Then its shape is byte-stable", func() {
+			got, err := marshalJSON(doc)
+			So(err, ShouldBeNil)
+			So(string(got), ShouldEqual, goldenSearch)
+		})
+	})
+
+	Convey("Given a home whose packages are in different states", t, func() {
+		w := newWorld(t)
+		w.chdir(t, w.root)
+		w.target(t, "SKILL.md", "# installed\n")
+		w.mustRun(t, "install", w.fixture(t), "-y", "--hooks", "yes")
+
+		// The catalog a declared `local:` source offers: present on disk,
+		// in nobody's spec and nobody's lock.
+		catalog := filepath.Join(w.homeDir, "catalog")
+		writeWorldFile(t, filepath.Join(catalog, "offered", ".claude-plugin", "plugin.json"),
+			`{"name":"offered","version":"9.9.9"}`)
+		writeWorldFile(t, filepath.Join(catalog, "offered", "skills", "one", "SKILL.md"), "# offered\n")
+
+		// The spec no longer declares `local:caveman`, but the lock and the
+		// receipts still carry it — the state a user lands in after deleting a
+		// line by hand. That row is the one a collector cannot fake: `in_lock`
+		// and `installed` are true while `in_spec` is false, so folding any of
+		// them into another changes the bytes below.
+		//
+		// `ghost` is the mirror image: declared, never resolved, never
+		// delivered. `offered` is in the catalog and nowhere else.
+		So(w.writeSpec(t, "schema = 1\n"+
+			"\n"+
+			"[[source]]\n"+
+			"name = \"local\"\n"+
+			"url = \"local:./catalog\"\n"+
+			"\n"+
+			"[[package]]\n"+
+			"id = \"local:ghost\"\n"), ShouldBeNil)
+
+		client, err := verger.Open(context.Background(), w.options().openOpts...)
+		So(err, ShouldBeNil)
+
+		t.Cleanup(func() { _ = client.Close() })
+
+		paths, err := client.Paths(verger.User, "")
+		So(err, ShouldBeNil)
+
+		res, err := client.Search(t.Context(), verger.SearchOptions{Paths: paths, Query: "o"})
+		So(err, ShouldBeNil)
+
+		Convey("Then the document the command would print is byte-stable", func() {
+			got, err := marshalJSON(searchDocFrom(res))
+			So(err, ShouldBeNil)
+			So(string(got), ShouldEqual, goldenSearchStates)
+		})
+	})
+}
+
 // TestWhyStatusMatchesTheStatusDocument is the cross-document pin: the same
 // cell, explained by two different commands, must carry the same word. This
 // is the bug that `why` had — it passed the raw internal status straight
@@ -130,4 +212,12 @@ const (
 	goldenWhy = `{"schema":{"name":"verger.why","version":1},"package":"local:skewed","host":"claude","scope":"user","status":"skipped","detail":"skew","version":"1.0.0","strategy":"loose","reasons":["the lock asks for 1.0.0, the receipt says 2.0.0"],"blockers":[]}`
 
 	goldenDoctor = `{"schema":{"name":"verger.doctor","version":1},"findings":[{"severity":"warning","subject":"spec:project","message":"the project spec was not written by this machine","fix":[["verger trust","."]],"safe_to_autofix":true}],"applied":["spec:project"]}`
+
+	goldenSearch = `{"schema":{"name":"verger.search","version":1},"query":"cave","matches":[{"id":"local:caveman","name":"Caveman toolkit.","in_spec":true,"in_lock":true,"installed":true}],"skipped":[{"source":"remote","reason":"not a local ref"}]}`
+
+	// Three rows, three states, produced by the collectors themselves:
+	// lock-and-delivered but no longer declared, declared but never resolved,
+	// and offered by a local source and nothing else. A collector that folds
+	// one flag into another changes these bytes.
+	goldenSearchStates = `{"schema":{"name":"verger.search","version":1},"query":"o","matches":[{"id":"local:caveman","source":"claude","in_spec":false,"in_lock":true,"installed":true},{"id":"local:ghost","in_spec":true,"in_lock":false,"installed":false},{"id":"local:offered","name":"offered","in_spec":false,"in_lock":false,"installed":false,"offered_by":"local"}],"skipped":[]}`
 )

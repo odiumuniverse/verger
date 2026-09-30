@@ -183,6 +183,7 @@ question. Anything touching something you wrote, or needing your consent, is lef
 | `verger remove <id>` | remove one package from every host, keeping it in the trash |
 | `verger status` | show the package × host matrix |
 | `verger info <id>` | show what one package is and where it is installed |
+| `verger search <query>` | find packages by name, and say which are already installed |
 | `verger why <id> <host>` | explain one cell: strategy, version, blockers |
 | `verger outdated` | list skew and missing cells |
 | `verger update [id]` | re-apply the spec, picking up newer versions |
@@ -199,6 +200,10 @@ question. Anything touching something you wrote, or needing your consent, is lef
 `--hooks ask|yes|no`; `install --pin` records a version; `gc --dry-run` shows what it would purge.
 Without `--allow-downgrade`, a channel that resolves to an older version skips the package and
 prints the command that would take it.
+
+`search` never reaches the network. It answers from the spec, the lock, the receipts and the
+offers of `local:` sources, and names every other source under `skipped` rather than passing over
+it in silence — a list you can trust is a list that says what it could not read.
 
 `install` and `remove` never overwrite a file you edited since it was delivered — they refuse and
 tell you so. `--force` proceeds, and keeps what you wrote first: your version is copied under

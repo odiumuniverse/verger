@@ -60,6 +60,7 @@ func TestSearchFiltersSpecLockAndReceipts(t *testing.T) {
 
 			Convey("Then it is a usage error, not a listing of everything", func() {
 				So(err, ShouldNotBeNil)
+
 				var usage *UsageError
 				So(errors.As(err, &usage), ShouldBeTrue)
 			})
@@ -94,11 +95,13 @@ func TestSearchNeverTouchesTheNetwork(t *testing.T) {
 			So(res.Skipped, ShouldNotBeEmpty)
 
 			var named bool
+
 			for _, s := range res.Skipped {
 				if s.Source == "remote" && s.Reason != "" {
 					named = true
 				}
 			}
+
 			So(named, ShouldBeTrue)
 		})
 	})
@@ -126,11 +129,13 @@ func TestSearchReadsDeclaredLocalSources(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			var found bool
+
 			for _, m := range res.Matches {
 				if m.ID == "local:localpkg" && m.OfferedBy == "local" {
 					found = true
 				}
 			}
+
 			So(found, ShouldBeTrue)
 			So(len(res.Skipped), ShouldEqual, 0)
 		})
