@@ -31,6 +31,8 @@ func newStatusCmd(a *app) *cobra.Command {
 
 	cmd.Flags().BoolVar(&outdatedOnly, "outdated-only", false, "only show skew and missing cells")
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
+	cmd.Flags().StringSliceVar(&a.hostsFlag, "hosts", nil, "only these hosts (comma separated)")
+	cmd.Flags().StringSliceVar(&a.exceptFlag, "except", nil, "exclude these hosts")
 
 	return cmd
 }
@@ -117,7 +119,9 @@ func (a *app) hostSwitches(client *verger.Client, paths verger.Paths) []hostSwit
 // facade (DESIGN §9.1); the CLI only converts the document into its own JSON
 // shape and its own level column.
 func (a *app) statusCells(client *verger.Client, ctx context.Context, paths verger.Paths, outdatedOnly bool) (statusDoc, error) {
-	doc, err := client.Status(ctx, verger.StatusOptions{Paths: paths, OutdatedOnly: outdatedOnly})
+	doc, err := client.Status(ctx, verger.StatusOptions{
+		Paths: paths, OutdatedOnly: outdatedOnly, Hosts: a.hostFilter(),
+	})
 	if err != nil {
 		return statusDoc{}, err
 	}

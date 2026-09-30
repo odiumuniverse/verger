@@ -135,12 +135,21 @@ func TestREADMEPairsYesWithForce(t *testing.T) {
 	Convey("Given the README's safety claim", t, func() {
 		readme := readREADME(t)
 
+		// These assert the PROMISE, not one phrasing of it. The earlier version
+		// pinned two sentences verbatim, and the README rewrite - which said the
+		// same thing in other words - turned the guard into a tripwire against
+		// an editor. A guard that fires when the docs are still correct is a
+		// guard that gets deleted, and then nothing guards anything.
 		Convey("Then it says -y does not imply --force", func() {
-			So(readme, ShouldContainSubstring, "never resolves a destructive conflict")
+			So(readme, ShouldContainSubstring, "-y` does not imply `--force")
 		})
 
-		Convey("And it says the previous version is kept under --force", func() {
-			So(readme, ShouldContainSubstring, "previous version is kept")
+		Convey("And it says --force keeps what the user wrote", func() {
+			So(readme, ShouldContainSubstring, "`--force` proceeds, and keeps what you wrote")
+			// Recoverable rather than destructive is the point, so a README that
+			// promises --force without naming where the old file went has
+			// quietly become a lie.
+			So(readme, ShouldContainSubstring, "state/backups/")
 		})
 	})
 }

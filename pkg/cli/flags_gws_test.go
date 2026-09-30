@@ -46,8 +46,12 @@ func TestForceFlagAppearsOnlyWhereItIsHonoured(t *testing.T) {
 // a --hosts flag on it could only ever be ignored.
 func TestHostFilterOnlyWhereItFilters(t *testing.T) {
 	Convey("Given the verbs that filter by host", t, func() {
-		Convey("Then the delivery verbs carry --hosts and --except", func() {
-			for _, name := range []string{"install", "remove", "sync", "update", "adopt"} {
+		// status carries it too: it reports a package x host matrix, so narrowing
+		// it is the question it already answers, and a requested host this
+		// machine does not detect must be the same refusal install gives rather
+		// than a silently empty column.
+		Convey("Then the delivery verbs and status carry --hosts and --except", func() {
+			for _, name := range []string{"install", "remove", "sync", "update", "adopt", "status"} {
 				cmd, _, err := NewRootCmd(Options{}).Find([]string{name})
 				So(err, ShouldBeNil)
 				So(cmd.Flags().Lookup("hosts"), ShouldNotBeNil)

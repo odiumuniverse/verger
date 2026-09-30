@@ -19,6 +19,12 @@ type UpdateOptions = SyncOptions
 // that wants "make it match" and one that wants "bring it up to date" cannot
 // drift apart (DESIGN §9.3).
 func (c *Client) Update(ctx context.Context, opts UpdateOptions) (*SyncPlan, *apply.Report, error) {
+	// Marked before Sync, because the two are the same call and this is the
+	// only thing that tells them apart. The update cooldown throttles "pull
+	// something newer" and must never throttle a reconcile, and a reconcile
+	// arrives here with the same options and no other mark.
+	opts.Update = true
+
 	return c.Sync(ctx, opts)
 }
 

@@ -147,7 +147,11 @@ type app struct {
 	force       bool
 	homeFlag    string
 	projectFlag bool
-	fixFlag     bool
+	// allowDowngrade is the one update flag that can undo what is installed,
+	// so it is named on the command rather than folded into --force: forcing
+	// files and choosing an older version are different decisions.
+	allowDowngrade bool
+	fixFlag        bool
 
 	hostsFlag  []string
 	exceptFlag []string

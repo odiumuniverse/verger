@@ -233,6 +233,14 @@ func newFacadeWorld(t *testing.T) (*facadeWorld, *Client) {
 	return world, client
 }
 
+// writeSpec replaces the scope's spec document, so a test can change what the
+// spec asks for without going through a delivery.
+func (w *facadeWorld) writeSpec(t *testing.T, paths Paths, content string) {
+	t.Helper()
+
+	writeFacadeFile(t, paths.SpecPath, content)
+}
+
 // fixture writes a local package under the world root and returns its ref.
 func (w *facadeWorld) fixture(t *testing.T, name, version string) string {
 	t.Helper()
@@ -260,7 +268,10 @@ func (w *facadeWorld) withHooks(t *testing.T) string {
 	return "./hooked"
 }
 
-// writeFacadeFile writes one fixture file.
+// writeFacadeFile writes one fixture file for the facade tests. The godoc
+// Examples carry their own writer (writeExampleFile) precisely because an
+// Example body is a plain function with no testing.T to fail with - so this one
+// can stay an ordinary helper.
 func writeFacadeFile(t *testing.T, path, content string) {
 	t.Helper()
 

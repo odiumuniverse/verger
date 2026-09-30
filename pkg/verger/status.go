@@ -63,6 +63,13 @@ type StatusOptions struct {
 	Paths Paths
 	// OutdatedOnly keeps only the skewed and missing cells.
 	OutdatedOnly bool
+	// Hosts narrows the matrix to the selected hosts. An empty filter is every
+	// host, which is what status has always meant.
+	//
+	// The filter is resolved through Targets, not applied to the receipts
+	// afterwards: asking about a host this machine does not detect has to be
+	// the same refusal every other verb gives, not a quietly empty column.
+	Hosts HostFilter
 }
 
 // Status merges receipts and lock cells into the stable matrix. It is the same
@@ -92,6 +99,18 @@ func (c *Client) Status(ctx context.Context, opts StatusOptions) (StatusDocument
 		return StatusDocument{}, err
 	}
 
+	// Resolved before anything is read, so an unavailable host is the verdict
+	// rather than an empty row discovered afterwards.
+	targets, err := c.Targets(opts.Hosts)
+	if err != nil {
+		return StatusDocument{}, err
+	}
+
+	selected := make(map[string]bool, len(targets))
+	for _, adapter := range targets {
+		selected[string(adapter.ID())] = true
+	}
+
 	receipts := receipt.NewStore(opts.Paths.ReceiptsDir)
 
 	list, err := receipts.List()
@@ -109,6 +128,8 @@ func (c *Client) Status(ctx context.Context, opts StatusOptions) (StatusDocument
 	doc.Cells = append(doc.Cells, c.receiptCells(ctx, list, lockDoc)...)
 
 	doc.Cells = append(doc.Cells, lockOnlyCells(lockDoc, list)...)
+
+	doc.Cells = filterCellsByHost(doc.Cells, opts.Hosts, selected)
 
 	slices.SortFunc(doc.Cells, func(left, right Cell) int {
 		return cmp.Or(
@@ -129,6 +150,29 @@ func (c *Client) Status(ctx context.Context, opts StatusOptions) (StatusDocument
 	}
 
 	return doc, nil
+}
+
+// filterCellsByHost narrows a matrix to the selected hosts.
+//
+// It runs only after Targets has agreed the hosts exist: a receipt for a host
+// the user excluded is not their business, and a receipt for a host nobody
+// selected would answer a question that was not asked. An empty filter is
+// every host, which is what status has always meant - so the common case costs
+// nothing and cannot filter by accident.
+func filterCellsByHost(cells []Cell, filter HostFilter, selected map[string]bool) []Cell {
+	if len(filter.Only) == 0 && len(filter.Except) == 0 {
+		return cells
+	}
+
+	kept := cells[:0]
+
+	for _, cell := range cells {
+		if selected[cell.Host] {
+			kept = append(kept, cell)
+		}
+	}
+
+	return kept
 }
 
 // receiptCells turns the receipt store into matrix cells, one per record.

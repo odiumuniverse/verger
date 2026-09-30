@@ -44,12 +44,26 @@ const (
 // Store keeps one receipt file per (package, host, scope) cell under dir.
 type Store struct {
 	dir string
+	// now is the clock the stamps are read from. It is a field so a test can
+	// place a cooldown window instead of waiting one out, and so a caller
+	// embedding verger can hand over the same clock the rest of the run uses.
+	now func() time.Time
 }
 
 // NewStore returns a receipt store rooted at dir; the directory is created on
 // the first write.
 func NewStore(dir string) *Store {
-	return &Store{dir: dir}
+	return &Store{dir: dir, now: time.Now}
+}
+
+// WithClock sets the clock the install and update stamps are read from. The
+// zero value is time.Now.
+func (s *Store) WithClock(now func() time.Time) *Store {
+	if now != nil {
+		s.now = now
+	}
+
+	return s
 }
 
 // Artifact is one thing verger put on disk.
@@ -236,6 +250,26 @@ func validOpKind(kind OpKind) bool {
 // atomically with mode 0600.
 func (s *Store) Put(r Receipt) error {
 	r.Schema = Schema
+
+	// Both stamps are written here when the caller did not set them, because a
+	// stamp nobody has to remember is a stamp nothing can trust: the update
+	// cooldown is measured from `UpdatedAt`, and a receipt written without one
+	// reads as "never updated" - indistinguishable from "written by a build
+	// that predates the field".
+	//
+	// An explicit stamp is the caller's own claim about when the work happened
+	// and is kept: the executor passes the clock the run was given, and that
+	// is the time the stamps should carry. `InstalledAt` is therefore set once,
+	// on the first write of this cell, and carried afterwards.
+	now := s.now()
+
+	if r.InstalledAt.IsZero() {
+		r.InstalledAt = now
+	}
+
+	if r.UpdatedAt.IsZero() {
+		r.UpdatedAt = now
+	}
 
 	if err := r.Validate(); err != nil {
 		return err

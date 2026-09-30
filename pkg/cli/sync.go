@@ -67,6 +67,10 @@ func (a *app) runSync(ctx context.Context, locked bool) error {
 		Hooks:  verger.LibraryHooksMode(hooksMode),
 		DryRun: a.dryRun,
 		Force:  a.force,
+		// Only the update command offers the flag; a sync that was handed the
+		// value would quietly downgrade from a command whose help never
+		// mentions it.
+		AllowDowngrade: a.allowDowngrade,
 		Confirm: func() verger.Confirmer {
 			return a.applyOptionsFacade().Confirm
 		}(),

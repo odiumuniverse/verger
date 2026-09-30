@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,31 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// DefaultNPMRegistry is where a dist-tag is read unless a caller says else.
+const DefaultNPMRegistry = "https://registry.npmjs.org"
+
+// WithNPMRegistry points dist-tag reads at another registry. It is what makes
+// the npm half of a channel testable without a network: point it at an
+// httptest server serving one document and the resolution is the only thing
+// under test.
+func WithNPMRegistry(base string) Option {
+	return func(f *Fetcher) {
+		if strings.TrimSpace(base) != "" {
+			f.registry = base
+		}
+	}
+}
+
+// WithHTTPClient sets the client a registry read uses, for a caller that has
+// its own transport, proxy or timeout policy.
+func WithHTTPClient(c *http.Client) Option {
+	return func(f *Fetcher) {
+		if c != nil {
+			f.httpClient = c
+		}
+	}
+}
+
 // Fetcher fetches references into the source cache. It is safe for concurrent
 // use: fetches of the same reference serialize per instance, and cache entries
 // appear atomically.
@@ -62,13 +88,20 @@ type Fetcher struct {
 	cacheDir string
 	store    *store.Store
 	now      func() time.Time
+	// registry is the npm registry a dist-tag is read from, and httpClient is
+	// what reads it. Both are fields so a test can point at an httptest server
+	// and assert against a canned document: a channel resolved against the real
+	// registry is a test that passes whenever npm's own dist-tags happen to
+	// have the name it wants.
+	registry   string
+	httpClient *http.Client
 
 	locks sync.Map // cache key -> *sync.Mutex
 }
 
 // NewFetcher builds a fetcher over the store cache (or an explicit cache dir).
 func NewFetcher(opts ...Option) (*Fetcher, error) {
-	f := &Fetcher{now: time.Now}
+	f := &Fetcher{now: time.Now, registry: DefaultNPMRegistry}
 
 	for _, opt := range opts {
 		opt(f)
@@ -130,6 +163,36 @@ type entryMeta struct {
 func (f *Fetcher) Fetch(ctx context.Context, ref Ref) (*Fetched, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fetchError(ref, StepContext, err)
+	}
+
+	// The channel is resolved here, before anything is fetched and before the
+	// cache key is computed, so that "beta" and "stable" are distinct cache
+	// entries. Resolving later would let one channel's checkout be served for
+	// another whenever the cache was warm.
+	if ref.Channel != "" {
+		res, err := f.ResolveChannel(ctx, ref, ref.Channel)
+		if err != nil {
+			return nil, err
+		}
+
+		switch ref.Kind {
+		case KindNPM:
+			// The dist-tag resolved to a concrete "name@version"; the ref must
+			// carry that, not the range or tag the user wrote.
+			ref.NPM = res.Rev
+		case KindGit, KindGitHub:
+			// A git channel is a tag or a branch, which is exactly what Rev holds.
+			ref.Rev = res.Rev
+		default:
+			// A kind that cannot serve a channel was already refused by
+			// ResolveChannel above, so there is nothing left to apply.
+		}
+
+		// The channel has done its work. Keeping it would make the cache key
+		// depend on a name that no longer describes the ref, so "stable" and
+		// the tag it resolved to would stop sharing a cache entry - the point
+		// of resolving first.
+		ref.Channel = ""
 	}
 
 	switch ref.Kind {

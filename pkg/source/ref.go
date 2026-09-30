@@ -44,6 +44,14 @@ type Ref struct {
 	URL    string      // git URL or archive URL; may carry credentials — render via String()
 	SHA256 digest.Hash // required for archives
 
+	// Channel is a release channel ("stable", "beta", an npm dist-tag) to
+	// resolve into Rev before the fetch. It rides on the ref rather than being
+	// resolved by the caller because a ref is what gets fetched: a ref that
+	// has not resolved its own channel would fetch some version while looking
+	// entirely well formed, and the mistake would show up as a package that
+	// installs cleanly at the wrong version.
+	Channel string
+
 	NPM  string // full npm spec (scope/name@version)
 	Path string // local: absolute directory
 

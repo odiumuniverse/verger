@@ -633,10 +633,22 @@ func TestReceiptOmittedZeroFields(t *testing.T) {
 			So(json.Unmarshal(raw, &doc), ShouldBeNil)
 
 			Convey("Then zero times and empty lists are omitted", func() {
-				for _, key := range []string{"installed_at", "updated_at", "artifacts", "rma", "version", "caps_hash", "runtime_version"} {
+				// `installed_at` and `updated_at` are deliberately absent from
+				// this list: Put stamps both on every write, so a written
+				// receipt never has them zero and the update cooldown has
+				// something to measure from. The `omitzero` contract is still
+				// covered by the keys that remain.
+				for _, key := range []string{"artifacts", "rma", "version", "caps_hash", "runtime_version"} {
 					_, present := doc[key]
 					So(present, ShouldBeFalse)
 				}
+
+				Convey("And the two stamps are present, because Put writes them", func() {
+					for _, key := range []string{"installed_at", "updated_at"} {
+						_, present := doc[key]
+						So(present, ShouldBeTrue)
+					}
+				})
 
 				So(string(doc["schema"]), ShouldEqualJSON, "1")
 			})

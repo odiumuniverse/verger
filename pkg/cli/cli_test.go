@@ -598,12 +598,14 @@ func TestHelpHasNoPhaseMarkers(t *testing.T) {
 // `runPin` builds `PinOptions` with no Filter at all), so the flags were
 // accepted and ignored. They have been removed, and this test pins the
 // honest set instead of the old one.
+// status is in it: it is a per-host report, so --hosts narrows it. See
+// TestHostFilterOnlyWhereItFilters.
 func TestMutatingVerbsTakeTheHostFilter(t *testing.T) {
 	Convey("Given the command tree", t, func() {
 		root := NewRootCmd(Options{})
 
 		Convey("When the verbs that filter are inspected", func() {
-			for _, name := range []string{"install", "remove", "sync", "update", "adopt"} {
+			for _, name := range []string{"install", "remove", "sync", "update", "adopt", "status"} {
 				cmd, _, err := root.Find([]string{name})
 				So(err, ShouldBeNil)
 				So(cmd.Flags().Lookup("hosts"), ShouldNotBeNil)

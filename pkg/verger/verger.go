@@ -53,7 +53,11 @@ type Client struct {
 	// the same instances (an adapter is stateless, but the receipt-backed
 	// ownership source it carries is one receipt store).
 	adapters []host.Host
-
+	// now is the clock every "when did this last happen" decision reads. It is
+	// a field rather than a call to time.Now so that a window - the update
+	// cooldown - is something a test can place, not something a test has to
+	// wait for.
+	now    func() time.Time
 	mu     sync.Mutex
 	closed bool
 }
@@ -72,6 +76,7 @@ type config struct {
 	hostsSet          bool
 	trashRetention    time.Duration
 	trashRetentionSet bool
+	now               func() time.Time
 }
 
 // Option configures Open.
@@ -108,6 +113,24 @@ func WithTrashRetention(d time.Duration) Option {
 
 		c.trashRetention = d
 		c.trashRetentionSet = true
+	}
+}
+
+// WithClock sets the time the facade reads when a decision depends on "now":
+// the update cooldown, above all. The zero value is time.Now.
+//
+// It exists because a throttle is the one thing in the library that cannot be
+// tested by running the test: a cooldown of 24h asserted against a real clock
+// either passes instantly or needs a day. A caller that embeds verger - beadle
+// is the one that matters - can pass the same clock it uses for everything
+// else, so "is this inside the window" is a question with an answer.
+func WithClock(now func() time.Time) Option {
+	return func(c *config) {
+		if now == nil {
+			return
+		}
+
+		c.now = now
 	}
 }
 
@@ -186,7 +209,12 @@ func Open(ctx context.Context, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	client := &Client{home: h, store: st, secrets: secrets, logger: logger, configured: hosts}
+	now := cfg.now
+	if now == nil {
+		now = time.Now
+	}
+
+	client := &Client{home: h, store: st, secrets: secrets, logger: logger, configured: hosts, now: now}
 	client.adapters = client.buildAdapters()
 
 	return client, nil

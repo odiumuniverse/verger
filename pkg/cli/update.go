@@ -27,6 +27,8 @@ func newUpdateCmd(a *app) *cobra.Command {
 
 	addDeliverFlags(cmd, a)
 	cmd.Flags().BoolVar(&a.projectFlag, "project", false, "use the project scope")
+	cmd.Flags().BoolVar(&a.allowDowngrade, "allow-downgrade", false,
+		"let a channel take a version older than the installed one")
 
 	return cmd
 }

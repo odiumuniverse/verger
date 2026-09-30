@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/host"
@@ -33,10 +34,21 @@ type SyncOptions struct {
 	DryRun bool
 	// Confirm answers the executor's questions; nil declines them.
 	Confirm Confirmer
+	// AllowDowngrade lets a channel resolve to a version older than the one
+	// already installed. Without it such a package is skipped and the plan says
+	// so with the command that would do it: a channel that moves backwards -
+	// a retracted release, a "latest" that now points at an older build - should
+	// not quietly undo a working install on its own authority.
+	AllowDowngrade bool
 	// Force has the meaning of ApplyOptions.Force: it overwrites files the
 	// user has edited, keeping their copy under state/backups. Without it a
 	// hands-off cell is left alone and the run says so.
 	Force bool
+	// Update marks this run as an update rather than a reconcile, and it is
+	// what the cooldown is allowed to throttle. A reconcile brings the machine
+	// to what the spec says and is never throttled; an update asks for
+	// something newer, and that request is what a cooldown is about.
+	Update bool
 }
 
 // SyncPlan is what a reconcile would do, as data.
@@ -208,7 +220,10 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 		return nil, err
 	}
 
-	installed := map[string]bool{}
+	// installed maps a package to the version on this disk, not merely to a
+	// yes: a downgrade guard has to compare against something, and "installed"
+	// alone is not a version.
+	installed := map[string]string{}
 
 	// receipted is "this machine has a record of doing it", which is not the
 	// same question as "the files are here and match". A package with a
@@ -237,7 +252,7 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 			continue
 		}
 
-		installed[record.Package] = true
+		installed[record.Package] = record.Version
 	}
 
 	adapterByID := map[host.ID]host.Host{}
@@ -256,8 +271,26 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 
 	desired := map[string]bool{}
 
+	// Only an update is throttled, and only while its window is open. The stamp
+	// is when this machine last wrote the package, which is the only moment the
+	// cooldown can honestly be measured from.
+	lastWrite := lastUpdated(list)
+
+	cooling := cooldownHold{
+		active: opts.Update && !opts.Force && switches.Cooldown > 0,
+		window: switches.Cooldown, now: c.now(),
+	}
+
 	for _, entry := range doc.Packages {
 		if !syncWants(opts, entry.ID) {
+			continue
+		}
+
+		if until, held := cooling.holds(entry.ID, lastWrite); held {
+			plan.Notes = append(plan.Notes, entry.ID+": deferred by the "+switches.Cooldown.String()+
+				" cooldown, next attempt after "+until.UTC().Format(time.RFC3339))
+			desired[entry.ID] = true
+
 			continue
 		}
 
@@ -267,6 +300,57 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 	syncRemovals(plan, list, desired, adapterByID, opts)
 
 	return plan, nil
+}
+
+// lastUpdated maps each package to the last time this machine wrote it, taking
+// the newest of its receipts: a package delivered to several hosts is one
+// package, and the throttle is about the package.
+func lastUpdated(list []receipt.Receipt) map[string]time.Time {
+	stamps := make(map[string]time.Time, len(list))
+
+	for _, record := range list {
+		at := record.UpdatedAt
+		if at.IsZero() {
+			at = record.InstalledAt
+		}
+
+		if previous, ok := stamps[record.Package]; !ok || at.After(previous) {
+			stamps[record.Package] = at
+		}
+	}
+
+	return stamps
+}
+
+// cooldownHold answers "is this package still inside its window?". It is one
+// value rather than a boolean threaded through the plan so the caller has to
+// say which of the two it means: an inactive hold and a hold that has expired
+// both answer "no", and only the first may be reported.
+type cooldownHold struct {
+	active bool
+	window time.Duration
+	now    time.Time
+}
+
+// holds reports whether id is deferred, and when the window opens again. A
+// package this machine has never written is never held: there is nothing to
+// throttle, and an install that has not happened cannot be "too soon".
+func (h cooldownHold) holds(id string, stamps map[string]time.Time) (time.Time, bool) {
+	if !h.active {
+		return time.Time{}, false
+	}
+
+	written, ok := stamps[id]
+	if !ok || written.IsZero() {
+		return time.Time{}, false
+	}
+
+	opens := written.Add(h.window)
+	if !h.now.Before(opens) {
+		return time.Time{}, false
+	}
+
+	return opens, true
 }
 
 // syncWants reports whether one spec entry takes part in this run.
@@ -279,7 +363,8 @@ func syncWants(opts SyncOptions, id string) bool {
 // for every adapter.
 func syncInstall(
 	ctx context.Context, c *Client, fetcher *source.Fetcher, plan *SyncPlan,
-	adapters []host.Host, entry spec.Package, installed, receipted, desired map[string]bool,
+	adapters []host.Host, entry spec.Package, installed map[string]string,
+	receipted, desired map[string]bool,
 	opts SyncOptions, switches Switches,
 ) {
 	if entry.Disabled {
@@ -314,7 +399,14 @@ func syncInstall(
 
 	desired[entry.ID] = true
 
-	if installed[entry.ID] {
+	// The seam: this is the one place where the version on disk and the version
+	// the fetch resolved are both in hand. Earlier there is nothing to compare,
+	// later the plan is already written.
+	if have, ok := installed[entry.ID]; ok {
+		if skipDowngrade(plan, entry, have, fetched.Package.Version, opts.AllowDowngrade) {
+			return
+		}
+
 		return
 	}
 
@@ -442,6 +534,11 @@ func (s *SyncPlan) spec() *spec.Spec {
 func (c *Client) fetchSpecPackage(
 	ctx context.Context, fetcher *source.Fetcher, doc *spec.Spec, id, specDir string,
 ) (*source.Fetched, source.Ref, error) {
+	// The channel is a statement about which version to take, so it travels
+	// with the ref the planner records and the executor fetches. Resolving it
+	// here would be too early - nothing has fetched yet - and not at all would
+	// make the spec's channel a line the reader ignores.
+	channel := channelOf(doc, id)
 	seen := 0
 
 	for _, src := range doc.Sources {
@@ -458,6 +555,8 @@ func (c *Client) fetchSpecPackage(
 		if err != nil {
 			return nil, source.Ref{}, &UsageError{Cause: fmt.Errorf("source %s: %w", src.Name, err)}
 		}
+
+		ref.Channel = channel
 
 		offers, err := fetcher.FetchLocalOffers(ctx, ref)
 		if err != nil {
@@ -548,3 +647,35 @@ func (e *HandsOffError) Error() string {
 // Receipt is the receipt shape the facade returns to a caller that needs the
 // removed cells themselves rather than the actions that remove them.
 type Receipt = receipt.Receipt
+
+// downgrades reports whether resolving a channel to `got` moves a package from
+// `have` backwards. A package with no channel is never a downgrade: a plain
+// "install what the spec says" run has no opinion about versions, and making it
+// one would turn every re-sync into a question about semver.
+func downgrades(channel, have, got string) bool {
+	if channel == "" || have == "" || got == "" {
+		return false
+	}
+
+	return source.CompareVersions(got, have) < 0
+}
+
+// skipDowngrade reports whether a package must be left alone because its
+// channel resolved to a version older than the one installed, and says so on
+// the plan when it does. The note carries the command that would do it, because
+// a skip the user cannot undo from the message is a decision made for them.
+//
+// Nothing is decided here when the caller passed AllowDowngrade: the flag is
+// the user's statement that this move is intended.
+func skipDowngrade(plan *SyncPlan, entry spec.Package, have, got string, allow bool) bool {
+	if allow || !downgrades(entry.Channel, have, got) {
+		return false
+	}
+
+	plan.Notes = append(plan.Notes, fmt.Sprintf(
+		"skipped: %s channel %q resolves to %s, older than the installed %s; "+
+			"run `verger update %s --allow-downgrade` to take it",
+		entry.ID, entry.Channel, got, have, entry.ID))
+
+	return true
+}

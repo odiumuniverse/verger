@@ -28,6 +28,12 @@ type PlannedPackage struct {
 	// executor writes came from the lock, so it is a restore. The plan knows
 	// this; the executor only carries it.
 	Restored bool
+	// Skip is why this package was planned but not delivered, in the words a
+	// user would use to describe it. It is empty for a package that goes
+	// through, which is why it is a reason rather than a bool: a plan that
+	// skips something has to say which thing it skipped and why, and a bare
+	// "skipped" leaves the reader to guess between the reasons.
+	Skip string
 }
 
 // targets returns the adapters one planned package is delivered to.
@@ -287,30 +293,40 @@ func refuseUnsupportedRefs(refs []source.Ref) error {
 // specSourceFetcher resolves one ref through the sources the spec declares.
 // It returns nil, nil when no declared source offers the id, which is the
 // caller's cue to refuse the ref rather than look for it elsewhere.
-func specSourceFetcher(ctx context.Context, st *store.Store, sources []spec.Source, ref source.Ref) (*source.Fetched, error) {
+func specSourceFetcher(ctx context.Context, st *store.Store, sources []spec.Source, ref source.Ref) (*source.Fetched, []SourceOffer, error) {
 	fetcher, err := source.NewFetcher(source.WithStore(st))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	// What each source actually offered is kept, not discarded: a ref no source
+	// carries is otherwise a bare "not found", and the user has no way to tell a
+	// typo from a source simply pointed at the wrong place.
+	offered := make([]SourceOffer, 0, len(sources))
 
 	for _, src := range sources {
 		offers, offerErr := offerFromSource(ctx, fetcher, src, ref.ID)
 		if offerErr != nil {
-			return nil, offerErr
+			return nil, nil, offerErr
 		}
+
+		offer := SourceOffer{Name: src.Name, URL: src.URL}
 
 		for _, got := range offers {
 			if got.Package.ID == ref.ID {
-				return got, nil
+				return got, nil, nil
 			}
 
 			// A source that offered something else is not the package the
 			// user named, and its cache entry must not outlive the probe.
+			offer.IDs = append(offer.IDs, got.Package.ID)
 			_ = got.Cleanup()
 		}
+
+		offered = append(offered, offer)
 	}
 
-	return nil, nil
+	return nil, offered, nil
 }
 
 // offerFromSource asks one declared source what it offers. A source whose
@@ -343,6 +359,22 @@ func offerFromSource(ctx context.Context, fetcher *source.Fetcher, src spec.Sour
 type UndeclaredSourceError struct {
 	Ref     string
 	Sources []string
+	// Offered is what each declared source was asked for and what it had. A
+	// bare list of source names tells the user nothing they can act on: "not
+	// offered by a, b" says the same whether the sources are empty, hold
+	// different packages, or were never readable at all - and those are three
+	// different mistakes with three different fixes.
+	Offered []SourceOffer
+}
+
+// SourceOffer is what one declared source was asked for and what it carried.
+type SourceOffer struct {
+	Name string
+	URL  string
+	// IDs are the packages the source actually offered. Empty alongside a URL
+	// means the location could not be read, which reads differently from a URL
+	// that was read and held nothing.
+	IDs []string
 }
 
 // Error implements error.
@@ -351,7 +383,22 @@ func (e *UndeclaredSourceError) Error() string {
 		return "no source declares " + e.Ref
 	}
 
-	return fmt.Sprintf("%s is not offered by any source the spec declares (%s)", e.Ref, strings.Join(e.Sources, ", "))
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "%s is not offered by any source the spec declares:", e.Ref)
+
+	for _, offer := range e.Offered {
+		switch {
+		case len(offer.IDs) > 0:
+			fmt.Fprintf(&b, "\n  %s (%s) offers: %s", offer.Name, offer.URL, strings.Join(offer.IDs, ", "))
+		case offer.URL == "":
+			fmt.Fprintf(&b, "\n  %s offers: nothing (the spec gives it no url)", offer.Name)
+		default:
+			fmt.Fprintf(&b, "\n  %s (%s) offers: nothing readable", offer.Name, offer.URL)
+		}
+	}
+
+	return b.String()
 }
 
 // fetchPackages fetches every ref into one host package.
@@ -362,6 +409,16 @@ func (c *Client) fetchPackages(ctx context.Context, refs []source.Ref, opts Plan
 	}
 
 	sources := declaredSources(opts.Paths)
+
+	// The channel must be on the ref before resolve fetches it. This is the one
+	// point every install, update and plan goes through, so wiring it here
+	// covers all three paths rather than three times.
+	sp, _, err := LoadSpec(opts.Paths.SpecPath)
+	if err != nil {
+		return nil, err
+	}
+
+	applyChannels(sp, refs)
 
 	var packages []PlannedPackage
 
@@ -408,10 +465,10 @@ func declaredSources(paths Paths) []spec.Source {
 // the user controls must not turn into somebody else's package.
 func (c *Client) resolve(ctx context.Context, fetcher *source.Fetcher, sources []spec.Source, ref source.Ref) (*source.Fetched, error) {
 	if len(sources) == 0 || !bareID(ref) {
-		return fetcher.Fetch(ctx, ref)
+		return fetchResolved(ctx, fetcher, ref)
 	}
 
-	got, err := specSourceFetcher(ctx, c.Store(), sources, ref)
+	got, offered, err := specSourceFetcher(ctx, c.Store(), sources, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +480,7 @@ func (c *Client) resolve(ctx context.Context, fetcher *source.Fetcher, sources [
 			names = append(names, src.Name)
 		}
 
-		return nil, &UndeclaredSourceError{Ref: ref.ID, Sources: names}
+		return nil, &UndeclaredSourceError{Ref: ref.ID, Sources: names, Offered: offered}
 	}
 
 	return got, nil
@@ -434,7 +491,22 @@ func (c *Client) resolve(ctx context.Context, fetcher *source.Fetcher, sources [
 // `github:` prefix, a URL, a path and an npm specifier all say where they
 // come from, so they keep their own kind.
 func bareID(ref source.Ref) bool {
-	return ref.Kind == source.KindGitHub && ref.Raw == ref.ID && ref.ID != ""
+	if ref.Kind != source.KindGitHub || ref.ID == "" || ref.Raw != ref.ID {
+		return false
+	}
+
+	// `owner/name` and nothing else. A colon means the ref names a scheme of
+	// its own — `github:owner/name`, and the canonical `local:name` id verger
+	// gives a locally installed package, which is a fact about the package
+	// rather than a place to fetch it from. Both are self-describing and both
+	// must reach their own kind.
+	if strings.Contains(ref.Raw, ":") {
+		return false
+	}
+
+	owner, name, ok := strings.Cut(ref.Raw, "/")
+
+	return ok && owner != "" && name != "" && !strings.Contains(name, "/")
 }
 
 // Apply executes one plan (DESIGN §9.1). It is the single entry point a second
