@@ -126,6 +126,18 @@ func (a *app) ask(message string, defaultYes bool) (bool, error) {
 		return false, err
 	}
 
+	// An empty read is not a "no". The terminal test is a character-device
+	// check and /dev/null is a character device, so a run with stdin
+	// redirected from it reaches the question, prints it, and gets nothing
+	// back. Taking the default there turned a refusal into a silent success:
+	// nothing written, exit 0. An unanswered question is a pending question,
+	// and it leaves through the typed error so the exit code is 5. A bare
+	// Enter - an empty line the user actually typed - is still a deliberate
+	// default, and is answered with it.
+	if errors.Is(err, io.EOF) && strings.TrimSpace(line) == "" {
+		return false, fmt.Errorf("%w: nothing was read from stdin", ErrConfirmationRequired)
+	}
+
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
 		return true, nil

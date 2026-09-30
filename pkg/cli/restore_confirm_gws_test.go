@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/odiumuniverse/verger/pkg/exitcode"
 )
 
 // TestRestoreAsksWithoutYes pins the question a restore has to ask.
@@ -98,6 +100,41 @@ func TestRestoreWithoutYesAndWithoutATerminalRefuses(t *testing.T) {
 				So(err, ShouldWrap, ErrConfirmationRequired)
 				So(worldFileExists(t, target), ShouldBeFalse)
 			})
+		})
+	})
+}
+
+// TestRestoreWithNoAnswerIsNotANo is the case a script actually hits. The
+// terminal check is a character-device test, and /dev/null is a character
+// device: a run with stdin redirected from it looks interactive, the question
+// is printed, and the read comes back empty. Treating that empty read as "no"
+// made the run print "nothing was written" and exit 0 - a refusal reported as
+// a success. An unanswered question is a pending question, and it has to leave
+// through the typed error so the exit code says so.
+func TestRestoreWithNoAnswerIsNotANo(t *testing.T) {
+	Convey("Given a removed package and a stdin that answers nothing", t, func() {
+		w := newWorld(t)
+		w.chdir(t, w.root)
+
+		target := w.target(t, "SKILL.md", "# installed\n")
+		w.mustRun(t, "install", w.fixture(t), "-y")
+		w.mustRun(t, "remove", "caveman", "-y")
+
+		w.tty = true
+		w.in = "" // /dev/null: the read returns EOF, not an answer
+
+		_, err := w.run("restore", "caveman")
+
+		Convey("Then it refuses with the typed error a script recognises", func() {
+			So(err, ShouldWrap, ErrConfirmationRequired)
+		})
+
+		Convey("Then nothing was restored", func() {
+			So(worldFileExists(t, target), ShouldBeFalse)
+		})
+
+		Convey("Then the exit code is consent, not success and not conflict", func() {
+			So(exitcode.Classify(err), ShouldEqual, exitcode.Consent)
 		})
 	})
 }

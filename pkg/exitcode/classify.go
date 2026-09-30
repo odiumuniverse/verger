@@ -121,6 +121,13 @@ func isConsent(err error) bool {
 		return true
 	}
 
+	// A question the tool could not ask is consent, not a disagreement on disk:
+	// the user's next action is to answer it or pass -y, and reporting it as
+	// a conflict told a script the run failed for a reason it cannot act on.
+	if errors.Is(err, apply.ErrConfirmationRequired) {
+		return true
+	}
+
 	return errors.Is(err, secret.ErrKeyringUnavailable) ||
 		errors.Is(err, secret.ErrKeyringUnsupported)
 }
@@ -151,9 +158,8 @@ func isConflict(err error) bool {
 	// else let a script read "done" over a file that was deliberately left
 	// alone.
 	_, handsOff := errors.AsType[*verger.HandsOffError](err)
-	confirm := errors.Is(err, apply.ErrConfirmationRequired)
 
-	return collision || restore || locked || leased || applyLock || destExists || srcMissing || confirm || handsOff
+	return collision || restore || locked || leased || applyLock || destExists || srcMissing || handsOff
 }
 
 func isHostUnavailable(err error) bool {

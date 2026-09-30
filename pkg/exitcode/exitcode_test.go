@@ -8,6 +8,7 @@ import (
 
 	. "github.com/smartystreets/goconvey/convey"
 
+	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/consent"
 	"github.com/odiumuniverse/verger/pkg/exitcode"
 	"github.com/odiumuniverse/verger/pkg/home"
@@ -84,6 +85,13 @@ func TestClassifyEachTypedError(t *testing.T) {
 			{"missing secrets", &host.MissingSecretsError{}, exitcode.Consent},
 			{"keyring unavailable", fmt.Errorf("load: %w", secret.ErrKeyringUnavailable), exitcode.Consent},
 			{"keyring unsupported", secret.ErrKeyringUnsupported, exitcode.Consent},
+			// A pending question is 5, not 3: the next action is the user
+			// answering, not the user settling a disagreement on disk. This
+			// is what `verger restore` with no terminal and no -y returns,
+			// and reporting it as a conflict told a script the run "failed"
+			// for a reason it cannot act on.
+			{"confirmation required", apply.ErrConfirmationRequired, exitcode.Consent},
+			{"confirmation required, wrapped", fmt.Errorf("restore: %w", apply.ErrConfirmationRequired), exitcode.Consent},
 
 			// 4 — policy
 			{"policy", &host.PolicyError{}, exitcode.Policy},
