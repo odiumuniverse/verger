@@ -12,7 +12,9 @@ import (
 	"github.com/odiumuniverse/verger/pkg/apply"
 	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
+	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/receipt"
+	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/verger"
 )
 
@@ -652,12 +654,83 @@ func ExampleConfirmer() {
 	// question: Install hooks?
 }
 
-// PickStrategy is the ladder a plan resolves per host; a front end that
-// previews a plan needs the same answer the executor will use.
-func ExamplePickStrategy() {
-	strategy, _ := verger.PickStrategy(host.Package{ID: "acme/caveman", Marketplace: "caveman@acme"}, host.Claude, "local")
+// PickStrategyFor is the ladder a front end that previews a plan resolves per
+// host with, and it takes the adapter rather than a host id — so the answer
+// comes from what the caller injected, not from what happens to be installed.
+//
+// This example used to call PickStrategy with a marketplace ref and expect
+// "native", which made it the one Example in this file that only passed on a
+// machine with a `claude` binary on PATH: under the hermetic PATH the ladder
+// correctly answered "loose" with a note saying the CLI does not resolve, and
+// the example failed. A goddoc example that fails on a stripped PATH is
+// documenting the machine, not the API.
+//
+// The fix is not to fake a binary into PATH — it is to pick inputs the ladder
+// decides from the payload alone. No `Marketplace`, so nothing is looked up;
+// a `caveman` id whose skill renders, so synth is chosen and the answer is
+// "synth" on every machine that has Go.
+func ExamplePickStrategyFor() {
+	root, err := os.MkdirTemp("", "verger-example-pick")
+	if err != nil {
+		return
+	}
+
+	defer func() { _ = os.RemoveAll(root) }()
+
+	// A real package tree, because pack.Render reads the payload it renders: a
+	// synth answer computed over a payload that does not exist would be a
+	// different example than the one the goddoc claims.
+	const skill = "# caveman\n"
+
+	writeExampleFile(filepath.Join(root, ".claude-plugin", "plugin.json"),
+		`{"name":"acme/caveman","version":"1.0.0","description":"A toolkit."}`)
+	writeExampleFile(filepath.Join(root, "skills", "caveman", "SKILL.md"), skill)
+
+	parsed, err := manifest.Parse(root, manifest.FormatClaude)
+	if err != nil {
+		return
+	}
+
+	pkg := host.Package{
+		ID:         parsed.ID,
+		Version:    parsed.Version,
+		Format:     parsed.Format,
+		Root:       root,
+		Components: parsed.Components,
+		MCP:        parsed.MCP,
+		Hooks:      parsed.Hooks,
+	}
+
+	strategy, note := verger.PickStrategyFor(exampleAdapter{}, pkg, source.KindGit)
 
 	fmt.Println(strategy)
+	fmt.Println(note)
 	// Output:
-	// native
+	// synth
+	// synth: pkg/pack rendered the payload for the host, so no host CLI is needed
+}
+
+// exampleAdapter is the fake host the strategy example resolves against: an
+// injected adapter, so the ladder's answer comes from what the caller passed in
+// rather than from which CLIs the machine running the tests happens to have.
+type exampleAdapter struct{}
+
+// ID implements host.Host.
+func (exampleAdapter) ID() host.ID { return host.Claude }
+
+// Detect implements host.Host: injected means present.
+func (exampleAdapter) Detect(string) bool { return true }
+
+// Oracle implements host.Host.
+func (exampleAdapter) Oracle() host.Oracle { return exampleOracle{} }
+
+// Deliver implements host.Host: the strategy example resolves a decision and
+// never delivers, so there is nothing to write.
+func (exampleAdapter) Deliver(context.Context, string, host.Delivery) (host.Result, error) {
+	return host.Result{}, nil
+}
+
+// Uninstall implements host.Host.
+func (exampleAdapter) Uninstall(context.Context, string, receipt.Receipt) (host.Result, error) {
+	return host.Result{}, nil
 }

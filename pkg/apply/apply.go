@@ -160,8 +160,7 @@ const defaultParallel = 4
 func loadLockForRun(path string, fallback *lock.Lock) (*lock.Lock, error) {
 	doc, err := lock.ParseFile(path)
 	if err != nil {
-		var newer *lock.SchemaNewerError
-		if errors.As(err, &newer) {
+		if _, newer := errors.AsType[*lock.SchemaNewerError](err); newer {
 			return nil, err
 		}
 
