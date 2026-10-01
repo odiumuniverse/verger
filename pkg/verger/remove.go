@@ -104,6 +104,28 @@ func excludedNote(pkg, hostID string, filter HostFilter, registered []host.Host)
 	return fmt.Sprintf("%s: %s was excluded by %s; left installed", pkg, hostID, flag)
 }
 
+// holdsSomething reports whether a receipt is holding something a removal has
+// to take back.
+//
+// A receipt holds its package in two ways, and counting only the first made
+// every native and synth removal a no-op. Artifacts are what verger wrote;
+// host-install ops are what a host CLI registered and only a host CLI can take
+// back. A registered plugin produces a receipt with two host-install ops and
+// NO artifacts at all — that is what the e2e remote-archive leg installs — so
+// the artifact count said "this host holds nothing", no action was built, and
+// `remove` reported an empty plan and exited 0 with the plugin still enabled
+// on the host. The question is whether anything is left to undo, not whether a
+// file is.
+func holdsSomething(record *receipt.Receipt) bool {
+	if len(record.Artifacts) > 0 {
+		return true
+	}
+
+	return slices.ContainsFunc(record.RMA, func(op receipt.Op) bool {
+		return op.Kind == receipt.OpHostInstall
+	})
+}
+
 // PlanRemove resolves the receipts one package id owns and the actions that
 // would reverse them. A host whose adapter this build does not have is left
 // installed, with the reason in the notes, never silently dropped.
@@ -157,7 +179,7 @@ func (c *Client) PlanRemove(ctx context.Context, id string, opts RemoveOptions) 
 		// has, after pruning, nothing left to delete — and skipping its action
 		// would leave its receipt behind forever, so the reference count would
 		// never reach zero and no later removal could ever take the file.
-		held := len(record.Artifacts) > 0
+		held := holdsSomething(&record)
 
 		plan.Notes = append(plan.Notes,
 			pruneSharedArtifacts(&record, pathsSharedWithRemainingHosts(list, id, adapterByID))...)

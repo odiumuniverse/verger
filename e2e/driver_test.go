@@ -1126,7 +1126,12 @@ func assertNotCurrent(t *testing.T, env Env, host string) {
 			continue
 		}
 
-		if cell.Status == "current" {
+		// `detail` is the code and `status` is the user-facing word (cellDoc):
+		// a delivered cell reads "delivered", so comparing `status` to
+		// "current" could never fire and the assertion passed over a cell that
+		// was still there. This is the one check that would have caught the
+		// remote-archive removal that reported success and removed nothing.
+		if cell.Detail == "current" {
 			t.Fatalf("e2e: %s cell still current after remove: %+v", host, cell)
 		}
 

@@ -1030,6 +1030,29 @@ func (r *runner) runRemove(action Action, cell CellResult) CellResult {
 		return cell
 	}
 
+	// A host CLI that answers is not a host that agreed. When the receipt held
+	// registrations, the host's own list is re-read BEFORE the receipt is
+	// deleted: a plugin the host still names was not taken back, and finishing
+	// here would report a removal that never happened — the silent false
+	// success pS hit on the remote-archive leg.
+	if registrations(prev.RMA) {
+		listed, listErr := r.hostStillLists(action.Host, prev)
+
+		switch {
+		case listErr != nil:
+			cell.Status = StatusFailed
+			cell.Notes = append(cell.Notes, "remove: ask "+string(action.Host)+" what it still has: "+listErr.Error())
+
+			return cell
+		case listed:
+			cell.Status = StatusFailed
+			cell.Notes = append(cell.Notes,
+				"remove: "+string(action.Host)+" still lists "+prev.Package+" after uninstall; the host CLI did not remove it")
+
+			return cell
+		}
+	}
+
 	if err := r.finishRemove(action, outcome); err != nil {
 		cell.Status = StatusFailed
 		cell.Notes = append(cell.Notes, err.Error())
@@ -1071,6 +1094,48 @@ func (r *runner) finishRemove(action Action, outcome rmaOutcome) error {
 	r.emit(action, stepReceipt, "removed "+prev.Package)
 
 	return nil
+}
+
+// registrations reports whether ops hold anything only a host CLI can take
+// back. A file op is undone on the disk and needs no second opinion; a
+// registration lives inside the host, and only the host can say it is gone.
+func registrations(ops []receipt.Op) bool {
+	return slices.ContainsFunc(ops, func(op receipt.Op) bool {
+		return op.Kind == receipt.OpHostInstall
+	})
+}
+
+// hostStillLists reports whether the host's own list still names this package
+// after its inverse ran.
+//
+// The plugin name is the package's last segment: a package is `market/plugin`
+// and that is what a host's list prints. An entry that names something else is
+// not counted — the same rule the delivery path uses when it decides an
+// artifact is not checkable against the disk.
+func (r *runner) hostStillLists(hostID host.ID, prev *receipt.Receipt) (bool, error) {
+	adapter, ok := r.deps.Hosts[hostID]
+	if !ok {
+		return false, nil
+	}
+
+	oracle := adapter.Oracle()
+	if oracle == nil {
+		return false, nil
+	}
+
+	listed, err := oracle.List(r.ctx)
+	if err != nil {
+		return false, err
+	}
+
+	name := prev.Package
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+
+	return slices.ContainsFunc(listed, func(entry host.Installed) bool {
+		return entry.Name == name || entry.Name == prev.Package || entry.Source == name
+	}), nil
 }
 
 // driftNotes compares the previous receipt against the disk and reports every

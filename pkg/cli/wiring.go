@@ -353,6 +353,13 @@ type reportDoc struct {
 	Cells  []cellDoc `json:"cells"`
 	Notes  []string  `json:"notes,omitempty"`
 	Home   string    `json:"home,omitempty"`
+
+	// Status is the run's own verdict, and it is here for the one case that has
+	// no cells to speak for it: removing a package that is not installed
+	// produces no cell, so without this field a script reading `cells: []`
+	// cannot tell "there was nothing to remove" from "the command wrote no
+	// document". Empty on every run that has cells — the cells are the report.
+	Status string `json:"status,omitempty"`
 }
 
 // reportDocFrom converts one apply report.

@@ -65,9 +65,7 @@ func (a *app) runRemove(ctx context.Context, id string, cause receipt.Cause) err
 	}
 
 	if len(plan.Actions) == 0 {
-		_, err := fmt.Fprintf(a.out, "%s: no installed cell\n", id)
-
-		return err
+		return a.renderNothingInstalled(id, homeRoot(client))
 	}
 
 	if err := a.printPlan(cliCells(plan.Cells)); err != nil {
@@ -173,4 +171,38 @@ func (a *app) runRestore(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// statusNotInstalled is the report status of a removal that had nothing to
+// remove. It is a named constant because a script keys off the string, and a
+// literal in a format call is not something a reader can grep for.
+const statusNotInstalled = "not-installed"
+
+// renderNothingInstalled reports a removal of a package that is not installed
+// on any host.
+//
+// The exit stays 0: `remove` is idempotent so a script can remove a package
+// without first asking whether it is there, and turning "already gone" into a
+// failure would break exactly that script. What was wrong was the reporting.
+// "no installed cell" reads like a complaint about the arguments rather than a
+// statement about the machine, and under --json this branch printed NOTHING AT
+// ALL — no document, no cells, no way for a caller to tell "there was nothing
+// to remove" from "the command produced no output". So the text now names the
+// package and the reason, and the JSON carries a status a script can test.
+func (a *app) renderNothingInstalled(id, homePath string) error {
+	message := id + " is not installed on any host — nothing to remove"
+
+	if a.jsonOut {
+		return a.printJSON(reportDoc{
+			Schema: schemaOf(schemaReport),
+			Cells:  []cellDoc{},
+			Notes:  []string{message},
+			Home:   homePath,
+			Status: statusNotInstalled,
+		})
+	}
+
+	_, err := fmt.Fprintln(a.out, message)
+
+	return err
 }
