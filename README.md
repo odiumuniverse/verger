@@ -197,10 +197,22 @@ question. Anything touching something you wrote, or needing your consent, is lef
 | `verger import` | write what your agents already installed into the spec |
 | `verger gc` | purge trash entries older than the retention window |
 
+Removal is checked, not assumed: after a host's own uninstall, verger re-reads what that host
+lists and fails the cell if the package is still there — a host CLI that answered is not a host
+that agreed. Removing a package that is not installed is not an error either: it prints
+`<id> is not installed on any host — nothing to remove` and exits 0, because a script must be
+able to remove without first asking whether it is there. Under `--json` that same run carries
+`"status":"not-installed"`, so a caller can tell it apart from a run that wrote cells.
+
 `status --outdated-only` shows only skew and missing cells; `install` and `update` take
 `--hooks ask|yes|no`; `install --pin` records a version; `gc --dry-run` shows what it would purge.
 Without `--allow-downgrade`, a channel that resolves to an older version skips the package and
 prints the command that would take it.
+
+Your `verger.toml` is yours to write, so a command that changes it changes only what it means to:
+comments, blank lines and the quoting you used come back byte for byte, and `pin` adds its one
+`version =` line to the package it names. A load and a save with nothing changed in between gives
+back the same file, so a command that touches one package cannot reformat the other nine.
 
 `search` never reaches the network. It answers from the spec, the lock, the receipts and the
 offers of `local:` sources, and names every other source under `skipped` rather than passing over
@@ -321,6 +333,11 @@ Every document starts with the same envelope, so a consumer can read one and swi
 
 `-y` never means "discard what you wrote". It answers the prompts a command asks and never resolves
 a destructive conflict; overwriting a file you edited is always its own flag, `--force`.
+
+It never grants consent either. Hooks are the one thing `-y` does not decide: the package's files
+are installed and its hooks do not run, the run ends with `hooks skipped … no consent was given`,
+and the exit is 5. That is a deliberate answer, not a failure to ask — granting it is its own
+step, `--hooks yes` or `verger approve <id>` for the content hash.
 
 ### Exit codes
 
