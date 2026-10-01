@@ -102,6 +102,13 @@ func TestOpenHomeSources(t *testing.T) {
 			t.Fatalf("mkdir vault: %v", err)
 		}
 
+		// A vault DIRECTORY is not a home any more — an emptied one is what
+		// `beadle plugins eject` leaves behind, and taking it for a home is the
+		// bug this batch fixes (pR-27). So the fixture puts a home in it.
+		if err := os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600); err != nil {
+			t.Fatalf("write spec: %v", err)
+		}
+
 		t.Setenv("VERGER_HOME", "")
 		t.Setenv("BEADLE_HOME", beadle)
 
