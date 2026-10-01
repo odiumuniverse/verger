@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/odiumuniverse/verger/pkg/exitcode"
+
 	"github.com/odiumuniverse/verger/pkg/secret"
 
 	"github.com/spf13/cobra"
@@ -124,6 +126,23 @@ type ApplyFailedError struct {
 func (e *ApplyFailedError) Error() string {
 	return fmt.Sprintf("%d cell(s) failed: %s", len(e.Cells), strings.Join(e.Cells, ", "))
 }
+
+// ExitClass reports that a command named a feature this phase does not have.
+// The user's next action is to run the task that brings it, which is not a
+// disagreement on disk and not something verger can fix by retrying.
+func (e *NotAvailableError) ExitClass() int { return exitcode.HostUnavailable }
+
+// ExitClass reports that the package is installed, but not on any host. The run
+// cannot ask a host to do something when there is no host to ask.
+func (e *ApplyFailedError) ExitClass() int { return exitcode.HostUnavailable }
+
+// ExitClass reports a refusal to write because the run was --locked. Rule 7 is
+// what refused it, and the way out is to run without the flag.
+func (e *LockedError) ExitClass() int { return exitcode.Policy }
+
+// ExitClass reports a project manifest waiting for the user to say they trust
+// it: the same question as an unanswered hook consent.
+func (e *TrustError) ExitClass() int { return exitcode.Consent }
 
 // app is the per-invocation CLI state shared by every command.
 type app struct {

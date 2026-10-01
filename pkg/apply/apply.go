@@ -153,6 +153,11 @@ type Report struct {
 	// made every later run report a consent failure for a package it had never
 	// looked at.
 	PendingConsent []string
+	// Refusals names the operations a host declined to carry out. It is part
+	// of the result rather than buried in a cell's notes because the exit
+	// class is decided from it: a run that failed only because a host said no
+	// is a different answer for a script than a run verger could not finish.
+	Refusals []HostRefusedError
 }
 
 // Confirmer asks the user one question and reports the answer.
@@ -265,6 +270,47 @@ func (e *ReceiptError) Error() string {
 
 // Unwrap returns the underlying cause.
 func (e *ReceiptError) Unwrap() error {
+	return e.Cause
+}
+
+// HostRefusedError reports that the host did not carry out an operation verger
+// asked of it, so the run cannot honestly report the operation as done.
+//
+// It is a type of its own because "the host said no" is not any other failure.
+// The removal ran, the host answered, and the answer was that the thing is
+// still there — a condition the user can go and look at, on that host, with
+// that host's own CLI. Reporting it as an unexpected error sent the run out at
+// the code that means verger itself broke, which is the one answer nobody can
+// act on.
+//
+// Output is what the host's CLI printed, verbatim. It is carried rather than
+// summarised because the summary is the part the user already has: the point of
+// the message is to say which host, what it still lists, and let the host speak
+// for itself.
+type HostRefusedError struct {
+	Host    host.ID
+	Package string
+	Action  string
+	Output  string
+	Cause   error
+}
+
+// Error implements error.
+func (e *HostRefusedError) Error() string {
+	msg := fmt.Sprintf("%s did not %s %s", e.Host, e.Action, e.Package)
+	if e.Output != "" {
+		msg += ": " + e.Output
+	}
+
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
+
+	return msg
+}
+
+// Unwrap returns the underlying cause.
+func (e *HostRefusedError) Unwrap() error {
 	return e.Cause
 }
 

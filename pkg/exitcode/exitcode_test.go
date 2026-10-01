@@ -118,10 +118,20 @@ func TestClassifyEachTypedError(t *testing.T) {
 			{"invalid project", &consent.InvalidProjectError{}, exitcode.Usage},
 			{"temporary home", &service.ErrTemporaryHome{Home: "/tmp/x"}, exitcode.Usage},
 
-			// 1 — unclassified
+			// 3 — asking to restore something the trash does not hold. This was
+			// pinned at 1 as an example of an error verger raises without
+			// knowing what it means. It does know: the answer is the same
+			// family as the restore conflict beside it, and telling a user
+			// "verger crashed" when the trash is simply empty tells them
+			// something false.
+			{"store not found", &store.NotFoundError{}, exitcode.Conflict},
+
+			// 1 — unclassified. Only errors that are not verger's: a plain one
+			// and the filesystem's own. Nothing verger raises on purpose may
+			// land here, and classified_gws_test.go holds every one of them to
+			// that.
 			{"plain error", errors.New("boom"), exitcode.Unexpected},
 			{"fs not exist", fs.ErrNotExist, exitcode.Unexpected},
-			{"store not found", &store.NotFoundError{}, exitcode.Unexpected},
 		}
 
 		for _, item := range table {

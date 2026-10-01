@@ -418,6 +418,22 @@ func failedCells(report apply.Report) error {
 		}
 	}
 
+	// A host that declined the operation is the run's answer, and it outranks
+	// the generic "cells failed" verdict. The two used to leave through one
+	// unclassified error, so "the agent still has the plugin" and "verger could
+	// not finish" shared an exit code — a script branching on it could not tell
+	// an answer from a crash. Naming the refusal keeps the distinction where a
+	// caller can read it.
+	if len(report.Refusals) > 0 {
+		return &apply.HostRefusedError{
+			Host:    report.Refusals[0].Host,
+			Package: report.Refusals[0].Package,
+			Action:  report.Refusals[0].Action,
+			Output:  report.Refusals[0].Output,
+			Cause:   report.Refusals[0].Cause,
+		}
+	}
+
 	if len(failed) != 0 {
 		return &ApplyFailedError{Cells: failed}
 	}

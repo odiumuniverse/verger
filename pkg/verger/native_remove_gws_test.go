@@ -258,7 +258,19 @@ func TestARegistrationThatSurvivesUninstallFailsOnEveryHost(t *testing.T) {
 					// failedCells), so this is the signal a user sees.
 					So(len(report.Cells), ShouldEqual, 1)
 					So(string(report.Cells[0].Status), ShouldEqual, "failed")
-					So(strings.Join(report.Cells[0].Notes, " "), ShouldContainSubstring, "still lists")
+				})
+
+				Convey("And the refusal names the host and repeats what its CLI said", func() {
+					// The cell note is prose; this is what the exit class is
+					// decided from. Both have to carry the host, because the
+					// user's next move is on that host, with that host's CLI.
+					So(len(report.Refusals), ShouldEqual, 1)
+					So(string(report.Refusals[0].Host), ShouldEqual, string(id))
+					So(report.Refusals[0].Package, ShouldEqual, "acme/e2e-fixture")
+					So(report.Refusals[0].Output, ShouldContainSubstring, "e2e-fixture")
+
+					So(strings.Join(report.Cells[0].Notes, " "), ShouldContainSubstring, string(id))
+					So(strings.Join(report.Cells[0].Notes, " "), ShouldContainSubstring, "e2e-fixture")
 				})
 
 				Convey("And the receipt survives, so the plugin is still a thing to remove", func() {

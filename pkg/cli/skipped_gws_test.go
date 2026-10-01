@@ -51,10 +51,11 @@ func TestSkippedCarriesItsReason(t *testing.T) {
 // because reporting success there would claim work that never happened.
 func TestExitCodeTable(t *testing.T) {
 	cases := []struct {
-		name   string
-		cells  []apply.CellResult
-		exit   int
-		isFail bool
+		name     string
+		cells    []apply.CellResult
+		refusals []apply.HostRefusedError
+		exit     int
+		isFail   bool
 	}{
 		{
 			name: "everything delivered exits ok",
@@ -95,18 +96,38 @@ func TestExitCodeTable(t *testing.T) {
 			isFail: true,
 		},
 		{
-			name: "a failed cell still fails, and the failure wins",
+			// A failed cell is a HOST that did not do what it was asked, which
+			// is a thing the user can go and look at. It used to exit 1, the
+			// code that means verger itself broke, so a script branching on it
+			// could not tell an answer from a crash.
+			name: "a failed cell is the host failing, not verger failing",
 			cells: []apply.CellResult{
 				{Package: "a", Host: host.Claude, Status: apply.StatusFailed},
 			},
 			isFail: true,
-			exit:   exitcode.Unexpected,
+			exit:   exitcode.HostUnavailable,
+		},
+		{
+			name:     "a host that declined the operation names itself, not the cells",
+			refusals: []apply.HostRefusedError{{Host: host.Claude, Package: "a", Action: "remove", Output: "a 1.0.0"}},
+			isFail:   true,
+			exit:     exitcode.HostUnavailable,
+		},
+		{
+			// The refusal outranks the cell list on purpose: "the agent still
+			// has the plugin" and "3 cells failed" are different answers, and
+			// only one of them can be acted on without reading the report.
+			name:     "a refusal wins over the failed cells it came from",
+			cells:    []apply.CellResult{{Package: "a", Host: host.Claude, Status: apply.StatusFailed}},
+			refusals: []apply.HostRefusedError{{Host: host.Claude, Package: "a", Action: "remove"}},
+			isFail:   true,
+			exit:     exitcode.HostUnavailable,
 		},
 	}
 
 	for _, tc := range cases {
 		Convey("Given a report: "+tc.name, t, func() {
-			err := failedCells(apply.Report{Cells: tc.cells})
+			err := failedCells(apply.Report{Cells: tc.cells, Refusals: tc.refusals})
 
 			Convey("Then the exit code is the one the table says", func() {
 				if tc.isFail {

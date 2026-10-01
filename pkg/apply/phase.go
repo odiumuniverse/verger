@@ -137,6 +137,7 @@ type runner struct {
 	breakers    map[host.ID]CircuitState
 	notes       []string
 	recovered   map[cellKey]recoveredCell
+	refusals    []HostRefusedError
 	confirmErr  error
 }
 
@@ -543,6 +544,18 @@ func configOpFor(ops []receipt.Op, path string) (receipt.Op, bool) {
 	}
 
 	return receipt.Op{}, false
+}
+
+// recordRefusal remembers that a host declined an operation.
+//
+// It is kept on the runner rather than left in the cell's notes because the run's
+// exit class is decided from it, and a note is prose: nothing can read a
+// sentence and know it meant "the host said no".
+func (r *runner) recordRefusal(refusal HostRefusedError) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.refusals = append(r.refusals, refusal)
 }
 
 // markRecovered records the crash-replay verdict of one cell.
@@ -1043,11 +1056,25 @@ func (r *runner) runRemove(action Action, cell CellResult) CellResult {
 			cell.Status = StatusFailed
 			cell.Notes = append(cell.Notes, "remove: ask "+string(action.Host)+" what it still has: "+listErr.Error())
 
+			r.recordRefusal(HostRefusedError{
+				Host:    action.Host,
+				Package: prev.Package,
+				Action:  "remove",
+				Cause:   listErr,
+			})
+
 			return cell
-		case listed:
+		case len(listed) > 0:
 			cell.Status = StatusFailed
-			cell.Notes = append(cell.Notes,
-				"remove: "+string(action.Host)+" still lists "+prev.Package+" after uninstall; the host CLI did not remove it")
+
+			refusal := HostRefusedError{
+				Host:    action.Host,
+				Package: prev.Package,
+				Action:  "remove",
+				Output:  listedFor(listed),
+			}
+			cell.Notes = append(cell.Notes, "remove: "+refusal.Error())
+			r.recordRefusal(refusal)
 
 			return cell
 		}
@@ -1112,20 +1139,20 @@ func registrations(ops []receipt.Op) bool {
 // and that is what a host's list prints. An entry that names something else is
 // not counted — the same rule the delivery path uses when it decides an
 // artifact is not checkable against the disk.
-func (r *runner) hostStillLists(hostID host.ID, prev *receipt.Receipt) (bool, error) {
+func (r *runner) hostStillLists(hostID host.ID, prev *receipt.Receipt) ([]host.Installed, error) {
 	adapter, ok := r.deps.Hosts[hostID]
 	if !ok {
-		return false, nil
+		return nil, nil
 	}
 
 	oracle := adapter.Oracle()
 	if oracle == nil {
-		return false, nil
+		return nil, nil
 	}
 
 	listed, err := oracle.List(r.ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	name := prev.Package
@@ -1133,9 +1160,37 @@ func (r *runner) hostStillLists(hostID host.ID, prev *receipt.Receipt) (bool, er
 		name = name[idx+1:]
 	}
 
-	return slices.ContainsFunc(listed, func(entry host.Installed) bool {
-		return entry.Name == name || entry.Name == prev.Package || entry.Source == name
-	}), nil
+	// The entries come back rather than a bare yes, because the message has to
+	// show what the host said. A refusal that reports only "the host still has
+	// it" sends the user to the host's own CLI to find out which line, when the
+	// answer was already in hand.
+	var matched []host.Installed
+
+	for _, entry := range listed {
+		if entry.Name == name || entry.Name == prev.Package || entry.Source == name {
+			matched = append(matched, entry)
+		}
+	}
+
+	return matched, nil
+}
+
+// listedFor renders the entries a host's CLI printed that name this package. It
+// is the host's own words and not verger's paraphrase, so the user can paste it
+// back into the host's command and see the same line.
+func listedFor(entries []host.Installed) string {
+	lines := make([]string, 0, len(entries))
+
+	for _, entry := range entries {
+		line := entry.Name
+		if entry.Version != "" {
+			line += " " + entry.Version
+		}
+
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, ", ")
 }
 
 // driftNotes compares the previous receipt against the disk and reports every
@@ -2156,7 +2211,12 @@ func (r *runner) report() Report {
 		}
 	}
 
-	return Report{Cells: cells, Notes: slices.Clone(r.notes), Breakers: breakers}
+	return Report{
+		Cells:    cells,
+		Notes:    slices.Clone(r.notes),
+		Breakers: breakers,
+		Refusals: slices.Clone(r.refusals),
+	}
 }
 
 // runErr is the run-level error, if any: cancellation wins over confirmation.
