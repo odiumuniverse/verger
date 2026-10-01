@@ -105,6 +105,7 @@ func TestDiscoverPrecedence(t *testing.T) {
 			beadle := filepath.Join(t.TempDir(), "beadle")
 			vault := filepath.Join(beadle, BeadleSubdir)
 			So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+			So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 			h, err := Discover(
 				WithEnv(envMap(map[string]string{EnvBeadleHome: beadle})),
@@ -127,6 +128,7 @@ func TestDiscoverBeadleFallbacks(t *testing.T) {
 		Convey("When BEADLE_HOME is unset but ~/.beadle/verger exists", func() {
 			vault := filepath.Join(userHome, BeadleDirName, BeadleSubdir)
 			So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+			So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 			h, err := Discover(WithEnv(envMap(nil)), WithUserHome(userHome))
 
@@ -220,6 +222,7 @@ func TestDiscoverPathForms(t *testing.T) {
 			beadle := filepath.Join(t.TempDir(), "rel-beadle")
 			vault := filepath.Join(beadle, BeadleSubdir)
 			So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+			So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 			cwd, err := os.Getwd()
 			So(err, ShouldBeNil)
@@ -449,6 +452,7 @@ func TestDiscoverVaultWithoutUserHome(t *testing.T) {
 		beadle := filepath.Join(t.TempDir(), "beadle")
 		vault := filepath.Join(beadle, BeadleSubdir)
 		So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+		So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 		Convey("When discovery runs", func() {
 			h, err := Discover(

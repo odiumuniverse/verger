@@ -25,6 +25,7 @@ func TestAVaultWithoutAVergerSubdirIsStillTheHome(t *testing.T) {
 		root := t.TempDir()
 		vault := filepath.Join(root, "beadle")
 		So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+		So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 		So(dirExists(t, filepath.Join(vault, "verger")), ShouldBeFalse)
 
@@ -81,6 +82,7 @@ func TestAnEmptyEnvironmentVariableMeansUnset(t *testing.T) {
 				root := t.TempDir()
 				vault := filepath.Join(root, "beadle")
 				So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+				So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 				found, err := Discover(
 					WithEnv(envMap(map[string]string{name: ""})),
@@ -129,6 +131,7 @@ func TestTheDiscoveryLadderWithAnEmptyHomeVariable(t *testing.T) {
 		vault := filepath.Join(userHome, BeadleDirName)
 
 		So(os.MkdirAll(vault, 0o700), ShouldBeNil)
+		So(os.WriteFile(filepath.Join(vault, "verger.toml"), []byte("# spec\n"), 0o600), ShouldBeNil)
 
 		Convey("When VERGER_HOME is exported but empty", func() {
 			found, err := Discover(

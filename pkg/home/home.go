@@ -145,7 +145,98 @@ func vaultAt(beadle string) string {
 		return ""
 	}
 
+	// Present and EMPTY is also not a home. `beadle plugins eject` moves the
+	// state to ~/.verger and leaves this directory behind; discovery took it
+	// for a home, so every command afterwards ran against an empty one and
+	// reported no cells. The vault existing was the right signal when the
+	// subdir was verger's to create; it stops being the right signal the moment
+	// something else can empty the directory without removing it.
+	if _, subErr := os.Stat(candidate); subErr == nil && !looksLikeHome(candidate) {
+		return ""
+	}
+
 	return candidate
+}
+
+// looksLikeHome reports whether dir actually holds a verger home.
+//
+// Either marker is enough, because a fresh home has one or the other and not
+// both: state/ is created by the first write, verger.toml by the first install.
+func looksLikeHome(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "verger.toml")); err == nil {
+		return true
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "state"))
+
+	return err == nil && info.IsDir()
+}
+
+// CompetingHome reports a second home on this machine that discovery did NOT
+// choose, so a caller can tell the user about it.
+//
+// Two real homes is the state this product refuses to create: two locks, two
+// receipt trees, and the vault and the CLI stopping on what is installed. The
+// vault still wins — that is unchanged — but it wins silently, and a user who
+// has ended up here needs to be told which other directory is the one to look
+// at.
+//
+// An emptied directory is not reported: it is not a home, and warning about it
+// would be a false alarm about a directory nothing will use.
+//
+// The caller renders the warning. verger has no doctor of its own — the finding
+// is printed by `beadle doctor`, which is the surface a user already runs when
+// something looks wrong.
+func CompetingHome(opts ...Option) (string, bool) {
+	cfg := config{lookup: os.Getenv}
+
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	if cfg.lookup == nil {
+		cfg.lookup = os.Getenv
+	}
+
+	// $VERGER_HOME is the user saying where the home is. There is nothing to
+	// compete with it.
+	if value := strings.TrimSpace(cfg.lookup(EnvHome)); value != "" {
+		return "", false
+	}
+
+	chosen, err := Discover(opts...)
+	if err != nil {
+		return "", false
+	}
+
+	if chosen.Source() != SourceBeadleVault {
+		return "", false
+	}
+
+	explicitBeadle := strings.TrimSpace(cfg.lookup(EnvBeadleHome))
+
+	beadle := explicitBeadle
+
+	if beadle == "" {
+		userHome, homeErr := cfg.resolveUserHome()
+		if homeErr != nil {
+			return "", false
+		}
+
+		beadle = filepath.Join(userHome, BeadleDirName)
+	}
+
+	// beadle is <user home>/.beadle, so its parent IS the user home.
+	defaultHome, err := resolvePath(filepath.Join(filepath.Dir(beadle), DirName))
+	if err != nil || !looksLikeHome(defaultHome) {
+		return "", false
+	}
+
+	if defaultHome == chosen.Root() {
+		return "", false
+	}
+
+	return defaultHome, true
 }
 
 // resolveUserHome returns the injected user home or os.UserHomeDir.
