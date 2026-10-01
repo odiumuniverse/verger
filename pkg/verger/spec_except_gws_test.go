@@ -189,38 +189,115 @@ func detectSharedRootHosts(t *testing.T, home string) {
 	}
 }
 
+// unwriteSharedRoot takes away what the shared-root hosts were given, so the
+// next reconcile has work to do.
+//
+// Without it these tests prove nothing at all, and they passed for a while
+// without it. A reconcile of a package already installed at this exact version
+// is settled: `installedIsSettled` (sync.go:412) returns before a single cell is
+// planned, the report comes back empty, and "the excluded host is not in the
+// report" is true of a run that wrote to nobody. A receipt whose files are not
+// on this disk is not an install — that is what a machine which received the
+// vault looks like — so removing the files is what puts the hosts back to work.
+func unwriteSharedRoot(t *testing.T, home string) {
+	t.Helper()
+
+	if err := os.RemoveAll(filepath.Join(home, ".agents", "skills")); err != nil {
+		t.Fatalf("unwrite shared root: %v", err)
+	}
+}
+
+// reconcileExcludedHost is the shape both reconcile verbs are checked in, and it
+// is a function rather than a copy because `Sync` and `Update` are the same call
+// with a flag: two hand-written bodies would drift apart, and the drift would
+// be invisible, because each would still pass its own assertions.
+//
+// It installs a shared-root package, takes the delivered files back so the
+// reconcile has work to do, excludes one host in the spec, and returns the hosts
+// the run wrote cells for.
+func reconcileExcludedHost(t *testing.T, world *sharedWorld, verb string) []host.ID {
+	t.Helper()
+
+	paths, err := world.client.Paths(User, "")
+	So(err, ShouldBeNil)
+
+	pkgRoot := sharedSkillPackage(t, t.TempDir(), "caveman")
+
+	plan, err := world.client.Plan(t.Context(), PlanOptions{
+		Paths: paths, Refs: []string{pkgRoot}, Hosts: world.adapters,
+	})
+	So(err, ShouldBeNil)
+	So(plan.Packages, ShouldNotBeEmpty)
+
+	id := plan.Packages[0].Package.ID
+
+	_, err = world.client.Install(t.Context(), plan, ApplyOptions{Confirm: allowAllConfirmer{}})
+	So(err, ShouldBeNil)
+
+	detectSharedRootHosts(t, world.home)
+	unwriteSharedRoot(t, world.home)
+	exceptHost(t, paths, id, host.Omp)
+
+	var report *apply.Report
+
+	switch verb {
+	case "sync":
+		_, report, err = world.client.Sync(t.Context(), SyncOptions{
+			Paths: paths, Only: id, Confirm: allowAllConfirmer{},
+		})
+	case "update":
+		_, report, err = world.client.Update(t.Context(), UpdateOptions{
+			Paths: paths, Only: id, Confirm: allowAllConfirmer{},
+		})
+	default:
+		t.Fatalf("unknown verb %q", verb)
+	}
+
+	So(err, ShouldBeNil)
+
+	return hostsIn(report)
+}
+
 // TestSyncLeavesOutAHostTheSpecExcludes is the reconcile itself, over detected
 // adapters rather than injected ones.
 func TestSyncLeavesOutAHostTheSpecExcludes(t *testing.T) {
 	Convey("Given a spec that excludes one host for an installed package", t, func() {
 		world := newSharedWorld(t)
 
-		paths, err := world.client.Paths(User, "")
-		So(err, ShouldBeNil)
-
-		pkgRoot := sharedSkillPackage(t, t.TempDir(), "caveman")
-
-		plan, err := world.client.Plan(t.Context(), PlanOptions{
-			Paths: paths, Refs: []string{pkgRoot}, Hosts: world.adapters,
-		})
-		So(err, ShouldBeNil)
-		So(plan.Packages, ShouldNotBeEmpty)
-
-		id := plan.Packages[0].Package.ID
-
-		_, err = world.client.Install(t.Context(), plan, ApplyOptions{Confirm: allowAllConfirmer{}})
-		So(err, ShouldBeNil)
-
 		Convey("Then a reconcile writes no cell for the excluded host", func() {
-			detectSharedRootHosts(t, world.home)
-			exceptHost(t, paths, id, host.Omp)
+			So(reconcileExcludedHost(t, world, "sync"), ShouldNotContain, host.Omp)
+		})
 
-			_, report, syncErr := world.client.Sync(t.Context(), SyncOptions{
-				Paths: paths, Only: id, Confirm: allowAllConfirmer{},
-			})
-			So(syncErr, ShouldBeNil)
+		Convey("And it writes cells for the hosts the spec did not exclude", func() {
+			// Without this the exclusion above is satisfied by a reconcile
+			// that wrote to nobody, which is the shape a broken filter takes.
+			So(reconcileExcludedHost(t, world, "sync"), ShouldContain, host.Agy)
+		})
+	})
+}
 
-			So(hostsIn(report), ShouldNotContain, host.Omp)
+// TestUpdateLeavesOutAHostTheSpecExcludes is the fourth writing command, and the
+// one this report named without a test to show for it.
+//
+// `Update` is `Sync` with a flag, so it reaches the filter through the same call
+// — which is the argument for not needing a test at all, and is exactly why it
+// needs one: a command that is a synonym is the one whose divergence nobody
+// notices, because every other command's test still passes. It is also the
+// command whose host set comes from the update cooldown rather than a
+// reconcile, so it is the one where "the same options" is a claim worth making
+// out loud.
+func TestUpdateLeavesOutAHostTheSpecExcludes(t *testing.T) {
+	Convey("Given a spec that excludes one host for an installed package", t, func() {
+		world := newSharedWorld(t)
+
+		Convey("Then an update writes no cell for the excluded host", func() {
+			So(reconcileExcludedHost(t, world, "update"), ShouldNotContain, host.Omp)
+		})
+
+		Convey("And the host it did not exclude is still written", func() {
+			// Without this the exclusion would be satisfied by an update that
+			// writes to nobody at all, which is the shape a broken filter takes.
+			So(reconcileExcludedHost(t, world, "update"), ShouldContain, host.Agy)
 		})
 	})
 }

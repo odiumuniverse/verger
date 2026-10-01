@@ -96,7 +96,18 @@ type fakeHost struct {
 	oracleErr   error
 	uninstErr   error
 	deliverErr  error
-	signal      chan struct{}
+	// failAfterWrite makes a real delivery report what it wrote and then fail.
+	// deliverErr cannot stand in for it: that one fails the dry run first, so
+	// the install is never attempted and there is nothing to roll back. A host
+	// that got as far as settings.json and tripped over a later step is the
+	// shape whose rollback has to be reasoned about.
+	failAfterWrite bool
+	// rmaOnErr is what a host reports it had already written when it then
+	// fails. A real host that has put a key into settings.json and then trips
+	// over a later step says so, so the run has something to roll back; a bare
+	// error reads as "nothing happened" and quietly drops those writes.
+	rmaOnErr []receipt.Op
+	signal   chan struct{}
 }
 
 func newFake(id host.ID, tr *store.Trash) *fakeHost {
@@ -182,14 +193,16 @@ func (f *fakeHost) Oracle() host.Oracle { return &fakeOracle{host: f} }
 
 // deliverState is the knob snapshot of one Deliver call.
 type deliverState struct {
-	targets    []fakeFile
-	notes      []string
-	gate       chan struct{}
-	collide    int
-	collideAt  string
-	probe      string
-	verify     bool
-	deliverErr error
+	targets        []fakeFile
+	notes          []string
+	gate           chan struct{}
+	collide        int
+	collideAt      string
+	probe          string
+	verify         bool
+	deliverErr     error
+	failAfterWrite bool
+	rmaOnErr       []receipt.Op
 }
 
 // Deliver implements host.Host.
@@ -223,6 +236,12 @@ func (f *fakeHost) Deliver(ctx context.Context, _ string, d host.Delivery) (host
 
 	result.Notes = state.notes
 
+	if !d.DryRun && state.failAfterWrite {
+		result.RMA = append(result.RMA, slices.Clone(state.rmaOnErr)...)
+
+		return result, errors.New("host refused the last step")
+	}
+
 	return f.finishDelivery(d, state, result)
 }
 
@@ -234,14 +253,16 @@ func (f *fakeHost) snapshot(d host.Delivery) deliverState {
 	f.calls = append(f.calls, "deliver "+string(d.Strategy)+" "+d.Package.ID+" dry="+boolText(d.DryRun))
 
 	return deliverState{
-		targets:    slices.Clone(f.targets[d.Package.ID]),
-		notes:      slices.Clone(f.notes[d.Package.ID]),
-		gate:       f.gates[d.Package.ID],
-		collide:    f.collide[d.Package.ID],
-		collideAt:  f.collideAt[d.Package.ID],
-		probe:      f.probes[d.Package.ID],
-		verify:     f.verify[d.Package.ID],
-		deliverErr: f.deliverErr,
+		targets:        slices.Clone(f.targets[d.Package.ID]),
+		notes:          slices.Clone(f.notes[d.Package.ID]),
+		gate:           f.gates[d.Package.ID],
+		collide:        f.collide[d.Package.ID],
+		collideAt:      f.collideAt[d.Package.ID],
+		probe:          f.probes[d.Package.ID],
+		verify:         f.verify[d.Package.ID],
+		deliverErr:     f.deliverErr,
+		rmaOnErr:       slices.Clone(f.rmaOnErr),
+		failAfterWrite: f.failAfterWrite,
 	}
 }
 
