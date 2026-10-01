@@ -98,8 +98,8 @@ func Discover(opts ...Option) (*Home, error) {
 			return nil, err
 		}
 
-		if vault := vaultAt(beadle); vault != "" {
-			return &Home{root: vault, source: SourceBeadleVault}, nil
+		if home, ok := resolveVaultHome(cfg, beadle); ok {
+			return home, nil
 		}
 	}
 
@@ -109,67 +109,81 @@ func Discover(opts ...Option) (*Home, error) {
 	}
 
 	if explicitBeadle == "" {
-		if vault := vaultAt(filepath.Join(userHome, BeadleDirName)); vault != "" {
-			return &Home{root: vault, source: SourceBeadleVault}, nil
+		if home, ok := resolveVaultHome(cfg, filepath.Join(userHome, BeadleDirName)); ok {
+			return home, nil
 		}
 	}
 
 	return &Home{root: filepath.Join(userHome, DirName), source: SourceDefault}, nil
 }
 
-// vaultAt returns <beadle>/verger when the VAULT exists, "" when it does not.
+// resolveVaultHome resolves the home when a beadle VAULT exists, and reports
+// false when there is no vault to speak of. Three clauses, in order, and the
+// order is the whole point:
 //
-// The subdirectory inside the vault is deliberately NOT required to exist. It
-// used to be, and that made the choice a trap: on a vault beadle had just
-// created, <beadle>/verger was not there yet, so discovery fell through to
-// ~/.verger and the first install created a second home beside the vault. Two
-// homes on one machine means two locks and two receipt trees, and the vault
-// and the CLI stop agreeing about what is installed - the exact state this
-// product refuses to create.
+//  1. the vault's own home, when it HOLDS one — that is this machine's home;
+//  2. otherwise ~/.verger, when it HOLDS one;
+//  3. otherwise the vault home — a fresh machine.
 //
-// Requiring the vault itself to exist is the right signal. Discovery is
-// read-only, so naming a directory that does not exist yet is neither a write
-// nor a risk: the subdir is verger's to create, the first time it needs it.
-func vaultAt(beadle string) string {
+// Clause 2 is the eject case, and it is why this is not "does the vault home
+// exist". `beadle plugins eject` moves the state to ~/.verger, and beadle pS-17
+// then REMOVES the vault's home directory instead of leaving it empty. So the
+// directory is ABSENT — not empty, absent — and any rule phrased in terms of
+// emptiness stops firing and hands the machine back to clause 3, which then names
+// a directory that does not exist. Every command afterwards runs against it and
+// reports no cells on a machine that is full of them.
+//
+// "Holds one" means not EMPTY, deliberately, with no marker file. A marker check
+// couples discovery to a file layout, so a home whose contents move on reads as
+// fresh — and that coupling is what made this rule fragile in the first place.
+// The subdirectory is still not required to be a directory verger can use before
+// clause 3 will name it: discovery is read-only, so naming a directory that does
+// not exist yet is neither a write nor a risk.
+func resolveVaultHome(cfg config, beadle string) (*Home, bool) {
 	info, err := os.Stat(beadle)
 	if err != nil || !info.IsDir() {
-		return ""
+		return nil, false
 	}
 
 	candidate := filepath.Join(beadle, BeadleSubdir)
 
-	// Missing is fine - verger creates it. Present but NOT a directory is not:
-	// that is a beadle home somebody else put there, and delivering into it
+	// A FILE where the home goes is neither a home nor a vault to descend into.
+	// That is a beadle home somebody else put there, and delivering into it
 	// would fail later and less clearly than refusing it now.
 	if sub, subErr := os.Stat(candidate); subErr == nil && !sub.IsDir() {
-		return ""
+		return nil, false
 	}
 
-	// Present and EMPTY is also not a home. `beadle plugins eject` moves the
-	// state to ~/.verger and leaves this directory behind; discovery took it
-	// for a home, so every command afterwards ran against an empty one and
-	// reported no cells. The vault existing was the right signal when the
-	// subdir was verger's to create; it stops being the right signal the moment
-	// something else can empty the directory without removing it.
-	if _, subErr := os.Stat(candidate); subErr == nil && !looksLikeHome(candidate) {
-		return ""
+	if holdsFiles(candidate) {
+		return &Home{root: candidate, source: SourceBeadleVault}, true
 	}
 
-	return candidate
+	// The vault home holds nothing, so the state may be in ~/.verger. A user
+	// home that cannot be resolved is not a failure here: clause 3 still names
+	// a home, and a machine with a vault and no user home has never had a
+	// ~/.verger to find.
+	if userHome, homeErr := cfg.resolveUserHome(); homeErr == nil {
+		defaultHome := filepath.Join(userHome, DirName)
+		if holdsFiles(defaultHome) {
+			return &Home{root: defaultHome, source: SourceDefault}, true
+		}
+	}
+
+	return &Home{root: candidate, source: SourceBeadleVault}, true
 }
 
-// looksLikeHome reports whether dir actually holds a verger home.
+// holdsFiles reports whether dir holds anything at all.
 //
-// Either marker is enough, because a fresh home has one or the other and not
-// both: state/ is created by the first write, verger.toml by the first install.
-func looksLikeHome(dir string) bool {
-	if _, err := os.Stat(filepath.Join(dir, "verger.toml")); err == nil {
-		return true
+// An absent directory holds nothing, and neither does an empty one: the
+// difference is not one this rule acts on, and conflating them is what let a
+// removed vault home look like a fresh machine.
+func holdsFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
 	}
 
-	info, err := os.Stat(filepath.Join(dir, "state"))
-
-	return err == nil && info.IsDir()
+	return len(entries) > 0
 }
 
 // CompetingHome reports a second home on this machine that discovery did NOT
@@ -228,7 +242,7 @@ func CompetingHome(opts ...Option) (string, bool) {
 
 	// beadle is <user home>/.beadle, so its parent IS the user home.
 	defaultHome, err := resolvePath(filepath.Join(filepath.Dir(beadle), DirName))
-	if err != nil || !looksLikeHome(defaultHome) {
+	if err != nil || !holdsFiles(defaultHome) {
 		return "", false
 	}
 
