@@ -235,6 +235,8 @@ jobs:
           version="$VERSION"
           tarball="dist/verger-${version}-${{ matrix.asset }}.tar.gz"
           mkdir -p unpack
+          tar -xzf "$tarball" -C unpack
+          test -x unpack/verger || { echo "::error::the tarball has no executable verger at its root"; exit 1; }
           # The page must be IN the platform tarball, because brew installs the
           # platform tarball: this is the check that decides whether a brew user
           # actually gets a manpage.
