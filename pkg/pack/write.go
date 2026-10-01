@@ -137,7 +137,7 @@ func stageArtifact(ctx context.Context, staging string, art Artifact) error {
 			return err
 		}
 
-		if err := fsutil.WriteFileAtomic(target, art.Files[rel], 0o600); err != nil {
+		if err := fsutil.WriteFileAtomicCAS(target, art.Files[rel], 0o600); err != nil {
 			return err
 		}
 	}

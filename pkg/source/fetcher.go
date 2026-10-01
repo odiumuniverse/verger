@@ -352,7 +352,7 @@ func writeEntryMeta(tmp string, meta *entryMeta) error {
 		return fmt.Errorf("encode source entry: %w", err)
 	}
 
-	if err := fsutil.WriteFileAtomic(filepath.Join(tmp, entryFile), append(data, '\n'), 0o600); err != nil {
+	if err := fsutil.WriteFileAtomicCAS(filepath.Join(tmp, entryFile), append(data, '\n'), 0o600); err != nil {
 		return err
 	}
 

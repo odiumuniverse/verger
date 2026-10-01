@@ -29,6 +29,7 @@ import (
 	"github.com/vmkteam/embedlog"
 
 	"github.com/odiumuniverse/verger/pkg/digest"
+	"github.com/odiumuniverse/verger/pkg/fsutil"
 	"github.com/odiumuniverse/verger/pkg/home"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/lock"
@@ -383,6 +384,15 @@ func Run(ctx context.Context, deps Deps, plan Plan, opts Options) (Report, error
 	}
 
 	r.execute()
+
+	// The one barrier for every barrier-free write this run made. It belongs
+	// here, after execute and before the lock is released, so the renames that
+	// put those files in place are durable before another writer can interleave
+	// its own flush. commit() still writes receipts, the journal and the lock
+	// through the durable writer, so they do not wait for this.
+	if err := fsutil.SyncPendingDirs(); err != nil {
+		return r.report(), fmt.Errorf("sync delivered directories: %w", err)
+	}
 
 	if err := r.commit(); err != nil {
 		return r.report(), err

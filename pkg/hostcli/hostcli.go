@@ -130,7 +130,7 @@ func (r Records) Save(path string) error {
 		return fmt.Errorf("write host CLI records %s: %w", path, err)
 	}
 
-	if err := fsutil.WriteFileAtomic(path, append(data, '\n'), 0o600); err != nil {
+	if err := fsutil.WriteFileAtomicCAS(path, append(data, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write host CLI records %s: %w", path, err)
 	}
 

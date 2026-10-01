@@ -159,7 +159,7 @@ func excludeFromGit(project string) error {
 
 	content += "# added by verger: generated state, never committable\n" + entry + "\n"
 
-	return fsutil.WriteFileAtomic(path, []byte(content), 0o644)
+	return fsutil.WriteFileAtomicCAS(path, []byte(content), 0o644)
 }
 
 // Absorb moves the state of one home into another (DESIGN §9.1): the two homes

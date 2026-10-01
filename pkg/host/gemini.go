@@ -354,7 +354,7 @@ func stageRenamedExtension(ctx context.Context, synthDir, overlay, name string) 
 		return err
 	}
 
-	return fsutil.WriteFileAtomic(file, append(renamed, '\n'), 0o600)
+	return fsutil.WriteFileAtomicCAS(file, append(renamed, '\n'), 0o600)
 }
 
 // Uninstall runs the host-install RMA ops in reverse order; file/tree ops are

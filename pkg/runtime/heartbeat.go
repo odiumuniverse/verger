@@ -128,5 +128,5 @@ func WriteHeartbeat(dir string, hb Heartbeat) error {
 		return fmt.Errorf("encode runtime heartbeat: %w", err)
 	}
 
-	return fsutil.WriteFileAtomic(HeartbeatPath(dir), append(data, '\n'), 0o600)
+	return fsutil.WriteFileAtomicCAS(HeartbeatPath(dir), append(data, '\n'), 0o600)
 }

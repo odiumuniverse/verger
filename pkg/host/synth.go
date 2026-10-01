@@ -168,7 +168,9 @@ func (l synthLayout) writeDoc(ctx context.Context, name string) (bool, error) {
 		return false, nil
 	}
 
-	if err := fsutil.WriteFileAtomic(l.docPath(), data, 0o600); err != nil {
+	// A synth document is RENDERED, never authored: it is rebuilt from the canon
+	// on every run, so a lost write is re-rendered rather than lost.
+	if err := fsutil.WriteFileAtomicCAS(l.docPath(), data, 0o600); err != nil {
 		return false, err
 	}
 

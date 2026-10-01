@@ -2324,7 +2324,11 @@ func (b *Base) executeWrite(ctx context.Context, spec looseSpec, pkg Package, pl
 		return stepFailure(spec, pkg, err)
 	}
 
-	if err := fsutil.WriteFileAtomic(step.path, step.data, step.mode); err != nil {
+	// A delivered file, not a record: the artifact digest in the receipt is
+	// checked against the disk on the recovery path (apply.verifyArtifact), so
+	// a short write is detected and the file re-delivered rather than served as
+	// if it were intact.
+	if err := fsutil.WriteFileAtomicCAS(step.path, step.data, step.mode); err != nil {
 		return stepFailure(spec, pkg, err)
 	}
 
@@ -2474,7 +2478,9 @@ func copyRegularFile(from, to string) error {
 		return err
 	}
 
-	return fsutil.WriteFileAtomic(to, data, 0o600)
+	// Same reasoning as executeWrite: this lands a delivered artifact whose
+	// digest the receipt carries.
+	return fsutil.WriteFileAtomicCAS(to, data, 0o600)
 }
 
 // readOptionalFile reads a config file; a missing path is nil, not an error.
