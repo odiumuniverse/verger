@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/odiumuniverse/verger/pkg/hostpath"
 	"github.com/odiumuniverse/verger/pkg/manifest"
 	"github.com/odiumuniverse/verger/pkg/receipt"
 )
@@ -177,11 +178,10 @@ func dshSpec(userHome string) looseSpec {
 	}
 }
 
-// dshHome resolves the harness home: a non-empty $DSH_HOME is taken literally
-// (no trim, no `~` expansion, a relative path resolves from the working
-// directory — beadle pkg/agent/dsh.go), else ~/.dsh.
+// dshHome resolves the harness home: a non-empty $DSH_HOME, canonicalised by
+// envRoot (no `~` expansion), else ~/.dsh.
 func dshHome(userHome string) string {
-	if dir := strings.TrimSpace(os.Getenv(dshHomeEnv)); dir != "" {
+	if dir := hostpath.CanonicalRoot(strings.TrimSpace(os.Getenv(dshHomeEnv))); dir != "" {
 		return dir
 	}
 

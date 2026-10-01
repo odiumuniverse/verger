@@ -184,6 +184,39 @@ func (e Env) literal(name string) string {
 	return value
 }
 
+// CanonicalRoot cleans a root that arrived from outside the program, so it is
+// spelled the way the paths built from it will be spelled. An empty value stays
+// empty; nothing else about it changes.
+//
+// A root is not necessarily spelled the way its own children are spelled. macOS
+// hands TMPDIR over with a trailing separator and a mktemp template built on it
+// doubles the separator ("/var/folders/…/T//t-XXXXXX"), while every
+// filepath.Join below cleans. A root read verbatim and a path derived from it
+// then stop comparing equal, so the containment checks that guard a shared
+// file — and the drift checks that decide whether verger may replace
+// something — compare two spellings of one directory. Clean once, here, at the
+// boundary where the spelling is still the environment's.
+//
+// ONLY Clean, and that limit is load-bearing:
+//
+//   - No trimming. Whitespace is part of the directory name for these hosts,
+//     measured on the real binaries: kilo 7.8.1 takes "  /tmp/x  " literally
+//     and will NOT read a server planted in the trimmed path.
+//     TestEnvValuesAreTakenLiterally pins that for every root variable in this
+//     package, DSH_HOME included. A helper that trimmed would point verger at a
+//     directory no host reads — a worse defect than the spelling mismatch.
+//   - No Abs. On an absolute value Abs IS Clean, so it would buy nothing; on a
+//     relative one it resolves against the working directory, and resolving
+//     that here would apply the host's rule in the wrong process (dsh: "a
+//     relative value resolves from the working directory").
+func CanonicalRoot(value string) string {
+	if value == "" {
+		return ""
+	}
+
+	return filepath.Clean(value)
+}
+
 // HostRoots is where one host keeps its configuration, before any surface is
 // named.
 type HostRoots struct {
@@ -535,7 +568,11 @@ var rootResolvers = map[string]func(*HostRoots, Env) error{
 		// pkg/agent/dsh.go:39-46, which documents that as the host rule).
 		// This package trims only to decide whether the value is set; for
 		// every value but a whitespace-only one the result is identical.
-		r.ConfigRoot = orDefault(env.literal(DSHHome), filepath.Join(env.Home, dshDirName))
+		// CanonicalRoot, not literal: dsh resolves "/x//y/" and "/x/y" to one
+		// directory, so canonicalising names the directory dsh will actually
+		// use, while every path built from this root below is cleaned by Join
+		// and would otherwise stop matching it.
+		r.ConfigRoot = orDefault(CanonicalRoot(env.literal(DSHHome)), filepath.Join(env.Home, dshDirName))
 
 		return nil
 	},
