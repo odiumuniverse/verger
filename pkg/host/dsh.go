@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/hostpath"
 	"github.com/odiumuniverse/verger/pkg/manifest"
@@ -181,7 +180,14 @@ func dshSpec(userHome string) looseSpec {
 // dshHome resolves the harness home: a non-empty $DSH_HOME, canonicalised by
 // envRoot (no `~` expansion), else ~/.dsh.
 func dshHome(userHome string) string {
-	if dir := hostpath.CanonicalRoot(strings.TrimSpace(os.Getenv(dshHomeEnv))); dir != "" {
+	// No trim. `CanonicalRoot` is `Clean`, and `Clean` is the whole rule: it
+	// collapses separators and dot segments and leaves every other byte alone,
+	// because a space is a legal character in a directory name. Trimming here
+	// pointed verger at a directory no host looks at — kilo 7.8.1 takes
+	// "  /tmp/x  " literally and will not read a server moved to the trimmed
+	// path — and it also made this adapter disagree with the root table, which
+	// reads the same variable without trimming.
+	if dir := hostpath.CanonicalRoot(os.Getenv(dshHomeEnv)); dir != "" {
 		return dir
 	}
 
