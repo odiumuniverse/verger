@@ -107,10 +107,12 @@ jobs:
 
       # Each tarball carries a bare `verger` at its root, because the formula
       # does `bin.install "verger"`, and a `man/` directory beside it, because
-      # the formula does `man1.install Dir["man/*.1"]`. The man pages have to
-      # be inside the per-platform tarball, not only in the separate
-      # verger-man archive: brew installs from the platform tarball, so a page
-      # that lives only in the other archive is a page no brew user gets.
+      # the formula does `man1.install Dir["man/*.1"]`. The man pages are
+      # inside the per-platform tarball and nowhere else: brew installs from
+      # the platform tarball, so a page that lives only in some other archive
+      # is a page no brew user gets. There is deliberately no separate man
+      # tarball — one artifact per platform is one thing to checksum, one
+      # thing to upload, and one thing to verify.
       # The linux binaries cross-compile from the mac runner: CGO_ENABLED=0
       # means no cgo, so no cross toolchain is needed and the result is static.
       # They are NOT signed — a codesign signature is meaningless off darwin
@@ -147,14 +149,14 @@ jobs:
 
           ls -l dist
 
-
-      - name: Pack the man pages
-        run: |
-          version="$VERSION"
-          tar -czf "dist/verger-man-${version}.tar.gz" -C dist/man .
-
       # sha256 of every published artifact, so a user can verify a download
-      # without trusting the release page.
+      # without trusting the release page. The glob is the publish job's glob:
+      # `gh release upload … dist/*.tar.gz dist/checksums.txt` uploads every
+      # tarball in dist, so checksums.txt covers exactly every tarball in
+      # dist. Anything built into dist that is not uploaded would make
+      # `shasum -c checksums.txt` fail for the user, so the checksummed set and
+      # the published set are pinned together by
+      # TestChecksumsCoverExactlyThePublishedArtifacts.
       - name: Checksum the artifacts
         run: |
           cd dist
@@ -233,11 +235,9 @@ jobs:
           version="$VERSION"
           tarball="dist/verger-${version}-${{ matrix.asset }}.tar.gz"
           mkdir -p unpack
-          tar -xzf "$tarball" -C unpack
-          test -x unpack/verger || { echo "::error::the tarball has no executable verger at its root"; exit 1; }
-          # The page must be IN the platform tarball, not only in the separate
-          # verger-man archive: brew installs the platform tarball, so this is
-          # the check that decides whether a brew user actually gets a manpage.
+          # The page must be IN the platform tarball, because brew installs the
+          # platform tarball: this is the check that decides whether a brew user
+          # actually gets a manpage.
           # Listing the archive first, then the unpacked tree, catches both a
           # tarball that never had it and one that has it at the wrong depth.
           tar -tzf "$tarball" | grep -qx 'man/verger.1' \
