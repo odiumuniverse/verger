@@ -553,10 +553,28 @@ func (r *runner) markRecovered(key cellKey, status Status, version, note string)
 	r.recovered[key] = recoveredCell{status: status, version: version, note: note}
 }
 
-// execute runs the plan: one goroutine per host, hosts bounded by Parallel,
-// actions sequential in plan order inside a host.
+// execute runs the plan in two phases: the shared writes first, one host at a
+// time, then every remaining cell with one goroutine per host bounded by
+// Parallel and actions sequential in plan order inside a host.
+//
+// The first phase is what makes a shared root safe. agy, codex, dsh and omp
+// resolve skills under one directory, so one package names one physical file
+// once per host. Left to the parallel phase, every one of those hosts decides
+// independently that the file must be written: they look it up before any of
+// them has written it, they all find nothing, and they all add a write for one
+// file. Whichever finishes last leaves the tree, and a host that trashes what
+// another host is mid-way through writing takes the file away from the run that
+// was about to succeed. That is how an install reported every host as current
+// with nothing on disk (NIGHT-pR-24).
+//
+// Running the writer's cell alone, before the others exist, makes it
+// impossible for two hosts to execute over one path.
 func (r *runner) execute() {
-	groups := groupByHost(r.plan.Actions)
+	writers, perHost := splitSharedWrites(groupByHost(r.plan.Actions), r.plan.Shared)
+
+	for _, group := range writers {
+		r.runHost(group)
+	}
 
 	limit := r.opts.Parallel
 	if limit <= 0 {
@@ -567,7 +585,7 @@ func (r *runner) execute() {
 
 	var wg sync.WaitGroup
 
-	for _, group := range groups {
+	for _, group := range perHost {
 		wg.Go(func() {
 			sem <- struct{}{}
 
@@ -578,6 +596,35 @@ func (r *runner) execute() {
 	}
 
 	wg.Wait()
+}
+
+// splitSharedWrites partitions the host groups into the ones that write a shared
+// target and the ones that do not. A host's whole group moves to the first
+// phase, because a host that writes one shared file writes its own files in the
+// same delivery and splitting a delivery across phases would be a second thing
+// to keep in order.
+func splitSharedWrites(groups []hostGroup, shared []SharedTarget) (writers, perHost []hostGroup) {
+	writing := map[host.ID]bool{}
+
+	for _, target := range shared {
+		writing[target.Writer] = true
+	}
+
+	if len(writing) == 0 {
+		return nil, groups
+	}
+
+	for _, group := range groups {
+		if writing[group.host] {
+			writers = append(writers, group)
+
+			continue
+		}
+
+		perHost = append(perHost, group)
+	}
+
+	return writers, perHost
 }
 
 // hostGroup is the ordered action indexes of one host.
@@ -731,6 +778,20 @@ func (r *runner) runInstall(action Action, cell CellResult) CellResult {
 		return r.installFailed(action, cell, planned, result, err)
 	}
 
+	// The delivery returned without an error, which is not the same as the file
+	// being there: a Result is the adapter's own account of itself, and a cell
+	// that reports "current" for an artifact the disk does not hold is the
+	// silent success — all hosts current, nothing written, exit 0. So the claim
+	// is checked against the disk before the receipt commits to it.
+	artifacts, ops := committed(planned, result)
+
+	if missing := undeliveredArtifacts(artifacts, ops); len(missing) > 0 {
+		return r.installFailed(action, cell, planned, result, &ArtifactsMissingError{
+			Host:  action.Host,
+			Paths: missing,
+		})
+	}
+
 	r.emit(action, stepVerify, pkg.ID+" "+pkg.Version+" verified")
 
 	if crash := crashAfterInstall; crash != nil {
@@ -740,6 +801,65 @@ func (r *runner) runInstall(action Action, cell CellResult) CellResult {
 	dropNotes := r.dropOld(action, result)
 
 	return r.commitInstall(action, cell, started, planned, result, dropNotes)
+}
+
+// ArtifactsMissingError reports a delivery that claimed files the disk does not
+// hold. It is its own type because "the run said it wrote this and did not" is a
+// different answer from any step failure: the caller has to treat the cell as
+// failed, not as delivered with a note.
+type ArtifactsMissingError struct {
+	Host  host.ID
+	Paths []string
+}
+
+// Error implements error.
+func (e *ArtifactsMissingError) Error() string {
+	return fmt.Sprintf("%s: delivered but not on disk: %s", e.Host, strings.Join(e.Paths, ", "))
+}
+
+// committed picks the artifacts and ops a receipt will record, which is what a
+// cell claims: the delivery's own result, or the plan it fell back on.
+func committed(planned, result host.Result) ([]receipt.Artifact, []receipt.Op) {
+	artifacts := result.Artifacts
+	if len(artifacts) == 0 {
+		artifacts = planned.Artifacts
+	}
+
+	ops := result.RMA
+	if len(ops) == 0 {
+		ops = planned.RMA
+	}
+
+	return artifacts, ops
+}
+
+// undeliveredArtifacts names the artifacts a cell claims that the disk does not
+// hold with the recorded bytes.
+//
+// A receipt records what the run PLANNED to write, so "the plan produced this
+// artifact" and "this file exists" are different claims, and only the second is
+// what the user gets. Checking it here closes the class: a report saying
+// `current` for a file that is not there is a failed cell from now on.
+//
+// Verification is the one crash replay uses, so an interrupted run and a
+// finished one agree on what a written artifact looks like. An artifact only the
+// host itself can confirm — an installed MCP server, a document the adapter owns
+// record by record — is not checkable here and is never counted as missing.
+func undeliveredArtifacts(artifacts []receipt.Artifact, ops []receipt.Op) []string {
+	claim := intentRecord{Artifacts: artifacts, RMA: ops}
+
+	var missing []string
+
+	for _, artifact := range artifacts {
+		ok, checkable := verifyArtifact(claim, artifact)
+		if checkable && !ok {
+			missing = append(missing, artifact.Path)
+		}
+	}
+
+	slices.Sort(missing)
+
+	return missing
 }
 
 // journalIntent appends the pre-write intent of one install or update.

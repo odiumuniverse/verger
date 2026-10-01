@@ -49,7 +49,17 @@ func (a *app) runRemove(ctx context.Context, id string, cause receipt.Cause) err
 
 	adapters := a.hosts(client)
 
-	plan, err := client.PlanRemove(ctx, id, verger.RemoveOptions{Paths: paths, Hosts: adapters, Cause: cause})
+	// `RemoveOptions.Filter` is what `--hosts` / `--except` mean to the
+	// facade, and leaving it empty is not "no filter": an empty filter is
+	// every adapter, so a `remove --hosts claude` on a four-host machine
+	// uninstalled the package from all four and the three surviving files
+	// were gone before the user could see that they were going.
+	plan, err := client.PlanRemove(ctx, id, verger.RemoveOptions{
+		Paths:  paths,
+		Hosts:  adapters,
+		Filter: a.hostFilter(),
+		Cause:  cause,
+	})
 	if err != nil {
 		return err
 	}

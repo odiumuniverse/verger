@@ -401,6 +401,20 @@ func (p *loosePlan) record(artifact receipt.Artifact, op receipt.Op) {
 	p.ops = append(p.ops, op)
 }
 
+// reference keeps ONLY the artifact: this host points at a file another host of
+// the same run wrote, so it has nothing to undo.
+//
+// An RMA op here is not a harmless record. The executor walks a cell's ops to
+// resolve conflicts, and an op naming a path this host never wrote sends it
+// looking for a file that is either mid-write or absent — which is what produced
+// "resolve conflict … not found" and "unreadable … no such file or directory"
+// while the shared file was being written by the host that owns it. Ownership of
+// the deletion belongs to the writer's receipt; the readers only need to name
+// the artifact so the refcount can count them.
+func (p *loosePlan) reference(artifact receipt.Artifact) {
+	p.artifacts = append(p.artifacts, artifact)
+}
+
 // addConfig records one shared config-document write backing several keys: a
 // single step, one artifact for the document and one RMA op per key the delivery
 // owns. replaced carries the previous value of the first len(replaced) ops (the
@@ -731,13 +745,58 @@ func (p *loosePlanner) skill(component manifest.Component) error {
 
 	_, existed := p.ownerOf(target)
 
+	artifact := receipt.Artifact{Kind: "skill", Name: component.Name, Path: target, Digest: sum}
+	rmaOp := receipt.Op{Kind: receipt.OpCopyTree, Path: target, Digest: sum, Mode: 0o700, Existed: existed}
+
+	// A shared root means several hosts name one file. One of them writes it and
+	// the rest reference it: the plan names the writer, and the executor has
+	// already run that host's delivery alone before this one started.
+	if writer, shared := p.sharedWriter(target); shared && writer != p.spec.host {
+		p.plan.reference(artifact)
+
+		return nil
+	}
+
+	if p.alreadyDelivered(target, sum) {
+		p.plan.reference(artifact)
+
+		return nil
+	}
+
 	p.plan.add(
 		looseStep{kind: stepCopyTree, path: target, src: source, existed: existed, digest: sum, mode: 0o700},
-		receipt.Artifact{Kind: "skill", Name: component.Name, Path: target, Digest: sum},
-		receipt.Op{Kind: receipt.OpCopyTree, Path: target, Digest: sum, Mode: 0o700, Existed: existed},
+		artifact,
+		rmaOp,
 	)
 
 	return nil
+}
+
+// sharedWriter asks the plan which host writes target, when the plan decided.
+func (p *loosePlanner) sharedWriter(target string) (ID, bool) {
+	shared, ok := p.base.ownership.(RunDelivered)
+	if !ok {
+		return "", false
+	}
+
+	return shared.SharedWriter(target)
+}
+
+// alreadyDelivered reports whether this run already wrote target with exactly
+// this digest. A different digest is not a duplicate, it is a conflict, and the
+// ownership check above is what reports it.
+func (p *loosePlanner) alreadyDelivered(target string, sum digest.Hash) bool {
+	run, ok := p.base.ownership.(RunDelivered)
+	if !ok {
+		return false
+	}
+
+	pkg, written, ok := run.DeliveredThisRun(target)
+	if !ok || pkg != p.pkg.ID {
+		return false
+	}
+
+	return sum.Valid() && written == sum
 }
 
 // agent plans one host-side agent file.
@@ -2243,6 +2302,13 @@ func (b *Base) executeCopyTree(ctx context.Context, spec looseSpec, pkg Package,
 
 	if sum != step.digest {
 		return stepFailure(spec, pkg, fmt.Errorf("copied tree %s digests %s, expected %s", step.path, sum, step.digest))
+	}
+
+	// The write is real now, so the run owns it: a later host whose target
+	// resolves to this same path can reference the file instead of writing over
+	// it and then reporting it as a stranger's.
+	if run, ok := b.ownership.(RunDelivered); ok {
+		run.RecordDelivered(step.path, pkg.ID, sum)
 	}
 
 	return nil

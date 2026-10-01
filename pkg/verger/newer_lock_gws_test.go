@@ -153,10 +153,14 @@ func TestANewerLockIsRefusedByEveryDeliveryVerb(t *testing.T) {
 				So(errors.As(runErr, &newer), ShouldBeTrue)
 
 				// The message is the only thing a user has to act on, so it has
-				// to carry both versions and the way out.
+				// to carry both versions, the way out, and the file it came
+				// from: a machine can hold a user lock, a project lock and a
+				// vault lock at once, and a refusal that names none of them
+				// cannot be acted on.
 				msg := runErr.Error()
 				So(msg, ShouldContainSubstring, "newer verger")
 				So(msg, ShouldContainSubstring, strconv.Itoa(lock.Schema+1))
+				So(msg, ShouldContainSubstring, paths.LockPath)
 
 				So(lockBytes(t, paths.LockPath), ShouldResemble, before)
 			}

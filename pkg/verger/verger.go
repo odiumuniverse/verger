@@ -60,6 +60,11 @@ type Client struct {
 	now    func() time.Time
 	mu     sync.Mutex
 	closed bool
+	// owner is the ONE ownership source every adapter this client built is
+	// handed. It has to be a single instance: the run-scoped layer is how a
+	// later host sees what an earlier host in the same run wrote, and four
+	// adapters each holding their own copy would each know nothing.
+	runOwnership *Ownership
 }
 
 // config carries the option values of one Open call.

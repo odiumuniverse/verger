@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/odiumuniverse/verger/pkg/apply"
+	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/source"
 	"github.com/odiumuniverse/verger/pkg/spec"
@@ -107,6 +108,11 @@ type Plan struct {
 	// travels onto the Report so a caller reads it off the result it was handed
 	// rather than off the client that produced it.
 	pendingConsent []string
+
+	// shared are the paths several hosts resolve to one file. The executor
+	// writes them in their own phase, before any per-host delivery, so no two
+	// hosts ever execute over one path.
+	shared []apply.SharedTarget
 }
 
 // PendingConsent names the packages this plan withholds hooks for because nobody
@@ -550,6 +556,12 @@ func bareID(ref source.Ref) bool {
 // hooks exactly as its AllowHooks says, because the caller has already decided
 // and is not being asked again.
 func (c *Client) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*apply.Report, error) {
+	// The run-scoped ownership layer starts empty on every run. A client can
+	// outlive many runs — beadle's watch loop holds one and reconciles with it
+	// repeatedly — and a stale entry would let today's run claim yesterday's
+	// write and skip a file it never wrote.
+	c.runOwner().BeginRun()
+
 	if err := c.RequireTrust(plan.Paths); err != nil {
 		return nil, err
 	}
@@ -579,7 +591,7 @@ func (c *Client) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*app
 	execOpts := c.execOptions(opts)
 	execOpts.Events = source
 
-	report, err := apply.Run(ctx, deps, apply.Plan{Actions: plan.Actions}, execOpts)
+	report, err := apply.Run(ctx, deps, apply.Plan{Actions: plan.Actions, Shared: plan.shared}, execOpts)
 
 	if stop != nil {
 		stop()
@@ -792,6 +804,17 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 	// installs, so a sync does not lose the removals it found.
 	actions := slices.Clone(plan.Actions)
 
+	// Discovery runs over EVERY package before any action is built, because a
+	// shared path can be wanted by two packages of one run and only the combined
+	// view can say so. Per package, each host renders the same bytes — which is
+	// exactly why the dedup works — and the disagreement is invisible.
+	shared, err := c.planSharedTargets(ctx, plan, opts)
+	if err != nil {
+		return err
+	}
+
+	plan.shared = shared
+
 	for i := range plan.Packages {
 		item := &plan.Packages[i]
 
@@ -811,6 +834,23 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 
 		allowed, origin := propagateTargets(plan, item, adapters)
 
+		// Learn where every host would write, BEFORE any of them runs.
+		//
+		// Four adapters resolve skills under one shared root — agy, codex and omp
+		// all read ~/.agents/skills — so one package names the same physical file
+		// once per host. Without this pass each host plans that write
+		// independently, the executor runs them concurrently, and three
+		// goroutines race for one file: the loser sees the path move under its own
+		// verification and the run rolls the file away.
+		//
+		// The dry run is the single source of truth here because it runs the same
+		// planning code the real delivery runs. An adapter that declared its
+		// targets through a new interface method would be a SECOND statement of
+		// the same rules, free to drift from the code that actually writes.
+		//
+		// It is safe because Deliver(DryRun) is proved to touch nothing: see
+		// TestADryRunTouchesNothing, which snapshots the whole home tree,
+		// byte for byte, around a dry run of all ten adapters.
 		for _, adapter := range allowed {
 			if !opts.Switches.HooksOn(adapter.ID()) {
 				allow = false
@@ -1095,4 +1135,219 @@ func (e *NotAvailableError) Error() string {
 	}
 
 	return message
+}
+
+// sharedTargets is what a planning-time dry run learned about one package: which
+// paths its hosts want, with which bytes, and who wants them.
+type sharedTargets struct {
+	// want maps a path to digest -> the hosts that want those bytes there. One
+	// digest with more than one host is a SHARED target; two digests on one
+	// path is a conflict no single package's pass can see.
+	want map[string]map[string][]host.ID
+	// unplanned names hosts that could not even plan. Their paths are unknown,
+	// so nothing may be claimed or deleted on their behalf.
+	unplanned []host.ID
+}
+
+// ContentConflictError reports two hosts of one run that would write different
+// bytes to the same path.
+//
+// It is deliberately not a CollisionError. A collision means "this file is not
+// yours", which is true of a stranger's file and FALSE here: the file does not
+// exist yet, and the disagreement is between two of the user's own hosts. Naming
+// the hosts is what makes it actionable, because the fix is to narrow the spec's
+// host list for that package — nothing else resolves it.
+type ContentConflictError struct {
+	Path   string
+	Hosts  []host.ID
+	Detail map[host.ID]string
+}
+
+// Error implements error.
+func (e *ContentConflictError) Error() string {
+	names := make([]string, 0, len(e.Hosts))
+	for _, id := range e.Hosts {
+		names = append(names, string(id))
+	}
+
+	slices.Sort(names)
+
+	return fmt.Sprintf("%s would be written by %s with different content; "+
+		"narrow the package's host list so one of them does not take this path",
+		e.Path, strings.Join(names, ", "))
+}
+
+// discoverTargets dry-runs every adapter's delivery and reports what paths
+// they would occupy and with which bytes. It decides nothing: the decision is
+// plan-wide, because a conflict is between two PACKAGES and no single package's
+// pass can see one.
+func (c *Client) discoverTargets(
+	ctx context.Context, pkg host.Package, adapters []host.Host, opts ApplyOptions, kind source.Kind,
+) (sharedTargets, error) {
+	out := sharedTargets{want: map[string]map[string][]host.ID{}}
+
+	for _, adapter := range adapters {
+		strategy, _ := PickStrategy(pkg, adapter.ID(), kind)
+
+		prepared, _, err := c.prepareDelivery(ctx, pkg, strategy)
+		if err != nil {
+			return out, err
+		}
+
+		// The home argument is empty for the same reason the executor passes an
+		// empty one (apply/phase.go:1602): the adapter resolves its own home from
+		// its configuration. Passing verger's home here instead would resolve
+		// every path under a root the real delivery never touches, and the claims
+		// would name paths that do not exist — a dedup that silently does nothing.
+		result, err := adapter.Deliver(ctx, "", host.Delivery{
+			Package: prepared, Strategy: strategy, DryRun: true, Project: opts.Scope,
+		})
+		if err != nil {
+			// A host that will not even plan is that host's own business, and the
+			// real delivery reports it with fuller context. Silence here would hide
+			// a host whose paths are therefore UNKNOWN — precisely the case this
+			// pass exists to learn about, so it is noted rather than trusted.
+			out.unplanned = append(out.unplanned, adapter.ID())
+
+			continue
+		}
+
+		for _, artifact := range result.Artifacts {
+			sum := artifact.Digest.String()
+			if sum == "" {
+				sum = "unknown"
+			}
+
+			if out.want[artifact.Path] == nil {
+				out.want[artifact.Path] = map[string][]host.ID{}
+			}
+
+			out.want[artifact.Path][sum] = append(out.want[artifact.Path][sum], adapter.ID())
+		}
+	}
+
+	return out, nil
+}
+
+// planSharedTargets dry-runs every planned package against every host it would
+// reach, groups what they want by path, and returns the paths several hosts
+// resolve to one file. It refuses the plan if two packages want one path with
+// different bytes.
+//
+// The pass is whole-plan on purpose. Per package it would miss the only conflict
+// that matters here: a package's hosts all render the same bytes, so within one
+// package there is nothing to disagree about. The disagreement is between two
+// packages of the same run landing on one shared path, and only the combined
+// view can see it.
+func (c *Client) planSharedTargets(ctx context.Context, plan *Plan, opts ApplyOptions) ([]apply.SharedTarget, error) {
+	adapters := plan.Adapters
+
+	// path -> digest -> the hosts that want those bytes there. Two packages
+	// agreeing on a digest for one path is not a conflict, it is a shared
+	// target; only DIFFERENT digests are a conflict.
+	want := map[string]map[string][]host.ID{}
+
+	for i := range plan.Packages {
+		item := &plan.Packages[i]
+
+		allowed, _ := propagateTargets(plan, item, adapters)
+
+		discovered, err := c.discoverTargets(ctx, item.Package, allowed, opts, item.Ref.Kind)
+		if err != nil {
+			return nil, err
+		}
+
+		for path, digests := range discovered.want {
+			if want[path] == nil {
+				want[path] = map[string][]host.ID{}
+			}
+
+			for sum, ids := range digests {
+				want[path][sum] = append(want[path][sum], ids...)
+			}
+		}
+	}
+
+	paths := make([]string, 0, len(want))
+	for path := range want {
+		paths = append(paths, path)
+	}
+
+	slices.Sort(paths)
+
+	var shared []apply.SharedTarget
+
+	// The plan tells the run which host writes each shared path, and the
+	// executor runs that host's cell alone before any other starts. The
+	// decision is installed in one step and never cleared by a later BeginRun:
+	// it is made while the plan is built and consumed while the run executes,
+	// and Apply calls BeginRun after planning.
+	writers := map[string]host.ID{}
+
+	for _, path := range paths {
+		digests := want[path]
+
+		if len(digests) > 1 {
+			return nil, conflictOn(path, digests)
+		}
+
+		for sum, ids := range digests {
+			refs := uniqHosts(ids)
+			if len(refs) < 2 {
+				continue
+			}
+
+			writer := refs[0]
+			writers[path] = writer
+
+			parsed, err := digest.Parse(sum)
+			if err != nil {
+				continue
+			}
+
+			shared = append(shared, apply.SharedTarget{
+				Path: path, Digest: parsed, Writer: writer, Hosts: refs,
+			})
+		}
+	}
+
+	c.runOwner().SetSharedTargets(writers)
+
+	return shared, nil
+}
+
+// uniqHosts returns the distinct hosts of one path's reference list, sorted.
+//
+// A host can reach the same path through more than one package of a run, and
+// counting it twice would make one physical file look like two references — so
+// "is this path shared at all" is a question about distinct hosts.
+func uniqHosts(ids []host.ID) []host.ID {
+	out := slices.Clone(ids)
+
+	slices.Sort(out)
+
+	return slices.Compact(out)
+}
+
+// conflictOn names two packages of one run that would write different bytes to
+// one shared path, and which hosts wanted each.
+func conflictOn(path string, digests map[string][]host.ID) error {
+	ids := make([]host.ID, 0, len(digests))
+	detail := map[host.ID]string{}
+
+	for sum, hosts := range digests {
+		slices.Sort(hosts)
+
+		for _, id := range hosts {
+			if _, seen := detail[id]; !seen {
+				ids = append(ids, id)
+			}
+
+			detail[id] = sum
+		}
+	}
+
+	slices.Sort(ids)
+
+	return &ContentConflictError{Path: path, Hosts: ids, Detail: detail}
 }

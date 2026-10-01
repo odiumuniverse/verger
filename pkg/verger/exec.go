@@ -120,17 +120,23 @@ func (c *Client) applyDeps(adapters []host.Host, paths Paths) (apply.Deps, error
 }
 
 // LoadLock reads a lock document; a missing file is an empty lock.
+//
+// It goes through lock.ParseFile rather than reading the bytes and calling
+// lock.Parse, because the refusal a user acts on has to name the file it came
+// from: three homes on one machine means three locks, and "lock : written by a
+// newer verger" points at none of them. The missing-file case is still decided
+// here, before the parse, so an absent lock stays an empty lock rather than an
+// error.
 func LoadLock(path string) (*lock.Lock, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // G304: the caller names the state file
-	if errors.Is(err, os.ErrNotExist) {
-		return lock.New(), nil
-	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return lock.New(), nil
+		}
 
-	if err != nil {
 		return nil, fmt.Errorf("read lock %s: %w", path, err)
 	}
 
-	parsed, err := lock.Parse(data)
+	parsed, err := lock.ParseFile(path)
 	if err != nil {
 		return nil, err
 	}

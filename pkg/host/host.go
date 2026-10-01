@@ -267,6 +267,29 @@ type ArtifactDigests interface {
 	ArtifactDigest(path string) (digest.Hash, bool)
 }
 
+// RunDelivered is an optional PathOwner extension: it reports what THIS run has
+// already written, lets the run record a new write, and names the one host that
+// writes a path several hosts share.
+//
+// Four adapters resolve skills under one shared root — agy, codex, dsh and omp
+// all read ~/.agents/ — so one package names the same physical file once per
+// host. Ownership is otherwise answered from receipts on disk, and receipts are
+// written when the run ends, so the second host cannot see the first host's
+// write and reports a stranger's file. With this seam the planner can tell
+// "already delivered in this run" from "belongs to someone else", record the
+// artifact against the existing file instead of writing the same bytes twice,
+// and leave the physical file to the host that created it.
+type RunDelivered interface {
+	DeliveredThisRun(path string) (pkg string, sum digest.Hash, ok bool)
+	RecordDelivered(path, pkg string, sum digest.Hash)
+	// SharedWriter names the host the PLAN chose to write path. The executor
+	// runs that host's delivery alone, before any other host starts, so the
+	// decision does not depend on which goroutine reached the path first —
+	// every host looking the path up before any of them had written it is how
+	// one shared file came to be written three times over.
+	SharedWriter(path string) (hostID ID, ok bool)
+}
+
 // DefaultOracleWait bounds one service-backed oracle call: the OpenCode
 // plugin verbs talk to the host's background service, which the CLI starts
 // itself and retries forever when the port belongs to another instance, so the

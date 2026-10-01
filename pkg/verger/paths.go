@@ -126,12 +126,6 @@ func (c *Client) OwnsIn(paths Paths, path string) (string, bool) {
 	return record.Package, ok
 }
 
-// owner returns the receipt-backed ownership source of one scope's receipts
-// directory.
-func (c *Client) owner() Ownership {
-	return NewOwnership(c.Home().ReceiptsDir())
-}
-
 // excludeFromGit adds the project state dir to .git/info/exclude when the
 // project is a git repository (D11: generated files never become committable).
 func excludeFromGit(project string) error {

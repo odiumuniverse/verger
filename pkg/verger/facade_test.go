@@ -94,13 +94,17 @@ func (f *fakeHost) Deliver(_ context.Context, _ string, d host.Delivery) (host.R
 		}
 
 		sum := digest.Bytes([]byte(target.Data))
-		result.Artifacts = append(result.Artifacts, receipt.Artifact{
-			Kind: "skill", Name: filepath.Base(target.Path), Path: target.Path, Digest: sum,
-		})
 
 		if target.KeyPath != "" {
-			// A real adapter records the digest of the KEY's value, which is
-			// what a drift check compares against.
+			// A real adapter records the digest of the KEY's value, in the
+			// artifact as well as in the op: a document several keys share is
+			// verified key by key, so a whole-file digest would report every
+			// record the user added as a missing artifact.
+			result.Artifacts = append(result.Artifacts, receipt.Artifact{
+				Kind: "mcp", Name: filepath.Base(target.Path), Path: target.Path,
+				Digest: keyValueDigest(target.Data, target.KeyPath),
+			})
+
 			result.RMA = append(result.RMA, receipt.Op{
 				Kind: receipt.OpConfigKey, Path: target.Path, KeyPath: target.KeyPath,
 				Digest: keyValueDigest(target.Data, target.KeyPath), Mode: 0o600,
@@ -108,6 +112,10 @@ func (f *fakeHost) Deliver(_ context.Context, _ string, d host.Delivery) (host.R
 
 			continue
 		}
+
+		result.Artifacts = append(result.Artifacts, receipt.Artifact{
+			Kind: "skill", Name: filepath.Base(target.Path), Path: target.Path, Digest: sum,
+		})
 
 		result.RMA = append(result.RMA, receipt.Op{
 			Kind: receipt.OpWriteFile, Path: target.Path, Digest: sum, Mode: 0o600,

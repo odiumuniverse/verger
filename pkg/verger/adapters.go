@@ -34,7 +34,7 @@ func (c *Client) buildAdapters() []host.Host {
 	options := []host.Option{
 		host.WithStore(c.store),
 		host.WithTrash(c.store.Trash()),
-		host.WithOwnership(c.owner()),
+		host.WithOwnership(c.runOwner()),
 	}
 
 	if store, ok := c.secrets.(*secret.Store); ok {
@@ -71,13 +71,31 @@ type HostFilter struct {
 // adapter, or one the machine does not detect, is reported per host with the
 // reason, never silently dropped.
 func (c *Client) Targets(filter HostFilter) ([]host.Host, error) {
-	adapters := c.Hosts()
-
 	userHome, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve user home: %w", err)
 	}
 
+	return c.selectAdapters(c.Hosts(), filter, func(adapter host.Host) bool {
+		return adapter.Detect(userHome)
+	})
+}
+
+// selectAdapters applies the filter to a caller-supplied adapter list.
+//
+// Targets is not enough for a verb that was handed its own list. A removal must
+// keep the hosts that are NOT detected — uninstalling the agent you just
+// removed is the ordinary case, not an error — so it cannot fall back to the
+// detected set, and passing the list through unfiltered made `--hosts` a flag
+// that printed a narrowed plan and then removed from every host anyway.
+//
+// present decides which adapters count as reachable, and is what keeps
+// Targets' detection rule out of the removal path.
+func (c *Client) selectAdapters(
+	given []host.Host,
+	filter HostFilter,
+	present func(host.Host) bool,
+) ([]host.Host, error) {
 	only, err := hostSet(filter.Only, "--hosts")
 	if err != nil {
 		return nil, err
@@ -90,14 +108,14 @@ func (c *Client) Targets(filter HostFilter) ([]host.Host, error) {
 
 	var out []host.Host
 
-	for _, adapter := range adapters {
+	for _, adapter := range given {
 		id := string(adapter.ID())
 
 		if len(only) > 0 && !only[id] {
 			continue
 		}
 
-		if except[id] || !adapter.Detect(userHome) {
+		if except[id] || !present(adapter) {
 			continue
 		}
 
@@ -107,7 +125,7 @@ func (c *Client) Targets(filter HostFilter) ([]host.Host, error) {
 	if len(out) == 0 && len(only) > 0 {
 		return nil, &HostUnavailableError{
 			Only:       only,
-			Registered: AdapterIDs(adapters),
+			Registered: AdapterIDs(given),
 			Except:     except,
 		}
 	}
@@ -219,4 +237,17 @@ func hostIDKnown(id string) bool {
 	}
 
 	return false
+}
+
+// runOwner returns the ownership source every adapter of this run shares, and
+// builds it on first use so a caller that injected its own adapters still gets
+// a layer BeginRun can clear.
+func (c *Client) runOwner() *Ownership {
+	if c.runOwnership != nil {
+		return c.runOwnership
+	}
+
+	c.runOwnership = NewOwnership(c.Home().ReceiptsDir())
+
+	return c.runOwnership
 }

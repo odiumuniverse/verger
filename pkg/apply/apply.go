@@ -28,6 +28,7 @@ import (
 
 	"github.com/vmkteam/embedlog"
 
+	"github.com/odiumuniverse/verger/pkg/digest"
 	"github.com/odiumuniverse/verger/pkg/home"
 	"github.com/odiumuniverse/verger/pkg/host"
 	"github.com/odiumuniverse/verger/pkg/lock"
@@ -64,9 +65,29 @@ type Action struct {
 	Restored bool
 }
 
+// SharedTarget is one physical path several hosts of a plan resolve to the same
+// bytes. agy, codex, dsh and omp all read skills under ~/.agents, so one
+// package names the same file once per host.
+//
+// Writer is the ONE host whose delivery writes the file; Hosts names every host
+// whose receipt references it. The executor writes shared targets in their own
+// serialized phase, before any per-host delivery starts, so no two hosts ever
+// execute over one path. That is a property of the ORDER rather than of which
+// goroutine happened to reach the path first.
+type SharedTarget struct {
+	Path   string
+	Digest digest.Hash
+	Writer host.ID
+	Hosts  []host.ID
+}
+
 // Plan is the ordered set of actions one reconcile cycle executes.
 type Plan struct {
 	Actions []Action
+
+	// Shared are the paths several hosts resolve to one file; the executor
+	// writes them first, one host at a time, before the per-host phase.
+	Shared []SharedTarget
 }
 
 // Status is the outcome of one cell action.
