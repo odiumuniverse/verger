@@ -350,6 +350,15 @@ jobs:
             exit 1
           fi
           base="https://github.com/odiumuniverse/verger/releases/download/${GITHUB_REF_NAME}"
+          # The digests below are pipelines, and a pipeline exits with its last
+          # command: a missing tarball makes sha256sum fail while cut still exits
+          # 0, so the formula would be rendered with sha256 "" and the release
+          # would commit it. Homebrew then fails much later, on a user machine,
+          # pointing at the tap instead of at an artefact that was never built.
+          # So the files are checked before the hashes are read.
+          for f in dist/verger-"${version}"-{darwin-universal,linux-amd64,linux-arm64}.tar.gz; do
+            [ -f "$f" ] || { echo "::error::$f is missing; the formula cannot be rendered"; exit 1; }
+          done
           sha_darwin="$(sha256sum "dist/verger-${version}-darwin-universal.tar.gz" | cut -d' ' -f1)"
           sha_amd64="$(sha256sum "dist/verger-${version}-linux-amd64.tar.gz" | cut -d' ' -f1)"
           sha_arm64="$(sha256sum "dist/verger-${version}-linux-arm64.tar.gz" | cut -d' ' -f1)"
