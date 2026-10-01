@@ -267,8 +267,14 @@ func (c *Client) planSync(ctx context.Context, doc *spec.Spec, adapters []host.H
 		return nil, err
 	}
 
+	// The embedded Plan carries the document too, because buildInstallActions
+	// reads plan.doc to resolve a package's `except` list and [propagate] policy
+	// when it builds the actions. A SyncPlan that kept the document only in its
+	// own field left that pass with nothing to read, and every reconcile wrote
+	// the hosts its own cells had already declared excluded.
+	//
 	//nolint:modernize // a composite literal cannot spell an embedded field's promoted names
-	plan := &SyncPlan{Plan: Plan{Paths: opts.Paths, Adapters: adapters}, specDoc: doc, Switches: switches}
+	plan := &SyncPlan{Plan: Plan{Paths: opts.Paths, Adapters: adapters, doc: doc}, specDoc: doc, Switches: switches}
 
 	desired := map[string]bool{}
 
@@ -414,9 +420,12 @@ func syncInstall(
 	// cannot tell the two apart on its own, so the plan says which it is.
 	restored := !receipted[entry.ID]
 
-	targets := switches.Filter(adapters, ExceptFor(plan.spec(), entry.ID))
+	// The switches and the spec's `except` list, through the same helpers the
+	// action builder uses: a reconcile whose cells disagreed with the actions
+	// about who is excluded is how `except` came to promise something the
+	// executor then wrote anyway.
+	targets := propagateTargetsFor(plan.spec(), switches.Filter(exceptTargets(plan.spec(), entry.ID, adapters), nil), &entry)
 
-	targets = propagateTargetsFor(plan.spec(), targets, &entry)
 	if len(targets) == 0 {
 		desired[entry.ID] = true
 

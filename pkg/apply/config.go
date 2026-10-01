@@ -204,12 +204,22 @@ func (r *runner) undoConfigKey(ref rmaRef, op receipt.Op, mode rmaMode) (string,
 		return r.configMismatch(op, mode)
 	}
 
-	if op.Existed {
-		if op.Backup == "" {
-			return fmt.Sprintf("%s#%s: hands-off (no backup recorded); left in place", op.Path, op.KeyPath), true, nil
-		}
-
+	if op.Existed && op.Backup != "" {
 		return r.restoreConfigKey(op, data, current)
+	}
+
+	// A key recorded as pre-existing with no backup is a key the package found
+	// already holding its own value: nothing was replaced, so there is no
+	// trashed value to put back. The claim that makes removing it safe is the
+	// VALUE — the key on disk still hashes to what the receipt recorded, so it is
+	// still the key verger owns, and a removal that leaves it behind has wired a
+	// deleted package into a host for good.
+	//
+	// A rollback does not get that claim. The failing delivery never replaced
+	// this key, so unsetting it would destroy a value the user had before the
+	// run started.
+	if op.Existed && mode == modeRollback {
+		return fmt.Sprintf("%s#%s: hands-off (no backup recorded); left in place", op.Path, op.KeyPath), true, nil
 	}
 
 	out, err := configEdit(data, op.KeyPath, nil, true, current)

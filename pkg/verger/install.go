@@ -883,13 +883,21 @@ func (c *Client) buildInstallActions(ctx context.Context, plan *Plan, opts Apply
 	return nil
 }
 
-// propagateTargets narrows one planned package's hosts by the effective
-// [propagate] policy. "origin" keeps the package where the event happened and
-// writes nothing elsewhere; "ask" writes nothing unattended, because the
-// question belongs to a person and a plan is not a person. Without the spec
-// document the default is "all" and nothing is narrowed.
+// propagateTargets narrows one planned package's hosts by the spec package's own
+// `except` list and by the effective [propagate] policy. "origin" keeps the
+// package where the event happened and writes nothing elsewhere; "ask" writes
+// nothing unattended, because the question belongs to a person and a plan is
+// not a person. Without the spec document the default is "all" and nothing is
+// narrowed.
+//
+// This is the ONE place a package's host set is decided. buildInstallActions
+// calls it for every writing command — install, update, sync, import, adopt —
+// and discovery calls it too, so the shared-target grouping sees exactly the
+// hosts that will be written and not one more. `except` used to be applied
+// where a reconcile wrote its cells, an entirely different moment, and by the
+// time the actions were built the exclusion was gone.
 func propagateTargets(plan *Plan, item *PlannedPackage, adapters []host.Host) (allowed []host.Host, origin host.ID) {
-	candidates := item.targets(adapters)
+	candidates := item.targets(exceptTargets(plan.doc, item.Package.ID, adapters))
 	if len(candidates) == 0 || plan.doc == nil {
 		return candidates, ""
 	}

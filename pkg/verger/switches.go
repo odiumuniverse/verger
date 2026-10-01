@@ -133,6 +133,42 @@ func ExceptFor(doc *spec.Spec, id string) []string {
 	return entry.Except
 }
 
+// exceptTargets drops the adapters one spec package excludes.
+//
+// It is the single implementation of that decision. install, update, sync and
+// import all resolve their host set through it, because a second copy of the
+// rule is how the plan and the executor came to disagree: a reconcile filtered
+// its cells by `except`, then buildInstallActions re-derived the host set from
+// the full adapter list and wrote the host the plan had already said was
+// excluded.
+func exceptTargets(doc *spec.Spec, id string, adapters []host.Host) []host.Host {
+	if doc == nil || len(doc.Packages) == 0 {
+		return adapters
+	}
+
+	skip := map[host.ID]bool{}
+
+	for _, excluded := range ExceptFor(doc, id) {
+		skip[host.ID(excluded)] = true
+	}
+
+	if len(skip) == 0 {
+		return adapters
+	}
+
+	out := make([]host.Host, 0, len(adapters))
+
+	for _, adapter := range adapters {
+		if skip[adapter.ID()] {
+			continue
+		}
+
+		out = append(out, adapter)
+	}
+
+	return out
+}
+
 // switchesFor resolves the effective switches of one run: the spec's table and
 // defaults, with the run's overrides on top.
 func (c *Client) switchesFor(paths Paths, overrides *SwitchOptions) (Switches, error) {

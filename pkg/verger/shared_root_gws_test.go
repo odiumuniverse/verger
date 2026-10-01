@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -203,6 +204,65 @@ func TestOneSkillReachesFourSharedRootHostsAndEveryCurrentCellIsOnDisk(t *testin
 		Convey("Then every cell reporting current has its artifacts on disk", func() {
 			So(assertCurrentCellsOnDisk(t, world, report), ShouldBeEmpty)
 		})
+	})
+}
+
+// TestTheSharedWriterIsTheFirstHostId pins WHICH host writes a shared path.
+//
+// The choice is arbitrary — any single host would do — but it must not be
+// arbitrary per run. The plan is built from a map, so an unsorted decision
+// would make the writer depend on Go's map iteration order: the same install
+// would hand the file to a different host each time, and the receipts of every
+// other host would flip between "owns the op" and "references it".
+func TestTheSharedWriterIsTheFirstHostId(t *testing.T) {
+	Convey("Given hosts that share a path, named so no order is obvious", t, func() {
+		world := newSharedWorld(t)
+
+		shared := filepath.Join(world.home, ".agents", "skills", "caveman")
+
+		plan, _ := world.planFor(t, sharedSkillPackage(t, t.TempDir(), "caveman"))
+
+		_, err := world.client.Install(t.Context(), plan, ApplyOptions{Confirm: allowAllConfirmer{}})
+		So(err, ShouldBeNil)
+
+		Convey("Then the writer is the first host id alphabetically", func() {
+			writer, ok := world.client.runOwner().SharedWriter(shared)
+			So(ok, ShouldBeTrue)
+
+			ids := make([]string, 0, len(world.adapters))
+			for _, adapter := range world.adapters {
+				ids = append(ids, string(adapter.ID()))
+			}
+
+			slices.Sort(ids)
+			So(string(writer), ShouldEqual, ids[0])
+		})
+
+		Convey("And exactly one host's receipt carries the operation that deletes it", func() {
+			writers := 0
+
+			for _, record := range loadReceipts(t, world) {
+				for _, op := range record.RMA {
+					if op.Path == shared {
+						writers++
+					}
+				}
+			}
+
+			So(writers, ShouldEqual, 1)
+		})
+	})
+}
+
+// TestUniqHostsIsDeterministic pins the helper the writer choice rests on: the
+// reference list is deduplicated AND ordered, so two packages reaching one path
+// through different orders still name the same writer.
+func TestUniqHostsIsDeterministic(t *testing.T) {
+	Convey("Given one host listed twice in two orders", t, func() {
+		So(uniqHosts([]host.ID{host.Omp, host.Agy, host.Omp}), ShouldResemble, []host.ID{host.Agy, host.Omp})
+		So(uniqHosts([]host.ID{host.Agy, host.Omp, host.Agy}), ShouldResemble, []host.ID{host.Agy, host.Omp})
+		So(uniqHosts([]host.ID{host.Omp}), ShouldResemble, []host.ID{host.Omp})
+		So(uniqHosts(nil), ShouldBeEmpty)
 	})
 }
 
